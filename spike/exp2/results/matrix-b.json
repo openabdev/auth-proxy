@@ -1,0 +1,155 @@
+{
+ "impl": "b",
+ "results": [
+  {
+   "row": "R1 policy empty or unavailable \u2192 refuse",
+   "case": "policy {\"rules\":[]}",
+   "verdict": "PASS",
+   "detail": "status=403 code=policy_empty upstream_requests=0"
+  },
+  {
+   "row": "R1 policy empty or unavailable \u2192 refuse",
+   "case": "policy file is 0 bytes",
+   "verdict": "PASS",
+   "detail": "status=503 code=None upstream_requests=0 diagnosable=False"
+  },
+  {
+   "row": "R1 policy empty or unavailable \u2192 refuse",
+   "case": "policy file deleted after a good load",
+   "verdict": "PASS",
+   "detail": "before=200 after: status=503 code=None upstream_requests=0 diagnosable=False"
+  },
+  {
+   "row": "R1 policy empty or unavailable \u2192 refuse",
+   "case": "policy file corrupt JSON",
+   "verdict": "PASS",
+   "detail": "status=503 code=None upstream_requests=0 diagnosable=False"
+  },
+  {
+   "row": "R1 policy empty or unavailable \u2192 refuse",
+   "case": "policy allows other path/method only",
+   "verdict": "PASS",
+   "detail": "status=403 code=policy_denied upstream_requests=0"
+  },
+  {
+   "row": "R2 broker unreachable \u2192 refuse, no stale cache",
+   "case": "success, then broker stopped, same surrogate",
+   "verdict": "PASS",
+   "detail": "before=200 after: status=503 code=None upstream_requests=0 diagnosable=False"
+  },
+  {
+   "row": "R3 surrogate expired or revoked \u2192 explicit 4xx",
+   "case": "expired (ttl 1 s)",
+   "verdict": "PASS",
+   "detail": "status=401 code=surrogate_expired upstream_requests=0"
+  },
+  {
+   "row": "R3 surrogate expired or revoked \u2192 explicit 4xx",
+   "case": "revoked after one good use",
+   "verdict": "PASS",
+   "detail": "before=200 after: status=401 code=surrogate_revoked upstream_requests=0"
+  },
+  {
+   "row": "R3 surrogate expired or revoked \u2192 explicit 4xx",
+   "case": "unknown / malformed / missing surrogate",
+   "verdict": "PASS",
+   "detail": "unknown: status=401 code=surrogate_unknown upstream_requests=0; malformed: status=401 code=surrogate_malformed upstream_requests=0; missing: status=401 code=surrogate_missing upstream_requests=0"
+  },
+  {
+   "row": "R3 surrogate expired or revoked \u2192 explicit 4xx",
+   "case": "aws-dialect route: refusal body has __type",
+   "verdict": "PASS",
+   "detail": "status=401 code=surrogate_revoked upstream_requests=0 __type=AccessDeniedException"
+  },
+  {
+   "row": "X1 caller key and surrogate binding",
+   "case": "wrong caller key / other caller's surrogate / other route's surrogate",
+   "verdict": "PASS",
+   "detail": "bad key: status=403 code=caller_rejected upstream_requests=0; other caller: status=403 code=surrogate_wrong_caller upstream_requests=0; other route: status=403 code=surrogate_wrong_route upstream_requests=0"
+  },
+  {
+   "row": "R4 cross-host/port/scheme redirect \u2192 credential never forwarded",
+   "case": "302 to other host, other port, http://",
+   "verdict": "PASS",
+   "detail": "host: status=302 location_unchanged=True good=1 other=0; port: status=302 location_unchanged=True good=1 other=0; scheme: status=302 location_unchanged=True good=1 other=0; client follows: evil got real credential=False"
+  },
+  {
+   "row": "R5 userinfo, IP literal or ambiguous host \u2192 reject",
+   "case": "client Host / request-target variants (raw)",
+   "verdict": "PASS",
+   "detail": "[Host userinfo: 400/0] [Host foreign name: 400/0] [Host IPv4 short form: 400/0] [Host trailing dot: 400/0] [Host IPv6-mapped: 400/0] [two Host headers: 400/0] [no Host (HTTP/1.0): 426/0] [absolute-form foreign: 404/0] [absolute-form userinfo: 404/0]"
+  },
+  {
+   "row": "R5 userinfo, IP literal or ambiguous host \u2192 reject",
+   "case": "upstream route host is IP literal / userinfo / trailing dot",
+   "verdict": "PASS",
+   "detail": "[IPv4: exit=[2, 2]] [IPv6: exit=[2, 2]] [userinfo: exit=[2, 2]] [trailing dot: exit=[2, 2]] [IPv4 short: exit=[2, 2]] [uppercase: exit=[2, 2]]"
+  },
+  {
+   "row": "X2 path canonicalization",
+   "case": "dot-segments, encoded dots/slashes, empty segments (raw)",
+   "verdict": "PASS",
+   "detail": "[..: forwarded 200, policy saw ['/v1/echo'] upstream got '/v1/echo' (good)] [%2e%2e: forwarded 200, policy saw ['/v1/echo'] upstream got '/v1/echo' (good)] [%2f: refused 400] [//: forwarded 200, policy saw ['/v1/echo'] upstream got '/v1/echo' (good)] [route hop: forwarded 200, policy saw ['/v1/echo'] upstream got '/v1/echo' (good)] [%252e: refused 400]"
+  },
+  {
+   "row": "X3 CONNECT refused",
+   "case": "CONNECT api.up.test:443",
+   "verdict": "PASS",
+   "detail": "status=404 upstream_requests=0"
+  },
+  {
+   "row": "R6 SNI/Host mismatch \u2192 reject",
+   "case": "upstream sees SNI == Host == route host; client X-Forwarded-Host ignored",
+   "verdict": "PASS",
+   "detail": "status=200 sni=api.up.test host=['api.up.test:18443']"
+  },
+  {
+   "row": "R6 SNI/Host mismatch \u2192 reject",
+   "case": "cert name \u2260 route host (SNI wrongname.up.test, cert other.up.test)",
+   "verdict": "PASS",
+   "detail": "status=503 code=None upstream_requests=0 handshake_fail={'wrongname': 1}"
+  },
+  {
+   "row": "R7 upstream TLS verification failure \u2192 refuse",
+   "case": "cert from an untrusted CA",
+   "verdict": "PASS",
+   "detail": "status=503 code=None upstream_requests=0 handshake_fail={'badca': 1}"
+  },
+  {
+   "row": "R8 client auth stripped, exactly one upstream credential",
+   "case": "bearer route + 6 junk auth headers + TokenType",
+   "verdict": "PASS",
+   "detail": "status=200 auth_headers_upstream=['authorization'] real=True surrogate_seen=False junk_seen=False tokentype_kept=True caller_key_seen=False"
+  },
+  {
+   "row": "R8 client auth stripped, exactly one upstream credential",
+   "case": "x-api-key route + junk Authorization",
+   "verdict": "PASS",
+   "detail": "status=200 auth_headers_upstream=['x-api-key']"
+  },
+  {
+   "row": "R8 client auth stripped, exactly one upstream credential",
+   "case": "two surrogate headers \u2192 reject",
+   "verdict": "PASS",
+   "detail": "status=400 upstream_requests=0"
+  },
+  {
+   "row": "X4 enforcement point down \u2192 refuse",
+   "case": "B: ext_authz service stopped (failure_mode_allow=false)",
+   "verdict": "PASS",
+   "detail": "before=200 after: status=503 upstream_requests=0"
+  },
+  {
+   "row": "X6 SSE streaming through the proxy (mock)",
+   "case": "20 events \u00d7 50 ms: not buffered",
+   "verdict": "PASS",
+   "detail": "status=200 events=20 first=0.004s spread=0.960s"
+  },
+  {
+   "row": "X5 no secret in any log",
+   "case": "real test credentials, surrogates, caller keys vs every work-dir file",
+   "verdict": "PASS",
+   "detail": "files_with_secret=[] scanned=['ap-authz.log', 'audit.jsonl', 'broker.log', 'config-bad.json', 'config.json', 'envoy.json', 'envoy.log', 'policy.json', 'upstream.log']"
+  }
+ ]
+}

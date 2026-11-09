@@ -1,0 +1,49 @@
+{
+ "impl": "b",
+ "rss_idle_kb": {
+  "envoy": 66464,
+  "ap-authz": 2448
+ },
+ "latency_direct": {
+  "p50_ms": 0.199,
+  "p90_ms": 0.224,
+  "p99_ms": 0.349,
+  "mean_ms": 0.205,
+  "n": 2000
+ },
+ "latency_proxied": {
+  "p50_ms": 0.911,
+  "p90_ms": 1.359,
+  "p99_ms": 1.651,
+  "mean_ms": 1.028,
+  "n": 2000
+ },
+ "latency_broker_only": {
+  "p50_ms": 0.198,
+  "p90_ms": 0.217,
+  "p99_ms": 0.284,
+  "mean_ms": 0.201,
+  "n": 2000
+ },
+ "added_p50_ms": 0.712,
+ "added_p99_ms": 1.302,
+ "rss_warm_kb": {
+  "envoy": 67844,
+  "ap-authz": 2784
+ },
+ "load": {
+  "conc": 32,
+  "seconds": 15.0,
+  "ok": 36470,
+  "errors": 0,
+  "rps": 2430.0,
+  "rss_peak_kb": {
+   "envoy": 71004,
+   "ap-authz": 8620
+  }
+ },
+ "rss_after_load_kb": {
+  "envoy": 71004,
+  "ap-authz": 8628
+ }
+}

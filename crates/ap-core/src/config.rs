@@ -905,6 +905,86 @@ allow = ["github.com:443"]
     }
 
     #[test]
+    fn rejects_invalid_identity_name() {
+        expect_invalid(
+            &base().replace("name = \"pty-team-a\"", "name = \"bad name\""),
+            "identity name",
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_credential_id() {
+        let dup =
+            "\n[[credential]]\nid = \"kiro\"\nsource = \"k8s:x:y\"\nroutes = [\"kiro-krs\"]\n";
+        expect_invalid(&(base() + dup), "duplicate credential id");
+    }
+
+    #[test]
+    fn rejects_invalid_credential_id() {
+        expect_invalid(
+            &base().replace("id = \"kiro\"", "id = \"Kiro\""),
+            "credential id",
+        );
+    }
+
+    #[test]
+    fn rejects_empty_credential_source() {
+        expect_invalid(
+            &base().replace("source = \"k8s:auth-proxy-kiro:api_key\"", "source = \" \""),
+            "source must not be empty",
+        );
+    }
+
+    #[test]
+    fn rejects_credential_without_routes() {
+        expect_invalid(
+            &base().replace("routes = [\"kiro-krs\"]", "routes = []"),
+            "routes must not be empty",
+        );
+    }
+
+    #[test]
+    fn rejects_credential_route_listed_twice() {
+        expect_invalid(
+            &base().replace(
+                "routes = [\"kiro-krs\"]",
+                "routes = [\"kiro-krs\", \"kiro-krs\"]",
+            ),
+            "twice",
+        );
+    }
+
+    #[test]
+    fn rejects_non_lowercase_header_name() {
+        expect_invalid(
+            &base().replace(
+                "error_shape = \"aws\"",
+                "error_shape = \"aws\"\n    surrogate_header = \"Authorization\"",
+            ),
+            "must be a lowercase header name",
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_pass_header_name() {
+        expect_invalid(
+            &base().replace(
+                "pass_headers = [\"tokentype\"]",
+                "pass_headers = [\"Token Type\"]",
+            ),
+            "pass_headers entry",
+        );
+    }
+
+    #[test]
+    fn rejects_grant_without_paths() {
+        expect_invalid(
+            &base().replace("paths = [\"/\"]", "paths = []"),
+            "grant paths must not be empty",
+        );
+    }
+
+    #[test]
     fn rejects_invalid_toml_syntax() {
         expect_parse_error("version = ");
     }

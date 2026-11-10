@@ -1,35 +1,27 @@
-# Option A test pod: init container installs per-UID egress rules, proxy sidecar
-# (UID 1001) is the only container with the credential Secret, agent (UID 1000)
-# has only a surrogate and a caller key.
-# Variant knobs (pod-b.yaml differs only in the commented lines).
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: auth-proxy-spike
----
+# Variant B of pod-a.yaml: the RFC draft's rule only (no DENY_LO_PORTS), plus
+# ALLOW_INBOUND_REPLIES=1, and shareProcessNamespace: true. Used for tests 6
+# (shared PID namespace), the loopback-reachability gap, and inbound replies.
 apiVersion: v1
 kind: Pod
 metadata:
-  name: ap-a
+  name: ap-b
   namespace: auth-proxy-spike
-  labels: {app: ap-spike, variant: a}
+  labels: {app: ap-spike, variant: b}
 spec:
   automountServiceAccountToken: false
   enableServiceLinks: false
-  shareProcessNamespace: false            # pod-b: true
+  shareProcessNamespace: true
   terminationGracePeriodSeconds: 2
   securityContext:
     seccompProfile: {type: RuntimeDefault}
   initContainers:
   - name: netinit
-    image: localhost/ap-spike-p1:dev
+    image: localhost/ap-spike:dev
     imagePullPolicy: Never
     command: [sh, /opt/ap/netinit.sh]
     env:
     - {name: AGENT_UID, value: "1000"}
-    - {name: DENY_LO_PORTS, value: "18190"}  # pod-b: unset (RFC rule only)
-    - {name: TEST_V6_ADDR, value: "fd00:a9::2/64"}  # test aid: gives IPv6 a non-lo route
-    # pod-b: ALLOW_INBOUND_REPLIES=1
+    - {name: ALLOW_INBOUND_REPLIES, value: "1"}
     securityContext:
       runAsUser: 0
       runAsNonRoot: false
@@ -40,7 +32,7 @@ spec:
     - {name: init-run, mountPath: /run}
   containers:
   - name: proxy
-    image: localhost/ap-spike-p1:dev
+    image: localhost/ap-spike:dev
     imagePullPolicy: Never
     command: [sh, /opt/ap/proxy-entry.sh]
     securityContext:
@@ -56,7 +48,7 @@ spec:
     - {name: handoff, mountPath: /handoff}
     - {name: proxy-tmp, mountPath: /tmp}
   - name: agent
-    image: localhost/ap-spike-p1:dev
+    image: localhost/ap-spike:dev
     imagePullPolicy: Never
     command: [sh, /opt/ap/agent-entry.sh]
     workingDir: /work

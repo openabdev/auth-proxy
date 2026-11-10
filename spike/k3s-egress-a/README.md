@@ -4,7 +4,7 @@ Spike code only. Validates RFC egress Option A on a single-node k3s test cluster
 (kube-router, NetworkPolicy enforced): an init container with `NET_ADMIN` confines
 the agent UID to `lo`, the proxy sidecar (spike/exp2 `ap-proxy`) is the only UID
 that reaches upstream, and the platform writes kiro-cli's loopback base URLs
-before kiro-cli starts. Report: `.agents/tasks/p1-egress-a/report.md`.
+before kiro-cli starts. Report: `.agents/tasks/k3s-egress-a/report.md`.
 
 | File | Role |
 |---|---|
@@ -36,5 +36,5 @@ the fixed `memread.py`) were piped into the containers on stdin.
 
 Run order on the node: `build.sh`, `kubectl create ns auth-proxy-spike`, `create-secret.sh`,
 `kubectl apply -f pod-a.yaml`, then the tests as listed in the report. Cleanup:
-`kubectl delete ns auth-proxy-spike`, `k3s ctr -n k8s.io images rm localhost/ap-spike-p1:dev`,
-`podman rmi localhost/ap-spike-p1:dev`, remove the work dir.
+`kubectl delete ns auth-proxy-spike`, `k3s ctr -n k8s.io images rm localhost/ap-spike:dev`,
+`podman rmi localhost/ap-spike:dev`, remove the work dir.

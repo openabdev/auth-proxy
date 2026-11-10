@@ -14,13 +14,17 @@ in a later phase.
 - Kubernetes: HTTP/1.1 with JSON bodies over the Unix socket `/run/auth-proxy/session.sock`. The
   socket sits in a volume that the agent container and the proxy container both mount. The admin
   socket is a separate socket that only the proxy mounts, and it does not serve these calls.
+- Known limitation: the agent container mounts the session socket volume writable, and the socket
+  is created with mode 0666. An agent-UID process can unlink and rebind `session.sock`. That breaks
+  the authority's calls, and it can capture the bearer token on `renew`. The effect is limited to
+  the identity's own sessions. The pod spec does not yet move the socket out of agent reach.
 - Every call except `hello` carries `Authorization: Bearer <authority-token>`.
 
 ## Calls
 
 | Call | Body | Success | Failure |
 |---|---|---|---|
-| `POST /v1/hello` (Kubernetes only) | `{}` | `201 {authority_token, lease_secs}` | `409 authority_active` while the current authority's lease is live |
+| `POST /v1/hello` (Kubernetes only) | `{identity}`, where `identity` is the name of an identity in the config | `201 {authority_token, lease_secs}` | `400 identity_unknown` for a name not in the config, `400 invalid_body` for a body without a string `identity`; `409 authority_active` while the current authority's lease is live |
 | `POST /v1/sessions` | `{session, generation, surrogate_sha256, credentials: [id]}` | `201 {lease_secs}` | `401` bad token; `400` invalid field; `403 credential_not_granted`; `409` same session and generation already registered with another hash; `429` over `max_sessions` |
 | `POST /v1/renew` | `{sessions: [{session, generation}]}` | `200 {lease_secs, unknown: [...]}` | `401` |
 | `DELETE /v1/sessions/{session}/{generation}` | none | `204` (also when unknown) | `401` |
@@ -56,6 +60,18 @@ token back.
 - In openab-pty the runtime is PID 1 of its container. A dead runtime takes its shells with it, so
   the next `hello` comes from the restarted runtime before any session exists.
 
+**Open gap (pending owner decision).** The Phase 1 code does not enforce the PID 1 guarantee above.
+`hello` takes an identity name and no secret. The agent container shares the session socket and
+runs as UID 1000, the same UID as the authority. So during the lease-lapse window, any agent-UID
+process that can reach `session.sock` can call `hello` first and become the authority. Its reach is
+limited to its own identity's grants. The real credential stays in the proxy, and an unknown
+surrogate is still refused. Two options are open, and the owner has not chosen between them:
+
+- (a) Add a runtime-only proof to `hello`. This changes the `hello` call.
+- (b) Record acceptance of the gap against design condition 1, and name the test that covers it.
+
+Until the owner decides, the guarantee in the paragraph above is not enforced.
+
 On ECS there is no `hello`. The authority token is set in the proxy config as its hash.
 
 ## Revocation and audit
@@ -65,3 +81,10 @@ On ECS there is no `hello`. The authority token is set in the proxy config as it
 - A process that outlives its session is refused on its next request.
 - Every call writes an audit line with the session id, the generation, a short hash prefix and the
   result. An audit line never contains a surrogate or the caller key.
+
+## Amendments to the design table
+
+- The design's Q1-B table lists the `hello` body as `{}`. The implementation requires
+  `{"identity": "<identity name>"}`, and the matrix driver sends it. This document uses the
+  implemented body. The design copy at `docs/design/phase1.md` is unchanged.
+- The `400 identity_unknown` row is added. It is returned for a name not in the config.

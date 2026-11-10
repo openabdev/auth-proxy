@@ -26,7 +26,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (  # noqa: E402
-    AUTH, DEFAULT_GRANTS, MAX_BODY, PORT_AUTHORITY, PORT_EGRESS, PORT_LEASE, PORT_MAIN, PORT_PROBE,
+    AUTH, DEFAULT_GRANTS, EGRESS_NAME, MAX_BODY, PORT_AUTHORITY, PORT_EGRESS, PORT_LEASE, PORT_MAIN, PORT_PROBE,
     PORT_RESTART, UPSTREAM_PORTS, Env, read_response, sha256_hex, tls_get,
 )
 
@@ -253,9 +253,13 @@ def _(e):
     st = tls_get(UPSTREAM_PORTS["evil"], "evil.up.test", "/v1/echo", e.bearer(s), os.path.join(e.pki, "ca.pem"))
     lg = e.ulog()
     seen = [r for r in lg if r["listener"] == "evil"]
+    own = [("authorization", f"Bearer {s}")]
+    got = auth_values(seen[0]) if len(seen) == 1 else None
     vals = [v for r in lg for _, v in auth_values(r)]
     leaked = any(c in v for v in vals for c in e.creds.values())
-    return st == 200 and len(seen) == 1 and not leaked, f"evil status={st} seen={len(seen)} real_credential_seen={leaked}"
+    ok = st == 200 and len(seen) == 1 and got == own and not leaked
+    return ok, (f"evil status={st} seen={len(seen)} auth_is_own_surrogate={got == own} "
+                f"real_credential_seen={leaked}")
 
 
 # ================================================================ R5 host canonicalization
@@ -687,17 +691,25 @@ def _(e):
     return refusal(e, st, b, 501, "websocket_unsupported")
 
 
-@case("P1-09", "P1", "egress refuses localhost, a private address, an IP literal and an unlisted host",
+@case("P1-09", "P1", "egress refuses a loopback name, IP literals and an unlisted host, with no connect",
       instance="egress")
 def _(e):
+    # loop.test is on this instance's allowlist and the test resolver maps it to 127.0.0.1, so its 403
+    # can only come from the resolver's address check: an unlisted host would be NotAllowed, and a failed
+    # lookup would be 502. With that check removed, the connect reaches the probe and the client gets 200.
     out, ok = [], True
-    for target in (f"localhost:{PORT_PROBE}", "10.0.0.1:443", f"127.0.0.1:{PORT_PROBE}", "example.org:443"):
+    for target, why in (
+        (f"{EGRESS_NAME}:{PORT_PROBE}", "allowlisted, mapped to loopback"),
+        ("10.0.0.1:443", "IP literal, private range"),
+        (f"127.0.0.1:{PORT_PROBE}", "IP literal, loopback"),
+        ("example.org:443", "not allowlisted"),
+    ):
         before = e.probe.count()
         st = egress_send(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
         hit = e.probe.count() - before
-        good = st in (400, 403, 405) and hit == 0
+        good = st == 403 and hit == 0
         ok = ok and good
-        out.append(f"[{target}: {st} connects={hit}]")
+        out.append(f"[{target} ({why}): {st} connects={hit}]")
     return ok, " ".join(out)
 
 
@@ -745,8 +757,10 @@ def run_instance(e, instance, results):
         e.write_file(cfg, e.main_text(port=PORT_RESTART))
         e.start_proxy(cfg, PORT_RESTART)
     elif instance == "egress":
+        cfg = os.path.join(e.work, "config-egress.toml")
+        e.write_file(cfg, e.main_text(egress_allow=("allowed.test:443", f"{EGRESS_NAME}:{PORT_PROBE}")))
         e.probe = Probe(PORT_PROBE)
-        e.start_egress(e.main_cfg)
+        e.start_egress(cfg)
     try:
         for cid, row, name, _, fn in cases:
             if instance == "main":

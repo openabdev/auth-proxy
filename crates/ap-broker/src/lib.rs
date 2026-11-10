@@ -3,3 +3,4 @@
 pub mod clock;
 pub mod registry;
 pub mod session;
+pub mod store;

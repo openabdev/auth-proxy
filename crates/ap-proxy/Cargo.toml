@@ -33,6 +33,11 @@ default = []
 # throwaway CA and resolve mock upstream names (crates/ap-proxy/src/matrix_hooks.rs).
 matrix-upstream = []
 
+[[test]]
+name = "matrix"
+path = "tests/matrix.rs"
+required-features = ["matrix-upstream"]
+
 [dev-dependencies]
 getrandom = "0.2"
 http-body-util = "0.1"

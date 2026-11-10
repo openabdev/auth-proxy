@@ -14,17 +14,20 @@ import argparse
 import http.client
 import json
 import os
+import secrets
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (  # noqa: E402
-    AUTH, DEFAULT_GRANTS, PORT_AUTHORITY, PORT_LEASE, PORT_MAIN, PORT_RESTART, UPSTREAM_PORTS, Env,
-    tls_get,
+    AUTH, DEFAULT_GRANTS, MAX_BODY, PORT_AUTHORITY, PORT_EGRESS, PORT_LEASE, PORT_MAIN, PORT_PROBE,
+    PORT_RESTART, UPSTREAM_PORTS, Env, read_response, sha256_hex, tls_get,
 )
 
 CASES = []  # (id, row, name, instance, fn)
@@ -34,7 +37,8 @@ GATE_IDS = [
     "X1-1", "X1-2", "X1-3", "R4-1", "R4-2", "R5-1", "R5-2", "X2-1", "X3-1", "R6-1", "R6-2",
     "R7-1", "R8-1", "R8-2", "R8-3", "X4-1", "X5-1", "X6-1",
 ]
-P1_IDS = []  # Phase 1 cases are added in the next commit
+P1_IDS = ["P1-01", "P1-02", "P1-03", "P1-04", "P1-05", "P1-06", "P1-07", "P1-08", "P1-09", "P1-10",
+          "P1-11"]
 EXPECTED = GATE_IDS + P1_IDS
 
 
@@ -482,6 +486,243 @@ def _(e):
 
 
 
+# ================================================================ Phase 1 cases (session plane, bodies, egress)
+class Probe:
+    """A loopback TCP listener that counts connections. A connection here means egress reached out."""
+
+    def __init__(self, port):
+        self.n = 0
+        self.lock = threading.Lock()
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", port))
+        self.srv.listen(16)
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            with self.lock:
+                self.n += 1
+            c.close()
+
+    def count(self):
+        with self.lock:
+            return self.n
+
+    def close(self):
+        self.srv.close()
+
+
+def ref(sess, gen=1):
+    return {"session": sess, "generation": gen}
+
+
+def new_surrogate():
+    return "aps_" + secrets.token_hex(32)
+
+
+def send_tolerant(e, head, body):
+    """Send a request whose body the proxy may refuse early. A reset after the send still counts."""
+    s = socket.create_connection(("127.0.0.1", e.port), 5)
+    s.settimeout(5)
+    try:
+        s.sendall(head + body)
+    except OSError:
+        pass
+    try:
+        return read_response(s)
+    except OSError:
+        return 0, "", b""
+
+
+def uds_raw(e, method, path, token, body):
+    """A session-plane request whose body may be refused early. Returns the status."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect(e.session_sock)
+    head = (f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n").encode()
+    try:
+        s.sendall(head + body)
+    except OSError:
+        pass
+    try:
+        st, _, _ = read_response(s)
+    except OSError:
+        st = 0
+    return st
+
+
+def egress_send(data):
+    s = socket.create_connection(("127.0.0.1", PORT_EGRESS), 5)
+    s.settimeout(3)
+    try:
+        s.sendall(data)
+    except OSError:
+        pass
+    try:
+        st, _, _ = read_response(s)
+    except OSError:
+        st = 0
+    return st
+
+
+@case("P1-01", "P1", "session plane call with no bearer")
+def _(e):
+    st, _ = e.sp("POST", "/v1/renew", {"sessions": []})
+    return st == 401, f"status={st}"
+
+
+@case("P1-02", "P1", "session plane call with a wrong bearer")
+def _(e):
+    st, _ = e.sp("POST", "/v1/renew", {"sessions": []}, token="not-the-token")
+    return st == 401, f"status={st}"
+
+
+@case("P1-03", "P1", "second hello while the authority lease is live; hello after it lapses",
+      instance="authority")
+def _(e):
+    st1, _ = e.hello("agent-1")
+    st2, j2 = e.sp("POST", "/v1/hello", {"identity": "agent-1"})
+    s = e.mint("agent-1", ("c-up",))
+    time.sleep(2.5)
+    st3, _ = e.hello("agent-1")
+    e.ureset()
+    st4, _, b = e.req("GET", e.ap("up", "/v1/echo"), e.bearer(s))
+    code4 = code_of(b)
+    err2 = (j2 or {}).get("error")
+    ok = st1 == 201 and st2 == 409 and err2 == "authority_active" and st3 == 201 \
+        and st4 == 403 and code4 == "surrogate_revoked"
+    return ok, (f"hello={st1} second_hello={st2}/{err2} hello_after_lapse={st3} "
+                f"old_surrogate={st4}/{code4}")
+
+
+@case("P1-04", "P1", "session PUT with one bad entry: 400 and nothing applied")
+def _(e):
+    tok = e.token("agent-1")
+    s = new_surrogate()
+    good = {"session": "p104-" + secrets.token_hex(6), "generation": 1,
+            "surrogate_sha256": sha256_hex(s), "credentials": ["c-up"]}
+    bad = {"session": "a b", "generation": 1, "surrogate_sha256": sha256_hex(s), "credentials": ["c-up"]}
+    st, _ = e.sp("PUT", "/v1/sessions", {"sessions": [good, bad]}, token=tok)
+    e.ureset()
+    st2, _, b = e.req("GET", e.ap("up", "/v1/echo"), e.bearer(s))
+    ok, d = refusal(e, st2, b, 403, "surrogate_unknown")
+    return st == 400 and ok, f"put={st} then: {d}"
+
+
+@case("P1-05", "P1", "proxy restarted: renew reports unknown, resync restores only the listed session",
+      instance="restart")
+def _(e):
+    tok = e.token("agent-1")
+    sa = e.mint("agent-1", ("c-up",))
+    sb = e.mint("agent-1", ("c-up",))
+    st0, _, _ = e.req("GET", e.ap("up", "/v1/echo"), e.bearer(sa))
+    e.stop_proxy()
+    e.restart_proxy()
+    st1, _, b1 = e.req("GET", e.ap("up", "/v1/echo"), e.bearer(sa))
+    code1 = code_of(b1)
+    ren_st, ren = e.sp("POST", "/v1/renew", {"sessions": [ref(e.sessions[sa][1]), ref(e.sessions[sb][1])]},
+                       token=tok)
+    unknown = len((ren or {}).get("unknown", []))
+    res_st, res = e.sp("PUT", "/v1/sessions", {"sessions": [e.entry_for(sa)]}, token=tok)
+    st2, _, _ = e.req("GET", e.ap("up", "/v1/echo"), e.bearer(sa))
+    st3, _, b3 = e.req("GET", e.ap("up", "/v1/echo"), e.bearer(sb))
+    code3 = code_of(b3)
+    ok = (st0 == 200 and st1 == 403 and code1 == "surrogate_unknown" and ren_st == 200 and unknown == 2
+          and res_st == 200 and (res or {}).get("registered") == 1 and st2 == 200
+          and st3 == 403 and code3 == "surrogate_unknown")
+    return ok, (f"before={st0} after_restart={st1}/{code1} renew={ren_st} unknown={unknown} "
+                f"resync={res_st} listed={st2} left_out={st3}/{code3}")
+
+
+@case("P1-06", "P1", "aws_targets grant allows X; request sends Y")
+def _(e):
+    s = e.mint("agent-1", ("c-aws",))
+    e.ureset()
+    st, _, b = e.req("POST", e.ap("upaws", "/v1/echo"),
+                     e.bearer(s) + [("X-Amz-Target", "AwsSvc.Other"),
+                                    ("Content-Type", "application/x-amz-json-1.1")], body=b"{}")
+    return refusal(e, st, b, 403, "policy_denied")
+
+
+@case("P1-07", "P1", "body over the 1 MiB cap refused; slow body under the cap accepted")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    over = MAX_BODY + 1
+    head = (f"POST {e.ap('up', '/v1/echo')} HTTP/1.1\r\nHost: {e.authority()}\r\n"
+            f"Authorization: Bearer {s}\r\nContent-Type: application/octet-stream\r\n"
+            f"Content-Length: {over}\r\n\r\n").encode()
+    e.ureset()
+    st1, _, b1 = send_tolerant(e, head, b"x" * over)
+    n1 = len(e.ulog())
+    size = 512 * 1024
+    head2 = (f"POST {e.ap('up', '/v1/echo')} HTTP/1.1\r\nHost: {e.authority()}\r\n"
+             f"Authorization: Bearer {s}\r\nContent-Type: application/octet-stream\r\n"
+             f"Content-Length: {size}\r\n\r\n").encode()
+    e.ureset()
+    sock = socket.create_connection(("127.0.0.1", e.port), 5)
+    sock.settimeout(5)
+    sock.sendall(head2)
+    for _ in range(4):
+        sock.sendall(b"y" * (size // 4))
+        time.sleep(0.2)
+    st2, _, _ = read_response(sock)
+    n2 = len(e.ulog())
+    ok = st1 == 413 and code_of(b1) == "body_too_large" and n1 == 0 and st2 == 200 and n2 == 1
+    return ok, f"over_cap={st1}/{code_of(b1)} upstream={n1}; slow_under_cap={st2} upstream={n2}"
+
+
+@case("P1-08", "P1", "Upgrade: websocket request refused")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    e.ureset()
+    st, _, b = e.raw_req(f"GET {e.ap('up', '/v1/echo')} HTTP/1.1",
+                         [("Host", e.authority()), ("Authorization", f"Bearer {s}"),
+                          ("Connection", "Upgrade"), ("Upgrade", "websocket")])
+    return refusal(e, st, b, 501, "websocket_unsupported")
+
+
+@case("P1-09", "P1", "egress refuses localhost, a private address, an IP literal and an unlisted host",
+      instance="egress")
+def _(e):
+    out, ok = [], True
+    for target in (f"localhost:{PORT_PROBE}", "10.0.0.1:443", f"127.0.0.1:{PORT_PROBE}", "example.org:443"):
+        before = e.probe.count()
+        st = egress_send(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+        hit = e.probe.count() - before
+        good = st in (400, 403, 405) and hit == 0
+        ok = ok and good
+        out.append(f"[{target}: {st} connects={hit}]")
+    return ok, " ".join(out)
+
+
+@case("P1-10", "P1", "egress refuses a plain HTTP proxy request and an allowlisted host on a wrong port",
+      instance="egress")
+def _(e):
+    before = e.probe.count()
+    st1 = egress_send(b"GET http://allowed.test:443/ HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n")
+    st2 = egress_send(b"CONNECT allowed.test:8443 HTTP/1.1\r\nHost: allowed.test:8443\r\n\r\n")
+    hit = e.probe.count() - before
+    ok = st1 == 405 and st2 == 403 and hit == 0
+    return ok, f"plain_get={st1} wrong_port={st2} connects={hit}"
+
+
+@case("P1-11", "P1", "session PUT over 1 MiB refused 413; invalid session id refused 400")
+def _(e):
+    tok = e.token("agent-1")
+    big = b'{"sessions":[' + b" " * (MAX_BODY + 1) + b"]}"
+    st1 = uds_raw(e, "PUT", "/v1/sessions", tok, big)
+    st2, _ = e.sp("POST", "/v1/sessions",
+                  {"session": "a b", "generation": 1, "surrogate_sha256": sha256_hex(new_surrogate()),
+                   "credentials": ["c-up"]}, token=tok)
+    return st1 == 413 and st2 == 400, f"oversize_put={st1} invalid_session={st2}"
+
+
 # ================================================================ driver
 def run_instance(e, instance, results):
     """Start the processes this instance needs, run its cases in table order, stop them."""
@@ -503,6 +744,9 @@ def run_instance(e, instance, results):
         cfg = os.path.join(e.work, "config-restart.toml")
         e.write_file(cfg, e.main_text(port=PORT_RESTART))
         e.start_proxy(cfg, PORT_RESTART)
+    elif instance == "egress":
+        e.probe = Probe(PORT_PROBE)
+        e.start_egress(e.main_cfg)
     try:
         for cid, row, name, _, fn in cases:
             if instance == "main":
@@ -518,6 +762,7 @@ def run_instance(e, instance, results):
     finally:
         if instance == "egress":
             e.stop_egress()
+            e.probe.close()
         else:
             e.stop_proxy()
 

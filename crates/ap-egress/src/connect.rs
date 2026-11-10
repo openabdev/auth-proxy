@@ -1,11 +1,14 @@
 //! CONNECT parsing, the allowlist decision and the tunnel (design Q3-E2).
 
+use crate::allow::allowed;
+use crate::resolve::{resolve, Resolver};
 use crate::Refuse;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 /// Largest request head read before the request is refused.
 pub const MAX_HEAD: usize = 8 * 1024;
@@ -148,4 +151,53 @@ where
     }
     copy_bidirectional(&mut client, &mut upstream).await?;
     Ok(())
+}
+
+/// Production connector: a TCP connection to the exact address given.
+pub struct TcpConnector;
+
+impl Connector for TcpConnector {
+    type Stream = TcpStream;
+
+    async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
+        TcpStream::connect(addr).await
+    }
+}
+
+/// Serve one client connection: read the CONNECT head, check the allowlist, resolve once, and
+/// tunnel to the validated address. Every refusal is answered before a connection to the target
+/// is attempted, and an unlisted host is refused before any lookup.
+pub async fn serve_conn<S, R, C>(
+    mut client: S,
+    allow: &[String],
+    resolver: &R,
+    connector: &C,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    R: Resolver,
+    C: Connector,
+{
+    let read = tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client))
+        .await
+        .unwrap_or(Err(Refuse::BadRequest));
+    let (head, early) = match read {
+        Ok(parts) => parts,
+        Err(why) => return refuse(&mut client, why).await,
+    };
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let headers: Vec<&str> = lines.collect();
+    let target = match parse_connect(request_line, &headers) {
+        Ok(target) => target,
+        Err(why) => return refuse(&mut client, why).await,
+    };
+    if !allowed(allow, &target.host, target.port) {
+        return refuse(&mut client, Refuse::NotAllowed).await;
+    }
+    let addr = match resolve(resolver, &target.host, target.port).await {
+        Ok(addr) => addr,
+        Err(why) => return refuse(&mut client, why).await,
+    };
+    tunnel(client, connector, addr, &early).await
 }

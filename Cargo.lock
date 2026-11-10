@@ -15,6 +15,22 @@ dependencies = [
 [[package]]
 name = "ap-client"
 version = "0.1.0"
+dependencies = [
+ "ap-broker",
+ "ap-core",
+ "ap-proxy",
+ "axum",
+ "bytes",
+ "getrandom 0.2.17",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
 
 [[package]]
 name = "ap-core"
@@ -29,6 +45,10 @@ dependencies = [
 [[package]]
 name = "ap-egress"
 version = "0.1.0"
+dependencies = [
+ "ap-core",
+ "tokio",
+]
 
 [[package]]
 name = "ap-proxy"

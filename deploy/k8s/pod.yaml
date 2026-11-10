@@ -1,0 +1,169 @@
+# Option A pod: one init container and three app containers, each with its own UID.
+# Images are placeholders. Replace every REPLACE_* value before use.
+#
+# Do not add a KIRO_API_KEY env var or a credential Secret mount to the agent container.
+# Do not set shareProcessNamespace to true (finding F3).
+# The namespace needs PSA "privileged" because netinit requires NET_ADMIN.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: auth-proxy
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: auth-proxy-phase1
+  namespace: auth-proxy
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  shareProcessNamespace: false
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+    # Installs the per-UID rule set in the pod netns, then exits. Runs as root with NET_ADMIN only.
+    - name: netinit
+      image: REPLACE_NETINIT_IMAGE
+      command: ["/bin/sh", "/usr/local/bin/netinit.sh"]
+      env:
+        - name: AGENT_UID
+          value: "1000"
+        - name: PROXY_PORT
+          value: "18080"
+        - name: EGRESS_PORT
+          value: "18081"
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_ADMIN"]
+      volumeMounts:
+        - name: netinit-run
+          mountPath: /run
+  containers:
+    # The agent: no credential, no KIRO_API_KEY, and loopback reaches only P and E.
+    - name: agent
+      image: REPLACE_AGENT_IMAGE
+      securityContext:
+        runAsUser: 1000
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      env:
+        - name: HOME
+          value: /home/agent
+        - name: HTTPS_PROXY
+          value: http://127.0.0.1:18081
+        - name: NO_PROXY
+          value: 127.0.0.1,localhost
+        - name: KIRO_DISABLE_TELEMETRY
+          value: "1"
+      volumeMounts:
+        - name: session-socket
+          mountPath: /run/auth-proxy
+        - name: caller-key
+          mountPath: /var/run/auth-proxy/caller
+          readOnly: true
+        - name: home
+          mountPath: /home/agent
+        - name: work
+          mountPath: /work
+        - name: tmp
+          mountPath: /tmp
+    # The proxy: the only container that holds the credential. Its listener is 127.0.0.1:18080.
+    - name: proxy
+      image: REPLACE_PROXY_IMAGE
+      command:
+        - auth-proxy
+        - --config
+        - /etc/auth-proxy/identity.toml
+        - --session-socket
+        - /run/auth-proxy/session.sock
+        - --admin-socket
+        - /run/auth-proxy-admin/admin.sock
+        - --secret-root
+        - /var/run/auth-proxy/secrets
+        - --token-dir
+        - /var/lib/auth-proxy/tokens
+      securityContext:
+        runAsUser: 1001
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: identity-config
+          mountPath: /etc/auth-proxy
+          readOnly: true
+        - name: kiro-secret
+          mountPath: /var/run/auth-proxy/secrets/auth-proxy-kiro
+          readOnly: true
+        - name: session-socket
+          mountPath: /run/auth-proxy
+        - name: admin-socket
+          mountPath: /run/auth-proxy-admin
+        - name: proxy-state
+          mountPath: /var/lib/auth-proxy
+    # The egress proxy: no credential and no broker. It only tunnels to allow-listed host:port.
+    - name: egress
+      image: REPLACE_EGRESS_IMAGE
+      command:
+        - ap-egress
+        - --config
+        - /etc/auth-proxy/identity.toml
+        - --listen
+        - 127.0.0.1:18081
+      securityContext:
+        runAsUser: 1002
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: identity-config
+          mountPath: /etc/auth-proxy
+          readOnly: true
+  volumes:
+    - name: netinit-run
+      emptyDir: {}
+    - name: session-socket
+      emptyDir: {}
+    - name: admin-socket
+      emptyDir: {}
+    - name: proxy-state
+      emptyDir: {}
+    - name: home
+      emptyDir: {}
+    - name: work
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}
+    - name: identity-config
+      configMap:
+        name: auth-proxy-identity
+    - name: caller-key
+      secret:
+        secretName: auth-proxy-caller
+        defaultMode: 292
+        items:
+          - key: caller_key
+            path: caller_key
+    # The store reads <secret-root>/<secret>/<key>, so this mounts the secret at its own subdirectory.
+    # defaultMode 292 is octal 0444: readable by any UID that mounts it. Only the proxy mounts it,
+    # and the validator fails if the agent does. No fsGroup is set.
+    - name: kiro-secret
+      secret:
+        secretName: auth-proxy-kiro
+        defaultMode: 292
+        items:
+          - key: api_key
+            path: api_key

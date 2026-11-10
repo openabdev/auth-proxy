@@ -286,6 +286,23 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn token_file_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let clock = ManualClock::new(T0);
+        let dir = tmp_dir("mode");
+        let mut r = Registry::new(clock.clone(), cfg(), access(), Some(dir.clone()));
+        hello(&mut r, IDENT, T0);
+        let mode = std::fs::metadata(token_file(&dir, IDENT))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn token_hash_reload_keeps_authority_valid() {
         let clock = ManualClock::new(T0);

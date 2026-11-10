@@ -15,6 +15,7 @@ use axum::body::Body;
 use axum::http::Request;
 use http_body_util::BodyExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
@@ -119,12 +120,16 @@ async fn surrogate_refused(app: &Arc<App>, caller: &str, surrogate: &str) -> boo
 }
 
 fn scratch_dir() -> PathBuf {
-    // Short path: a Unix socket path is limited to about 100 bytes.
+    // Short path: a Unix socket path is limited to about 100 bytes. The counter makes the name
+    // unique even when the clock's resolution gives two tests the same timestamp; without it
+    // parallel tests shared one directory and failed to bind the same socket path.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let dir = PathBuf::from("/tmp").join(format!("apc-{}-{nanos}", std::process::id()));
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = PathBuf::from("/tmp").join(format!("apc-{}-{nanos}-{n}", std::process::id()));
     std::fs::create_dir_all(dir.join("tokens")).expect("tokens dir");
     std::fs::create_dir_all(dir.join("secrets")).expect("secrets dir");
     dir

@@ -6,3 +6,5 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+ap-core = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

@@ -7,6 +7,8 @@ pub mod admin_http;
 pub mod audit_sink;
 pub mod forward;
 pub mod listener;
+#[cfg(feature = "matrix-upstream")]
+pub mod matrix_hooks;
 pub mod pipeline;
 pub mod session_http;
 
@@ -81,6 +83,8 @@ where
 /// Start the proxy and serve until a listener stops. Returns the process exit code: 2 for an
 /// invalid config or a socket that cannot be bound, 1 for a listener that stops while serving.
 pub async fn run(opts: Options) -> i32 {
+    #[cfg(feature = "matrix-upstream")]
+    eprintln!("{}", matrix_hooks::WARNING);
     let text = match std::fs::read_to_string(&opts.config) {
         Ok(t) => t,
         Err(e) => {

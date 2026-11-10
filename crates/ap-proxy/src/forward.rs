@@ -32,9 +32,14 @@ pub fn client_builder() -> ClientBuilder {
         .pool_idle_timeout(Duration::from_secs(60))
 }
 
-/// The production client, with the system trust roots.
-pub fn client() -> reqwest::Result<Client> {
-    client_builder().build()
+/// The production client, with the system trust roots. A `matrix-upstream` test build also applies
+/// the test overrides in `matrix_hooks`.
+pub fn client() -> Result<Client, String> {
+    #[cfg(feature = "matrix-upstream")]
+    let builder = crate::matrix_hooks::apply(client_builder())?;
+    #[cfg(not(feature = "matrix-upstream"))]
+    let builder = client_builder();
+    builder.build().map_err(|e| e.to_string())
 }
 
 /// The upstream URL for a route. `path_and_query` is the route-relative path with its query.

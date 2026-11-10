@@ -302,6 +302,12 @@ impl Config {
                         r.name
                     )));
                 }
+                if !AUTH_HEADERS.contains(&h.as_str()) {
+                    return Err(invalid(format!(
+                        "route {:?}: {field} {h:?} must be a credential header (AUTH_HEADERS) so stripping removes it",
+                        r.name
+                    )));
+                }
             }
             for h in &r.pass_headers {
                 if !valid_header_name(h) {
@@ -444,12 +450,12 @@ impl Config {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const H64: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    fn base() -> String {
+    pub(crate) fn base() -> String {
         format!(
             r#"version = 1
 
@@ -610,6 +616,28 @@ allow = ["github.com:443"]
                 "pass_headers = [\"authorization\"]",
             ),
             "credential or hop-by-hop",
+        );
+    }
+
+    #[test]
+    fn rejects_surrogate_header_not_in_auth_set() {
+        expect_invalid(
+            &base().replace(
+                "error_shape = \"aws\"",
+                "error_shape = \"aws\"\n    surrogate_header = \"x-custom\"",
+            ),
+            "must be a credential header",
+        );
+    }
+
+    #[test]
+    fn rejects_credential_header_not_in_auth_set() {
+        expect_invalid(
+            &base().replace(
+                "error_shape = \"aws\"",
+                "error_shape = \"aws\"\n    credential_header = \"x-custom\"",
+            ),
+            "must be a credential header",
         );
     }
 

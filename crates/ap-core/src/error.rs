@@ -1,5 +1,7 @@
 //! Refusal codes from design section 4. Each code has one HTTP status and one stable string.
 
+use crate::config::ErrorShape;
+
 /// A refusal code. The string form is what audit lines and error bodies carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Code {
@@ -27,6 +29,33 @@ pub enum Code {
 }
 
 impl Code {
+    /// Fixed, non-secret sentence for the error body.
+    pub fn message(self) -> &'static str {
+        match self {
+            Code::AbsoluteForm => "request target must be origin-form",
+            Code::HostRejected => "host header is missing, duplicated or not the route host",
+            Code::PathAmbiguous => "request path is ambiguous",
+            Code::SurrogateAmbiguous => "more than one surrogate header",
+            Code::CallerRejected => "caller key is missing or unknown",
+            Code::SurrogateMissing => "surrogate header is missing",
+            Code::SurrogateMalformed => "surrogate header is malformed",
+            Code::SurrogateUnknown => "surrogate is not registered",
+            Code::SurrogateRevoked => "surrogate was revoked",
+            Code::SurrogateExpired => "surrogate lease expired",
+            Code::SurrogateWrongCaller => "surrogate belongs to another caller",
+            Code::SurrogateWrongRoute => "surrogate is not valid for this route",
+            Code::PolicyEmpty => "no policy grants for this caller",
+            Code::PolicyDenied => "request is not allowed by policy",
+            Code::RouteUnknown => "route is unknown",
+            Code::ConnectRefused => "CONNECT is not served here",
+            Code::BodyTooLarge => "request body exceeds the configured limit",
+            Code::WebsocketUnsupported => "websocket upgrade is not supported",
+            Code::UpstreamUnavailable => "upstream is unavailable",
+            Code::PolicyUnavailable => "policy is unavailable",
+            Code::BrokerUnavailable => "credential store is unavailable",
+        }
+    }
+
     /// HTTP status for this refusal.
     pub fn status(self) -> u16 {
         match self {
@@ -81,9 +110,57 @@ impl Code {
     }
 }
 
+/// Status and body of a refusal in the route's error dialect.
+///
+/// `generic` returns `{"error": code, "message": text}`. `aws` returns the AWS JSON protocol
+/// shape `{"__type": "AccessDeniedException", "message": "auth-proxy: <code>: <text>"}`, so
+/// kiro-cli shows the message as-is. The status is the same in both shapes.
+pub fn render(code: Code, shape: ErrorShape) -> (u16, Vec<u8>) {
+    let body = match shape {
+        ErrorShape::Generic => serde_json::json!({
+            "error": code.code_str(),
+            "message": code.message(),
+        }),
+        ErrorShape::Aws => serde_json::json!({
+            "__type": "AccessDeniedException",
+            "message": format!("auth-proxy: {}: {}", code.code_str(), code.message()),
+        }),
+    };
+    // Serializing a json! value cannot fail.
+    let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    (code.status(), bytes)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Code;
+    use super::{render, Code};
+    use crate::config::ErrorShape;
+
+    #[test]
+    fn render_generic_body_is_error_and_message_json() {
+        let (status, body) = render(Code::PolicyDenied, ErrorShape::Generic);
+        assert_eq!(status, 403);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "policy_denied");
+        assert_eq!(v["message"], Code::PolicyDenied.message());
+        assert!(v.get("__type").is_none());
+    }
+
+    #[test]
+    fn render_aws_body_has_access_denied_type() {
+        let (status, body) = render(Code::PolicyDenied, ErrorShape::Aws);
+        assert_eq!(status, 403);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["__type"], "AccessDeniedException");
+        assert!(v["message"].as_str().unwrap().contains("auth-proxy"));
+        assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn render_status_follows_code_in_both_shapes() {
+        assert_eq!(render(Code::BodyTooLarge, ErrorShape::Aws).0, 413);
+        assert_eq!(render(Code::PolicyUnavailable, ErrorShape::Generic).0, 503);
+    }
 
     #[test]
     fn statuses_match_design_table() {

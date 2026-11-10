@@ -1,0 +1,24 @@
+# Build context: repository root.
+#   podman build -f deploy/k8s/Containerfile --target proxy   -t REPLACE_PROXY_IMAGE .
+#   podman build -f deploy/k8s/Containerfile --target egress  -t REPLACE_EGRESS_IMAGE .
+#   podman build -f deploy/k8s/Containerfile --target netinit -t REPLACE_NETINIT_IMAGE .
+# Replace each *_DIGEST placeholder with a pinned digest before release.
+
+# Release builds use default features only. The matrix-upstream feature stays off.
+FROM docker.io/library/rust@sha256:REPLACE_RUST_DIGEST AS builder
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked -p ap-proxy -p ap-egress
+
+FROM docker.io/library/alpine@sha256:REPLACE_ALPINE_DIGEST AS netinit
+RUN apk add --no-cache iptables
+COPY deploy/k8s/netinit/netinit.sh /usr/local/bin/netinit.sh
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/netinit.sh"]
+
+FROM gcr.io/distroless/cc-debian12@sha256:REPLACE_DISTROLESS_DIGEST AS proxy
+COPY --from=builder /src/target/release/auth-proxy /usr/local/bin/auth-proxy
+ENTRYPOINT ["/usr/local/bin/auth-proxy"]
+
+FROM gcr.io/distroless/cc-debian12@sha256:REPLACE_DISTROLESS_DIGEST AS egress
+COPY --from=builder /src/target/release/ap-egress /usr/local/bin/ap-egress
+ENTRYPOINT ["/usr/local/bin/ap-egress"]

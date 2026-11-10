@@ -69,9 +69,12 @@ pub struct App {
     policy: RwLock<Option<Loaded>>,
     listen_authority: String,
     max_body: u64,
+    pub(crate) token_dir: PathBuf,
+    pub(crate) identity_names: Vec<String>,
+    pub(crate) authority_lease_secs: u64,
     pub(crate) registry: Arc<Mutex<Registry<SystemClock>>>,
     broker: Arc<dyn Broker>,
-    audit: AuditSink,
+    pub(crate) audit: AuditSink,
     client: reqwest::Client,
 }
 
@@ -90,10 +93,12 @@ impl App {
             SystemClock,
             RegistryCfg::from_sessions(&cfg.sessions),
             Access::from_config(&cfg),
-            Some(token_dir),
+            Some(token_dir.clone()),
         );
         let listen_authority = cfg.listen.proxy.to_string();
         let max_body = cfg.limits.max_body_bytes;
+        let identity_names = cfg.identities.iter().map(|i| i.name.clone()).collect();
+        let authority_lease_secs = cfg.sessions.authority_lease_secs;
         let snap = Arc::new(Snapshot::from_config(&cfg));
         let policy = stamp_of(&policy_path).map(|stamp| Loaded {
             stamp,
@@ -105,6 +110,9 @@ impl App {
             policy: RwLock::new(policy),
             listen_authority,
             max_body,
+            token_dir,
+            identity_names,
+            authority_lease_secs,
             registry: Arc::new(Mutex::new(registry)),
             broker,
             audit,

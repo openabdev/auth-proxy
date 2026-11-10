@@ -66,6 +66,9 @@ impl<C: Clock> Registry<C> {
     /// A listed surrogate that was revoked (for example by a DELETE racing this resync) makes
     /// the whole batch fail with `Conflict`. The authority must rebuild its list without that
     /// surrogate and resend.
+    ///
+    /// A listed session whose stored absolute expiry has passed is skipped, not an error: it is
+    /// not registered, and the rest of the batch still applies.
     pub fn resync(
         &mut self,
         identity: &str,
@@ -101,13 +104,17 @@ impl<C: Clock> Registry<C> {
             }
             // A session key keeps the absolute expiry stored when it was first recorded. A key
             // the store has never seen gets a new one, persisted before anything changes.
-            let absolute = match self.stored_expiry(identity, &key, now)? {
-                Some(absolute) => absolute,
-                None => {
+            let absolute = match self.stored_expiry(identity, &key, now) {
+                Ok(Some(absolute)) => absolute,
+                Ok(None) => {
                     let absolute = now + self.cfg.absolute_ttl_secs;
                     pending.push((record_key(identity, &key.0, key.1), absolute));
                     absolute
                 }
+                // Past its stored absolute expiry: leave it out of the batch. The key stays
+                // unbound, so its surrogate is refused as unknown, and the rest still applies.
+                Err(SessErr::AbsoluteExpired) => continue,
+                Err(e) => return Err(e),
             };
             plan.push((e, absolute));
         }

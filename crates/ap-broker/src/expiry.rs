@@ -288,16 +288,55 @@ mod tests {
         let past = T0 + cfg().absolute_ttl_secs;
         clock.set(past);
         let mut second = open(&clock, &dir, &path).expect("restart");
-        assert_eq!(
-            second.resync(IDENT, &tok, vec![entry("s1", 1, "a")], past),
-            Err(SessErr::AbsoluteExpired)
-        );
+        let resp = second
+            .resync(IDENT, &tok, vec![entry("s1", 1, "a")], past)
+            .expect("expired entry is skipped, not a batch error");
+        assert_eq!(resp.registered, 0);
         assert_eq!(
             second.register(IDENT, &tok, entry("s1", 1, "a"), past),
             Err(SessErr::AbsoluteExpired)
         );
         assert_eq!(
             second.authorize(&sha("a"), IDENT, "kiro-api", past),
+            Err(Deny::Unknown)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resync_after_restart_with_one_expired_and_one_live_entry_applies_the_live_one() {
+        let dir = tmp_dir("mixed-abs");
+        let path = file_in(&dir);
+        let clock = ManualClock::new(T0);
+        let mut first = open(&clock, &dir, &path).expect("start");
+        let tok = first.hello(IDENT, T0).expect("hello");
+        first
+            .register(IDENT, &tok, entry("s1", 1, "a"), T0)
+            .expect("register s1");
+        // s2 starts six hours later, so its absolute expiry is later than s1's. The authority and
+        // s1 are kept alive until then, otherwise the token lapses.
+        keep_alive(&mut first, &clock, &tok, "s1", T0 + 6 * 3600);
+        first
+            .register(IDENT, &tok, entry("s2", 1, "b"), clock.now())
+            .expect("register s2");
+        drop(first);
+
+        // s1's absolute expiry (T0 + 12 h) has passed; s2's (T0 + 18 h) has not.
+        let now = T0 + 12 * 3600;
+        clock.set(now);
+        let mut second = open(&clock, &dir, &path).expect("restart");
+        let resp = second
+            .resync(
+                IDENT,
+                &tok,
+                vec![entry("s1", 1, "a"), entry("s2", 1, "b")],
+                now,
+            )
+            .expect("batch with one expired entry still applies");
+        assert_eq!(resp.registered, 1);
+        assert!(second.authorize(&sha("b"), IDENT, "kiro-api", now).is_ok());
+        assert_eq!(
+            second.authorize(&sha("a"), IDENT, "kiro-api", now),
             Err(Deny::Unknown)
         );
         std::fs::remove_dir_all(&dir).ok();

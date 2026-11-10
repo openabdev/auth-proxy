@@ -4,8 +4,12 @@
 //! identity is found from the token: each identity's hash file in the token directory is compared
 //! in constant time. The registry checks the token again on every call.
 //!
-//! Each call writes one audit line with the session id, generation, a 12-character prefix of the
-//! surrogate's sha256, and the result. The token and the surrogate never appear in it.
+//! Each call writes exactly one audit line, including calls refused before the handler's own
+//! logic (missing or wrong bearer, bad body, bad generation). The line carries the session id,
+//! generation, a 12-character prefix of the surrogate's sha256 and the result. For renew and
+//! resync, which name several sessions in one body, the line carries `sessions` (the count of
+//! sessions in the request) in place of a session id. The token and the surrogate never appear in
+//! it.
 
 use std::sync::{Arc, MutexGuard};
 use std::time::Duration;
@@ -104,14 +108,18 @@ fn identify(app: &App, token: &str) -> Option<String> {
     found
 }
 
-/// A ready-made error response. Boxed, so the `Result` helpers stay small.
-type Refusal = Box<Response>;
-
-fn refusal(status: u16, code: &str) -> Refusal {
-    Box::new(error_reply(status, code))
+/// A refusal decided before the handler's own logic: HTTP status and error code.
+#[derive(Debug, Clone, Copy)]
+struct Refusal {
+    status: u16,
+    code: &'static str,
 }
 
-/// The calling identity and its token, or a 401 response.
+fn refusal(status: u16, code: &'static str) -> Refusal {
+    Refusal { status, code }
+}
+
+/// The calling identity and its token, or a 401 refusal.
 fn authenticate(app: &App, headers: &HeaderMap) -> Result<(String, String), Refusal> {
     let token = bearer_token(headers).ok_or_else(|| refusal(401, "unauthorized"))?;
     let identity = identify(app, token).ok_or_else(|| refusal(401, "unauthorized"))?;
@@ -157,9 +165,27 @@ struct Event<'a> {
     identity: &'a str,
     session: Option<&'a str>,
     generation: Option<u64>,
+    /// Count of sessions named in a renew or resync body.
+    sessions: Option<usize>,
     surrogate_sha256: Option<&'a str>,
     status: u16,
     result: &'a str,
+}
+
+impl<'a> Event<'a> {
+    /// An event for `op` with no session fields. The caller sets `status` and `result`.
+    fn bare(op: &'static str, identity: &'a str) -> Self {
+        Event {
+            op,
+            identity,
+            session: None,
+            generation: None,
+            sessions: None,
+            surrogate_sha256: None,
+            status: 0,
+            result: "",
+        }
+    }
 }
 
 fn audit(app: &App, ev: Event<'_>) {
@@ -172,6 +198,7 @@ fn audit(app: &App, ev: Event<'_>) {
         "identity": ev.identity,
         "session": ev.session,
         "generation": ev.generation,
+        "sessions": ev.sessions,
         "surrogate_sha256_prefix": prefix,
         "status": ev.status,
         "result": ev.result,
@@ -179,22 +206,27 @@ fn audit(app: &App, ev: Event<'_>) {
     app.audit.write_line(&line.to_string());
 }
 
+/// Audit a refusal made before the handler's logic, and build its response. The refusal supplies
+/// the status and result; the event supplies the rest.
+fn refused(app: &App, mut ev: Event<'_>, r: Refusal) -> Response {
+    ev.status = r.status;
+    ev.result = r.code;
+    audit(app, ev);
+    error_reply(r.status, r.code)
+}
+
 async fn hello(State(app): State<Arc<App>>, body: Body) -> Response {
     let req: HelloReq = match read_json(body).await {
         Ok(r) => r,
-        Err(resp) => return *resp,
+        Err(r) => return refused(&app, Event::bare("hello", ""), r),
     };
     if !app.identity_names.contains(&req.identity) {
         audit(
             &app,
             Event {
-                op: "hello",
-                identity: &req.identity,
-                session: None,
-                generation: None,
-                surrogate_sha256: None,
                 status: 400,
                 result: "identity_unknown",
+                ..Event::bare("hello", &req.identity)
             },
         );
         return error_reply(400, "identity_unknown");
@@ -231,13 +263,9 @@ async fn hello(State(app): State<Arc<App>>, body: Body) -> Response {
     audit(
         &app,
         Event {
-            op: "hello",
-            identity: &req.identity,
-            session: None,
-            generation: None,
-            surrogate_sha256: None,
             status,
             result: &result,
+            ..Event::bare("hello", &req.identity)
         },
     );
     reply
@@ -246,11 +274,11 @@ async fn hello(State(app): State<Arc<App>>, body: Body) -> Response {
 async fn register(State(app): State<Arc<App>>, headers: HeaderMap, body: Body) -> Response {
     let (identity, token) = match authenticate(&app, &headers) {
         Ok(v) => v,
-        Err(resp) => return *resp,
+        Err(r) => return refused(&app, Event::bare("register", ""), r),
     };
     let entry: Entry = match read_json(body).await {
         Ok(e) => e,
-        Err(resp) => return *resp,
+        Err(r) => return refused(&app, Event::bare("register", &identity), r),
     };
     let session = entry.session.clone();
     let generation = entry.generation;
@@ -279,13 +307,12 @@ async fn register(State(app): State<Arc<App>>, headers: HeaderMap, body: Body) -
     audit(
         &app,
         Event {
-            op: "register",
-            identity: &identity,
             session: Some(&session),
             generation: Some(generation),
             surrogate_sha256: Some(&surrogate),
             status,
             result: &result,
+            ..Event::bare("register", &identity)
         },
     );
     reply
@@ -294,13 +321,14 @@ async fn register(State(app): State<Arc<App>>, headers: HeaderMap, body: Body) -
 async fn renew(State(app): State<Arc<App>>, headers: HeaderMap, body: Body) -> Response {
     let (identity, token) = match authenticate(&app, &headers) {
         Ok(v) => v,
-        Err(resp) => return *resp,
+        Err(r) => return refused(&app, Event::bare("renew", ""), r),
     };
     let req: RenewReq = match read_json(body).await {
         Ok(r) => r,
-        Err(resp) => return *resp,
+        Err(r) => return refused(&app, Event::bare("renew", &identity), r),
     };
     let refs: Vec<SessionRef> = req.sessions;
+    let count = refs.len();
     let outcome = with_registry(&app, |reg, now| reg.renew(&identity, &token, &refs, now));
     let (status, reply, result) = match outcome {
         None => (
@@ -317,13 +345,10 @@ async fn renew(State(app): State<Arc<App>>, headers: HeaderMap, body: Body) -> R
     audit(
         &app,
         Event {
-            op: "renew",
-            identity: &identity,
-            session: None,
-            generation: None,
-            surrogate_sha256: None,
+            sessions: Some(count),
             status,
             result: &result,
+            ..Event::bare("renew", &identity)
         },
     );
     reply
@@ -332,13 +357,14 @@ async fn renew(State(app): State<Arc<App>>, headers: HeaderMap, body: Body) -> R
 async fn resync(State(app): State<Arc<App>>, headers: HeaderMap, body: Body) -> Response {
     let (identity, token) = match authenticate(&app, &headers) {
         Ok(v) => v,
-        Err(resp) => return *resp,
+        Err(r) => return refused(&app, Event::bare("resync", ""), r),
     };
     let req: ResyncReq = match read_json(body).await {
         Ok(r) => r,
-        Err(resp) => return *resp,
+        Err(r) => return refused(&app, Event::bare("resync", &identity), r),
     };
     let list = req.sessions;
+    let count = list.len();
     let outcome = with_registry(&app, |reg, now| reg.resync(&identity, &token, list, now));
     let (status, reply, result) = match outcome {
         None => (
@@ -355,13 +381,10 @@ async fn resync(State(app): State<Arc<App>>, headers: HeaderMap, body: Body) -> 
     audit(
         &app,
         Event {
-            op: "resync",
-            identity: &identity,
-            session: None,
-            generation: None,
-            surrogate_sha256: None,
+            sessions: Some(count),
             status,
             result: &result,
+            ..Event::bare("resync", &identity)
         },
     );
     reply
@@ -374,10 +397,26 @@ async fn revoke(
 ) -> Response {
     let (identity, token) = match authenticate(&app, &headers) {
         Ok(v) => v,
-        Err(resp) => return *resp,
+        Err(r) => {
+            return refused(
+                &app,
+                Event {
+                    session: Some(&session),
+                    ..Event::bare("revoke", "")
+                },
+                r,
+            )
+        }
     };
     let Ok(generation) = generation.parse::<u64>() else {
-        return error_reply(400, "invalid_field");
+        return refused(
+            &app,
+            Event {
+                session: Some(&session),
+                ..Event::bare("revoke", &identity)
+            },
+            refusal(400, "invalid_field"),
+        );
     };
     let session_ref = session.clone();
     let outcome = with_registry(&app, |reg, now| {
@@ -402,13 +441,11 @@ async fn revoke(
     audit(
         &app,
         Event {
-            op: "revoke",
-            identity: &identity,
             session: Some(&session),
             generation: Some(generation),
-            surrogate_sha256: None,
             status,
             result: &result,
+            ..Event::bare("revoke", &identity)
         },
     );
     reply

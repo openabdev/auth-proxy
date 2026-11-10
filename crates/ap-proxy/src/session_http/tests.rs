@@ -103,6 +103,34 @@ async fn session_plane_registers_renews_and_refuses_a_wrong_token() {
 }
 
 #[tokio::test]
+async fn unauthenticated_call_writes_one_audit_line_and_no_token() {
+    let up = start_upstream().await;
+    let f = Fixture::new("unauth", &up);
+    let (status, _) = call(
+        router(Arc::clone(&f.app)),
+        "POST",
+        "/v1/sessions",
+        Some("apt_wrong_0001"),
+        json!({
+            "session": "sess-1",
+            "generation": 1,
+            "surrogate_sha256": sha256_hex("aps_unused"),
+            "credentials": ["kiro"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 401);
+
+    let text = f.audit_text();
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains("\"op\":")).collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    assert!(lines[0].contains("\"op\":\"register\""), "{text}");
+    assert!(lines[0].contains("\"status\":401"), "{text}");
+    assert!(lines[0].contains("\"result\":\"unauthorized\""), "{text}");
+    assert!(!text.contains("apt_wrong_0001"), "presented token in audit");
+}
+
+#[tokio::test]
 async fn admin_lists_sessions_and_revoke_all_revokes_them() {
     let up = start_upstream().await;
     let f = Fixture::new("admin", &up);

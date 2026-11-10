@@ -75,7 +75,7 @@ pub fn check_origin_form(
     match (hosts.next(), hosts.next()) {
         (Some(_), Some(_)) => Err(Code::HostRejected),
         (None, _) => {
-            if version == Version::HTTP_11 && uri_authority.is_none() {
+            if version != Version::HTTP_2 && uri_authority.is_none() {
                 Err(Code::HostRejected)
             } else {
                 Ok(())
@@ -253,6 +253,11 @@ mod tests {
         assert!(canonical_host("-a.b").is_err());
     }
 
+    #[test]
+    fn rejects_ipv4_mapped_ipv6_literal() {
+        assert!(canonical_host("::ffff:127.0.0.1").is_err());
+    }
+
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
@@ -314,11 +319,71 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_host_on_http10() {
+        let uri: Uri = "/v1/x".parse().unwrap();
+        let h = HeaderMap::new();
+        assert_eq!(
+            check_origin_form(&uri, &h, Version::HTTP_10, HOSTNAME),
+            Err(Code::HostRejected)
+        );
+    }
+
+    #[test]
     fn rejects_mismatched_host_header() {
         let uri: Uri = "/v1/x".parse().unwrap();
         let h = headers(&[("host", "other.example.dev")]);
         assert_eq!(
             check_origin_form(&uri, &h, Version::HTTP_11, HOSTNAME),
+            Err(Code::HostRejected)
+        );
+    }
+
+    #[test]
+    fn rejects_ipv4_short_form_host_header() {
+        let uri: Uri = "/v1/x".parse().unwrap();
+        let h = headers(&[("host", "127.1")]);
+        assert_eq!(
+            check_origin_form(&uri, &h, Version::HTTP_11, HOSTNAME),
+            Err(Code::HostRejected)
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_dot_host_header() {
+        let uri: Uri = "/v1/x".parse().unwrap();
+        let h = headers(&[("host", "runtime.example.dev.")]);
+        assert_eq!(
+            check_origin_form(&uri, &h, Version::HTTP_11, HOSTNAME),
+            Err(Code::HostRejected)
+        );
+    }
+
+    #[test]
+    fn rejects_ipv6_mapped_host_header() {
+        let uri: Uri = "/v1/x".parse().unwrap();
+        let h = headers(&[("host", "::ffff:127.0.0.1")]);
+        assert_eq!(
+            check_origin_form(&uri, &h, Version::HTTP_11, HOSTNAME),
+            Err(Code::HostRejected)
+        );
+    }
+
+    #[test]
+    fn rejects_absolute_form_with_userinfo_over_http1() {
+        let uri: Uri = format!("https://user@{HOSTNAME}/v1/x").parse().unwrap();
+        let h = headers(&[("host", HOSTNAME)]);
+        assert_eq!(
+            check_origin_form(&uri, &h, Version::HTTP_11, HOSTNAME),
+            Err(Code::AbsoluteForm)
+        );
+    }
+
+    #[test]
+    fn rejects_userinfo_in_http2_authority() {
+        let uri: Uri = format!("https://user@{HOSTNAME}/v1/x").parse().unwrap();
+        let h = HeaderMap::new();
+        assert_eq!(
+            check_origin_form(&uri, &h, Version::HTTP_2, HOSTNAME),
             Err(Code::HostRejected)
         );
     }
@@ -344,7 +409,7 @@ mod tests {
         for bad in [
             "/ap/k/r/../x",
             "/ap/k/r/%2e%2e/x",
-            "/ap/k/r/%2E%2e/x",
+            "/ap/k/kiro-krs/../kiro-cw/x",
             "/ap/k/r/a%2Fb",
             "/ap//r/x",
             "/ap/k/r/%252e%252e/x",

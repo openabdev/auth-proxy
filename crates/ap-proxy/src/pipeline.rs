@@ -38,6 +38,9 @@ use subtle::ConstantTimeEq;
 use crate::audit_sink::AuditSink;
 use crate::forward;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stamp {
     modified: SystemTime,

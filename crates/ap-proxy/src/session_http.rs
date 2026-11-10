@@ -34,6 +34,9 @@ use tokio::net::UnixListener;
 
 use crate::pipeline::App;
 
+#[cfg(test)]
+mod tests;
+
 /// Routes of the session plane.
 pub fn router(app: Arc<App>) -> Router {
     Router::new()

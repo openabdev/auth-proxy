@@ -77,13 +77,15 @@ impl<C: Clock> Registry<C> {
         now: u64,
     ) -> Result<ResyncResp, SessErr> {
         self.check_token(identity, token, now)?;
+        for e in &list {
+            validate_entry(e).map_err(SessErr::Invalid)?;
+            self.check_grants(identity, &e.credentials)?;
+        }
         let mut keys: HashSet<Key> = HashSet::new();
         let mut surrogates: HashSet<String> = HashSet::new();
         let mut plan: Vec<(Entry, u64)> = Vec::with_capacity(list.len());
         let mut pending: Vec<(String, u64)> = Vec::new();
         for e in list {
-            validate_entry(&e).map_err(SessErr::Invalid)?;
-            self.check_grants(identity, &e.credentials)?;
             let key = (e.session.clone(), e.generation);
             if !keys.insert(key.clone()) || !surrogates.insert(e.surrogate_sha256.clone()) {
                 return Err(SessErr::Conflict);
@@ -202,6 +204,26 @@ mod tests {
         );
         assert_eq!(snapshot(&r), before);
         assert!(r.authorize(&sha("a"), IDENT, "kiro-api", T0).is_ok());
+    }
+
+    #[test]
+    fn resync_invalid_entry_after_conflicting_entry_still_returns_invalid() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        let before = snapshot(&r);
+        let mut bad = entry("s9", 1, "z");
+        bad.surrogate_sha256 = "not-hex".into();
+        // The duplicate key is a conflict, but the malformed entry after it must win.
+        let list = vec![entry("s2", 1, "b"), entry("s2", 1, "c"), bad];
+        assert_eq!(
+            r.resync(IDENT, &tok, list, T0),
+            Err(SessErr::Invalid(WireErr {
+                field: "surrogate_sha256"
+            }))
+        );
+        assert_eq!(snapshot(&r), before);
     }
 
     #[test]

@@ -1,1 +1,3 @@
-//! Credential proxy: library half. Phase 1 skeleton.
+//! Credential proxy: library half.
+
+pub mod listener;

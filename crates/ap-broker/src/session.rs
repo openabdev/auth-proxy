@@ -24,12 +24,26 @@ pub fn write_token_hash(path: &Path, sha256_hex: &str) -> io::Result<()> {
     let mut tmp: OsString = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
+    // A leftover temp file keeps its old mode when reopened, so remove it before creating.
+    let _ = fs::remove_file(&tmp);
     {
-        let mut f = fs::File::create(&tmp)?;
+        let mut f = create_private(&tmp)?;
         f.write_all(sha256_hex.as_bytes())?;
         f.sync_all()?;
     }
     fs::rename(&tmp, path)
+}
+
+/// Create a new file for writing that only the owner can read. On Unix the mode is 0600.
+fn create_private(path: &Path) -> io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
 }
 
 /// Read the stored hash text. The caller checks that it is 64 lowercase hex digits.
@@ -47,6 +61,10 @@ impl<C: Clock> Registry<C> {
     /// On success, sessions not listed with the same surrogate are revoked and their surrogates
     /// tombstoned. `dropped` counts those. Listed sessions get a fresh lease. An existing
     /// session keeps its absolute expiry; a new one gets `absolute_ttl_secs` from now.
+    ///
+    /// A listed surrogate that was revoked (for example by a DELETE racing this resync) makes
+    /// the whole batch fail with `Conflict`. The authority must rebuild its list without that
+    /// surrogate and resend.
     pub fn resync(
         &mut self,
         identity: &str,
@@ -73,6 +91,12 @@ impl<C: Clock> Registry<C> {
             }
             if self.revoked.contains(&e.surrogate_sha256) {
                 return Err(SessErr::Conflict);
+            }
+            // Same rule as register: a live session cannot change its credential set.
+            if let Some(s) = self.sessions.get(identity).and_then(|m| m.get(&key)) {
+                if s.credentials != e.credentials {
+                    return Err(SessErr::Conflict);
+                }
             }
         }
         if list.len() > self.cfg.max_sessions {
@@ -161,6 +185,27 @@ mod tests {
         );
         assert_eq!(snapshot(&r), before);
         assert!(r.authorize(&sha("a"), IDENT, "kiro-api", T0).is_ok());
+    }
+
+    #[test]
+    fn resync_with_changed_credentials_on_live_session_is_conflict() {
+        let clock = ManualClock::new(T0);
+        let mut a = access();
+        a.grants
+            .get_mut(IDENT)
+            .unwrap()
+            .insert("kiro-2".to_string());
+        let mut r = Registry::new(clock.clone(), cfg(), a, None);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        let before = snapshot(&r);
+        let mut changed = entry("s1", 1, "a");
+        changed.credentials = vec!["kiro".into(), "kiro-2".into()];
+        assert_eq!(
+            r.resync(IDENT, &tok, vec![changed], T0),
+            Err(SessErr::Conflict)
+        );
+        assert_eq!(snapshot(&r), before);
     }
 
     #[test]

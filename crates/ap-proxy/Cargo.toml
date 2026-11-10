@@ -27,6 +27,12 @@ serde_json = "1"
 subtle = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
 
+[features]
+default = []
+# Test-only, off by default and never enabled in a release build. Lets the black-box matrix trust a
+# throwaway CA and resolve mock upstream names (crates/ap-proxy/src/matrix_hooks.rs).
+matrix-upstream = []
+
 [dev-dependencies]
 getrandom = "0.2"
 http-body-util = "0.1"

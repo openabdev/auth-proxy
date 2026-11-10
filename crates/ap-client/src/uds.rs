@@ -9,7 +9,11 @@ use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 use tokio::net::UnixStream;
+
+/// Longest wait for one request and its reply. A stalled proxy must not block the renew loop.
+pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Failure before a reply was read.
 #[derive(Debug)]
@@ -57,6 +61,22 @@ fn encode<T: Serialize + ?Sized>(body: &T) -> Result<Vec<u8>, UdsError> {
 }
 
 async fn send(
+    sock: &Path,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body: Option<Vec<u8>>,
+) -> Result<Reply, UdsError> {
+    match tokio::time::timeout(IO_TIMEOUT, exchange(sock, method, path, bearer, body)).await {
+        Ok(reply) => reply,
+        Err(_) => Err(UdsError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "session plane did not answer in time",
+        ))),
+    }
+}
+
+async fn exchange(
     sock: &Path,
     method: &str,
     path: &str,

@@ -9,7 +9,7 @@ use ap_core::session_wire::{
     ResyncResp, SessionRef, WireErr,
 };
 use serde::de::DeserializeOwned;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,6 +53,9 @@ struct Inner {
     identity: String,
     token: Mutex<String>,
     live: Mutex<BTreeMap<(String, u64), Entry>>,
+    /// Ended sessions whose DELETE the proxy has not confirmed. They are not renewed or resynced.
+    /// Every renew round retries the DELETE until the proxy answers 2xx or 404.
+    pending: Mutex<BTreeSet<(String, u64)>>,
 }
 
 impl Inner {
@@ -108,6 +111,7 @@ impl Authority {
             identity: identity.to_string(),
             token: Mutex::new(token),
             live: Mutex::new(BTreeMap::new()),
+            pending: Mutex::new(BTreeSet::new()),
         });
         let renewer = tokio::spawn(renew_loop(Arc::clone(&inner)));
         Ok(Authority { inner, renewer })
@@ -142,10 +146,19 @@ impl Authority {
         Ok(Surrogate(surrogate))
     }
 
-    /// End a session. The call returns after the proxy has dropped it. A session the proxy does
-    /// not know counts as ended.
+    /// End a session. The session stops being renewed at once. The call returns after the proxy
+    /// confirms the DELETE. If the DELETE fails, the session stays pending and every later renew
+    /// round retries it, so a restarted proxy never gets the session back from this client. A
+    /// session the proxy does not know counts as ended.
     pub async fn end(&self, session: &str, generation: u64) -> Result<(), AuthorityError> {
         validate_session(session).map_err(AuthorityError::Invalid)?;
+        let key = (session.to_string(), generation);
+        self.inner.live.lock().expect("live lock").remove(&key);
+        self.inner
+            .pending
+            .lock()
+            .expect("pending lock")
+            .insert(key.clone());
         let token = self.inner.token();
         let path = format!("/v1/sessions/{session}/{generation}");
         let reply = uds::delete(&self.inner.socket, &path, Some(&token))
@@ -153,10 +166,10 @@ impl Authority {
             .map_err(AuthorityError::Transport)?;
         check(&reply, |s| (200..300).contains(&s) || s == 404)?;
         self.inner
-            .live
+            .pending
             .lock()
-            .expect("live lock")
-            .remove(&(session.to_string(), generation));
+            .expect("pending lock")
+            .remove(&key);
         Ok(())
     }
 
@@ -180,6 +193,7 @@ async fn hello(socket: &Path, identity: &str) -> Result<String, AuthorityError> 
 }
 
 async fn renew_round(inner: &Inner) -> Result<(), AuthorityError> {
+    flush_pending(inner).await;
     let token = inner.token();
     let req = RenewReq {
         sessions: inner.refs(),
@@ -198,7 +212,51 @@ async fn renew_round(inner: &Inner) -> Result<(), AuthorityError> {
     if resp.unknown.is_empty() {
         Ok(())
     } else {
-        resync(inner).await
+        resync_after_unknown(inner, &resp.unknown).await
+    }
+}
+
+/// Resync after renew reported `unknown`. If the proxy rejects the batch with 409, it revoked
+/// one of the listed surrogates (an admin revoke-all does this). The sessions renew reported as
+/// unknown are dropped from the live set, and the rest are sent again.
+async fn resync_after_unknown(inner: &Inner, unknown: &[SessionRef]) -> Result<(), AuthorityError> {
+    match resync(inner).await {
+        Err(AuthorityError::Refused { status: 409, .. }) => {
+            {
+                let mut live = inner.live.lock().expect("live lock");
+                for r in unknown {
+                    live.remove(&(r.session.clone(), r.generation));
+                }
+            }
+            resync(inner).await
+        }
+        other => other,
+    }
+}
+
+/// Retry every pending revoke. An entry leaves the set only when the proxy answers 2xx or 404.
+/// A failed attempt stays pending for the next round.
+async fn flush_pending(inner: &Inner) {
+    let pending: Vec<(String, u64)> = inner
+        .pending
+        .lock()
+        .expect("pending lock")
+        .iter()
+        .cloned()
+        .collect();
+    for (session, generation) in pending {
+        let token = inner.token();
+        let path = format!("/v1/sessions/{session}/{generation}");
+        let Ok(reply) = uds::delete(&inner.socket, &path, Some(&token)).await else {
+            continue;
+        };
+        if (200..300).contains(&reply.status) || reply.status == 404 {
+            inner
+                .pending
+                .lock()
+                .expect("pending lock")
+                .remove(&(session, generation));
+        }
     }
 }
 

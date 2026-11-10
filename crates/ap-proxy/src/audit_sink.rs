@@ -3,11 +3,24 @@
 //! A write failure is counted and never refuses a request. Durable, fail-closed audit is out of
 //! Phase 1 (RFC Q5).
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use ap_core::audit::AuditRec;
+
+/// Standard output, locked for each write.
+struct Stdout;
+
+impl Write for Stdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::stdout().lock().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().lock().flush()
+    }
+}
 
 pub struct AuditSink {
     writer: Mutex<Box<dyn Write + Send>>,
@@ -21,6 +34,11 @@ impl AuditSink {
             writer: Mutex::new(writer),
             failures: AtomicU64::new(0),
         }
+    }
+
+    /// A sink on the process's standard output, the Phase 1 audit destination.
+    pub fn stdout() -> Self {
+        AuditSink::new(Box::new(Stdout))
     }
 
     /// Write one decision line. A newline is added when `line` lacks one.

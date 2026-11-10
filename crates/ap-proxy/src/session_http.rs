@@ -63,7 +63,7 @@ pub async fn serve_unix(listener: UnixListener, router: Router) {
     }
 }
 
-fn json_reply<T: Serialize>(status: u16, value: &T) -> Response {
+pub(crate) fn json_reply<T: Serialize>(status: u16, value: &T) -> Response {
     let body = serde_json::to_vec(value).unwrap_or_default();
     let mut r = Response::new(Body::from(body));
     *r.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -72,7 +72,7 @@ fn json_reply<T: Serialize>(status: u16, value: &T) -> Response {
     r
 }
 
-fn error_reply(status: u16, code: &str) -> Response {
+pub(crate) fn error_reply(status: u16, code: &str) -> Response {
     json_reply(status, &json!({ "error": code }))
 }
 
@@ -123,7 +123,10 @@ async fn read_json<T: DeserializeOwned>(body: Body) -> Result<T, Refusal> {
 }
 
 /// Run `f` with the registry and the current time. `None` when the registry lock is poisoned.
-fn with_registry<T>(app: &App, f: impl FnOnce(&mut Registry<SystemClock>, u64) -> T) -> Option<T> {
+pub(crate) fn with_registry<T>(
+    app: &App,
+    f: impl FnOnce(&mut Registry<SystemClock>, u64) -> T,
+) -> Option<T> {
     let mut reg: MutexGuard<'_, Registry<SystemClock>> = app.registry.lock().ok()?;
     let now = reg.now();
     Some(f(&mut reg, now))

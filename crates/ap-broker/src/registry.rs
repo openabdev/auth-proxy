@@ -513,6 +513,36 @@ impl<C: Clock> Registry<C> {
         }
         keys.len()
     }
+
+    /// Every live session as `(identity, session, generation)`, sorted. A session is live when
+    /// its own lease and its authority's lease are both unexpired. The result holds no surrogate
+    /// or hash. The admin socket uses it.
+    pub fn live_sessions(&self, now: u64) -> Vec<(String, String, u64)> {
+        let mut out = Vec::new();
+        for (identity, map) in &self.sessions {
+            let authority_live = self
+                .authorities
+                .get(identity)
+                .is_some_and(|a| now < a.lease_expiry);
+            if !authority_live {
+                continue;
+            }
+            for ((session, generation), s) in map {
+                if now < s.lease_expiry {
+                    out.push((identity.clone(), session.clone(), *generation));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Revoke every session of every identity. Returns how many were revoked. The admin socket
+    /// uses it.
+    pub fn revoke_everything(&mut self) -> usize {
+        let identities: Vec<String> = self.sessions.keys().cloned().collect();
+        identities.iter().map(|id| self.revoke_all(id)).sum()
+    }
 }
 
 /// A fresh authority token: `apt_` plus 64 lowercase hex digits from the OS random source.

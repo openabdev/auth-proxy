@@ -24,8 +24,8 @@ pub enum UdsError {
     Encode(serde_json::Error),
 }
 
-/// Status and body of a reply. The body is not interpreted here.
-#[derive(Debug)]
+/// Status and body of a reply. The body is not interpreted here. There is no `Debug`: a hello
+/// reply body carries the authority token.
 pub struct Reply {
     pub status: u16,
     pub body: Bytes,
@@ -114,4 +114,35 @@ async fn exchange(
         .map_err(UdsError::Http)?
         .to_bytes();
     Ok(Reply { status, body })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn silent_peer_times_out() {
+        let path = std::env::temp_dir().join(format!("apc-to-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind socket");
+        let accept = tokio::spawn(async move {
+            // Keep the connection open and never answer.
+            let (stream, _) = listener.accept().await.expect("accept");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+
+        let err = match delete(&path, "/v1/sessions/x/1", None).await {
+            Ok(_) => panic!("silent peer must fail"),
+            Err(e) => e,
+        };
+        accept.abort();
+        let _ = std::fs::remove_file(&path);
+
+        match err {
+            UdsError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
 }

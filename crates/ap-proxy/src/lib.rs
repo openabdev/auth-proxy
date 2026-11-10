@@ -24,6 +24,11 @@ use axum::Router;
 use audit_sink::AuditSink;
 use pipeline::App;
 
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod tests;
+
 /// Command-line usage, printed with every argument error.
 pub const USAGE: &str = "usage: auth-proxy --config <path> [--session-socket <path>] \
 [--admin-socket <path>] [--secret-root <dir>] [--token-dir <dir>]";

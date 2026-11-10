@@ -52,6 +52,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-rustls",
+ "tower",
 ]
 
 [[package]]

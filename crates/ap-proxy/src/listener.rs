@@ -9,6 +9,9 @@ use std::path::Path;
 
 use tokio::net::{TcpListener, UnixListener};
 
+#[cfg(test)]
+mod tests;
+
 /// Bind the agent listener. Any address that is not loopback is refused before the bind.
 pub async fn bind_loopback(addr: SocketAddr) -> io::Result<TcpListener> {
     if !addr.ip().is_loopback() {

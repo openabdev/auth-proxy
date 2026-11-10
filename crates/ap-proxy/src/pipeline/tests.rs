@@ -156,6 +156,28 @@ async fn declared_body_over_the_cap_is_413_and_never_connects_upstream() {
 }
 
 #[tokio::test]
+async fn undeclared_body_over_the_cap_is_413_with_an_audit_line() {
+    // No Content-Length, so the proxy cannot refuse before connecting. The upstream connection
+    // opens, the body stream fails at the cap, and the agent gets 413 with the audit line.
+    let up = start_upstream().await;
+    let f = Fixture::new("streamcap", &up);
+    let surrogate = register_session(&f.app, IDENTITY, "sess-1", 1);
+    let body = vec![b'x'; (CAP + 1) as usize];
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/ap/{}/{ROUTE}/", f.caller))
+        .header("host", LISTEN)
+        .header("authorization", format!("Bearer {surrogate}"))
+        .body(Body::from(body))
+        .expect("request");
+    let (status, _, _) = run_request(&f.app, req).await;
+    assert_eq!(status, 413);
+    let text = f.audit_text();
+    assert!(text.contains("\"code\":\"body_too_large\""), "{text}");
+    assert!(!text.contains(&surrogate), "surrogate in audit");
+}
+
+#[tokio::test]
 async fn corrupted_policy_file_drops_the_snapshot_until_it_is_valid_again() {
     let up = start_upstream().await;
     let f = Fixture::new("policy", &up);

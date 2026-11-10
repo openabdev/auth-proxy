@@ -8,3 +8,9 @@ license.workspace = true
 [dependencies]
 ap-core = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[features]
+default = []
+# Test-only, off by default and never enabled in a release build. Maps named hosts to addresses for
+# the black-box matrix (src/matrix_hooks.rs). The address check still runs on every mapped address.
+matrix-upstream = []

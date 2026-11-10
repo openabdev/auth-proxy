@@ -4,6 +4,7 @@
 //! invalid config, a non-loopback listen address or a bind failure.
 
 use ap_egress::connect::{serve_conn, TcpConnector};
+#[cfg(not(feature = "matrix-upstream"))]
 use ap_egress::resolve::SystemResolver;
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -12,6 +13,19 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 
 const USAGE: &str = "usage: ap-egress --config <path> --listen <loopback-addr>";
+
+/// The resolver for every connection. A feature-enabled build reads the test name map; a release
+/// build always uses the system resolver.
+#[cfg(feature = "matrix-upstream")]
+fn make_resolver() -> Result<Arc<ap_egress::matrix_hooks::TestResolver>, String> {
+    eprintln!("{}", ap_egress::matrix_hooks::WARNING);
+    Ok(Arc::new(ap_egress::matrix_hooks::TestResolver::from_env()?))
+}
+
+#[cfg(not(feature = "matrix-upstream"))]
+fn make_resolver() -> Result<Arc<SystemResolver>, String> {
+    Ok(Arc::new(SystemResolver))
+}
 
 struct Args {
     config: String,
@@ -78,6 +92,13 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let resolver = match make_resolver() {
+        Ok(resolver) => resolver,
+        Err(msg) => {
+            eprintln!("ap-egress: {msg}");
+            return ExitCode::from(2);
+        }
+    };
     eprintln!("ap-egress: listening");
 
     let allow = Arc::new(cfg.egress.allow);
@@ -85,8 +106,9 @@ async fn main() -> ExitCode {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let allow = Arc::clone(&allow);
+                let resolver = Arc::clone(&resolver);
                 tokio::spawn(async move {
-                    let _ = serve_conn(stream, &allow, &SystemResolver, &TcpConnector).await;
+                    let _ = serve_conn(stream, &allow, &*resolver, &TcpConnector).await;
                 });
             }
             Err(e) => {

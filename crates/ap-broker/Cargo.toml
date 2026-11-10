@@ -6,3 +6,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+ap-core = { workspace = true }
+getrandom = "0.2"
+sha2 = "0.10"
+subtle = "2"

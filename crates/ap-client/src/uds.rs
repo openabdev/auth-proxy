@@ -56,6 +56,17 @@ pub async fn delete(sock: &Path, path: &str, bearer: Option<&str>) -> Result<Rep
     send(sock, "DELETE", path, bearer, None).await
 }
 
+/// Aborts the connection driver when dropped. A request that times out drops its exchange, and
+/// this stops the driver with it, so the socket closes instead of staying open against a peer
+/// that never answers.
+struct Driver(tokio::task::JoinHandle<()>);
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn encode<T: Serialize + ?Sized>(body: &T) -> Result<Vec<u8>, UdsError> {
     serde_json::to_vec(body).map_err(UdsError::Encode)
 }
@@ -102,9 +113,9 @@ async fn exchange(
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(UdsError::Http)?;
-    tokio::spawn(async move {
+    let _driver = Driver(tokio::spawn(async move {
         let _ = connection.await;
-    });
+    }));
     let response = sender.send_request(request).await.map_err(UdsError::Http)?;
     let status = response.status().as_u16();
     let body = response

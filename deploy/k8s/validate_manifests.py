@@ -176,6 +176,62 @@ def main():
         ),
     )
 
+    # Container hardening on the three app containers (FEAT-006 step 2).
+    for name in sorted(EXPECTED_UIDS):
+        c = containers.get(name, {})
+        sec = c.get("securityContext", {})
+        problems = []
+        if sec.get("capabilities", {}).get("drop") != ["ALL"]:
+            problems.append("capabilities.drop is not [ALL]")
+        if sec.get("allowPrivilegeEscalation") is not False:
+            problems.append("allowPrivilegeEscalation is not false")
+        if sec.get("readOnlyRootFilesystem") is not True:
+            problems.append("readOnlyRootFilesystem is not true")
+        if sec.get("runAsNonRoot") is not True:
+            problems.append("runAsNonRoot is not true")
+        check("hardening-%s" % name, not problems, "; ".join(problems))
+
+    # --token-dir: the proxy writes the authority hash there at hello, so the path must be a
+    # writable mount of a proxy volume. Without it, the first hello fails.
+    proxy_args = containers.get("proxy", {}).get("command", [])
+
+    def flag_value(flag):
+        if flag in proxy_args:
+            i = proxy_args.index(flag)
+            if i + 1 < len(proxy_args):
+                return proxy_args[i + 1]
+        return None
+
+    token_dir = flag_value("--token-dir")
+    proxy_mounts = containers.get("proxy", {}).get("volumeMounts", [])
+    token_mounts = [m for m in proxy_mounts if m.get("mountPath") == token_dir]
+    check(
+        "token-dir-is-proxy-mount",
+        token_dir is not None and len(token_mounts) == 1,
+        "--token-dir %s is not a proxy volumeMount mountPath" % token_dir,
+    )
+    if token_mounts:
+        tv = volumes.get(token_mounts[0].get("name"), {})
+        check(
+            "token-dir-volume-writable-emptydir",
+            "emptyDir" in tv and not token_mounts[0].get("readOnly", False),
+            "token-dir volume must be an emptyDir mounted read-write",
+        )
+        check(
+            "token-dir-not-mounted-by-agent-or-egress",
+            token_mounts[0].get("name")
+            not in (mount_names("agent") | mount_names("egress")),
+        )
+    for flag in ("--session-socket", "--admin-socket"):
+        path = flag_value(flag)
+        parent = os.path.dirname(path) if path else None
+        check(
+            "%s-dir-is-proxy-mount" % flag.lstrip("-"),
+            parent is not None
+            and any(m.get("mountPath") == parent for m in proxy_mounts),
+            "%s %s has no proxy volumeMount for its directory" % (flag, path),
+        )
+
     # Port consistency: netinit, agent proxy env and the identity file must agree.
     netinit_env = {e["name"]: e.get("value") for e in netinit.get("env", [])}
     agent_env = {e["name"]: e.get("value") for e in containers["agent"].get("env", [])}

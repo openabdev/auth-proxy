@@ -112,6 +112,10 @@ spec:
           mountPath: /run/auth-proxy-admin
         - name: proxy-state
           mountPath: /var/lib/auth-proxy
+        # --token-dir points here. The proxy creates the authority hash file in this directory, so it
+        # must exist before the first hello. Only the proxy mounts it.
+        - name: proxy-tokens
+          mountPath: /var/lib/auth-proxy/tokens
     # The egress proxy: no credential and no broker. It only tunnels to allow-listed host:port.
     - name: egress
       image: REPLACE_EGRESS_IMAGE
@@ -140,6 +144,8 @@ spec:
     - name: admin-socket
       emptyDir: {}
     - name: proxy-state
+      emptyDir: {}
+    - name: proxy-tokens
       emptyDir: {}
     - name: home
       emptyDir: {}

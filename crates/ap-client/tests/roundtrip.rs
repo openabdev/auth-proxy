@@ -79,7 +79,8 @@ async fn start_server(root: &Path, caller_sha: &str) -> Server {
         Arc::new(FileStore::new(root.join("secrets"))),
         AuditSink::new(Box::new(std::io::sink())),
         forward::client().expect("upstream client"),
-    );
+    )
+    .expect("app");
     let socket = listener::bind_session_socket(&root.join("session.sock")).expect("bind socket");
     let task = tokio::spawn(serve_unix(socket, session_http::router(Arc::clone(&app))));
     Server { app, task }

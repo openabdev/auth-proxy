@@ -108,14 +108,20 @@ pub async fn run(opts: Options) -> i32 {
             return 1;
         }
     };
-    let app = App::new(
+    let app = match App::new(
         opts.config.clone(),
         cfg,
         opts.token_dir.clone(),
         broker,
         AuditSink::stdout(),
         client,
-    );
+    ) {
+        Ok(app) => app,
+        Err(e) => {
+            eprintln!("auth-proxy: {e}");
+            return 2;
+        }
+    };
 
     let agent_listener = match listener::bind_loopback(listen).await {
         Ok(l) => l,

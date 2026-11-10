@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use ap_core::session_wire::{validate_entry, Entry, ResyncResp};
 
 use crate::clock::Clock;
+use crate::expiry::record_key;
 use crate::registry::{sha256_hex, Key, Registry, SessErr};
 
 /// Path of one identity's hash file under `dir`. The file name is the sha256 of the identity
@@ -35,7 +36,7 @@ pub fn write_token_hash(path: &Path, sha256_hex: &str) -> io::Result<()> {
 }
 
 /// Create a new file for writing that only the owner can read. On Unix the mode is 0600.
-fn create_private(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn create_private(path: &Path) -> io::Result<fs::File> {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -73,15 +74,15 @@ impl<C: Clock> Registry<C> {
         now: u64,
     ) -> Result<ResyncResp, SessErr> {
         self.check_token(identity, token, now)?;
-        for e in &list {
-            validate_entry(e).map_err(SessErr::Invalid)?;
-            self.check_grants(identity, &e.credentials)?;
-        }
         let mut keys: HashSet<Key> = HashSet::new();
-        let mut surrogates: HashSet<&str> = HashSet::new();
-        for e in &list {
+        let mut surrogates: HashSet<String> = HashSet::new();
+        let mut plan: Vec<(Entry, u64)> = Vec::with_capacity(list.len());
+        let mut pending: Vec<(String, u64)> = Vec::new();
+        for e in list {
+            validate_entry(&e).map_err(SessErr::Invalid)?;
+            self.check_grants(identity, &e.credentials)?;
             let key = (e.session.clone(), e.generation);
-            if !keys.insert(key.clone()) || !surrogates.insert(e.surrogate_sha256.as_str()) {
+            if !keys.insert(key.clone()) || !surrogates.insert(e.surrogate_sha256.clone()) {
                 return Err(SessErr::Conflict);
             }
             match self.index.get(&e.surrogate_sha256) {
@@ -98,15 +99,27 @@ impl<C: Clock> Registry<C> {
                     return Err(SessErr::Conflict);
                 }
             }
+            // A session key keeps the absolute expiry stored when it was first recorded. A key
+            // the store has never seen gets a new one, persisted before anything changes.
+            let absolute = match self.stored_expiry(identity, &key, now)? {
+                Some(absolute) => absolute,
+                None => {
+                    let absolute = now + self.cfg.absolute_ttl_secs;
+                    pending.push((record_key(identity, &key.0, key.1), absolute));
+                    absolute
+                }
+            };
+            plan.push((e, absolute));
         }
-        if list.len() > self.cfg.max_sessions {
+        if plan.len() > self.cfg.max_sessions {
             return Err(SessErr::TooMany);
         }
+        self.persist(&pending)?;
 
         // Nothing below can fail.
-        let listed: HashMap<Key, String> = list
+        let listed: HashMap<Key, String> = plan
             .iter()
-            .map(|e| {
+            .map(|(e, _)| {
                 (
                     (e.session.clone(), e.generation),
                     e.surrogate_sha256.clone(),
@@ -130,13 +143,9 @@ impl<C: Clock> Registry<C> {
             }
         }
         self.touch(identity, now);
-        let registered = list.len();
-        for e in list {
+        let registered = plan.len();
+        for (e, absolute) in plan {
             let key = (e.session.clone(), e.generation);
-            let absolute = match self.sessions.get(identity).and_then(|m| m.get(&key)) {
-                Some(s) => s.absolute_expiry,
-                None => now + self.cfg.absolute_ttl_secs,
-            };
             self.put(
                 identity,
                 key,
@@ -157,6 +166,7 @@ impl<C: Clock> Registry<C> {
 mod tests {
     use super::*;
     use crate::clock::ManualClock;
+    use crate::expiry::MemoryExpiry;
     use crate::registry::test_support::{
         access, cfg, entry, new_reg, sha, snapshot, tmp_dir, IDENT, T0,
     };
@@ -195,7 +205,14 @@ mod tests {
             .get_mut(IDENT)
             .unwrap()
             .insert("kiro-2".to_string());
-        let mut r = Registry::new(clock.clone(), cfg(), a, None);
+        let mut r = Registry::new(
+            clock.clone(),
+            cfg(),
+            a,
+            None,
+            Box::new(MemoryExpiry::default()),
+        )
+        .expect("registry");
         let tok = hello(&mut r, IDENT, T0);
         r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
         let before = snapshot(&r);
@@ -277,7 +294,14 @@ mod tests {
     fn token_file_holds_only_the_hash() {
         let clock = ManualClock::new(T0);
         let dir = tmp_dir("hash-only");
-        let mut r = Registry::new(clock.clone(), cfg(), access(), Some(dir.clone()));
+        let mut r = Registry::new(
+            clock.clone(),
+            cfg(),
+            access(),
+            Some(dir.clone()),
+            Box::new(MemoryExpiry::default()),
+        )
+        .expect("registry");
         let tok = hello(&mut r, IDENT, T0);
         let text = std::fs::read_to_string(token_file(&dir, IDENT)).unwrap();
         assert_eq!(text, sha256_hex(&tok));
@@ -292,7 +316,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let clock = ManualClock::new(T0);
         let dir = tmp_dir("mode");
-        let mut r = Registry::new(clock.clone(), cfg(), access(), Some(dir.clone()));
+        let mut r = Registry::new(
+            clock.clone(),
+            cfg(),
+            access(),
+            Some(dir.clone()),
+            Box::new(MemoryExpiry::default()),
+        )
+        .expect("registry");
         hello(&mut r, IDENT, T0);
         let mode = std::fs::metadata(token_file(&dir, IDENT))
             .unwrap()
@@ -307,11 +338,25 @@ mod tests {
     fn token_hash_reload_keeps_authority_valid() {
         let clock = ManualClock::new(T0);
         let dir = tmp_dir("reload");
-        let mut first = Registry::new(clock.clone(), cfg(), access(), Some(dir.clone()));
+        let mut first = Registry::new(
+            clock.clone(),
+            cfg(),
+            access(),
+            Some(dir.clone()),
+            Box::new(MemoryExpiry::default()),
+        )
+        .expect("registry");
         let tok = hello(&mut first, IDENT, T0);
         drop(first);
         clock.set(T0 + 10);
-        let mut second = Registry::new(clock.clone(), cfg(), access(), Some(dir.clone()));
+        let mut second = Registry::new(
+            clock.clone(),
+            cfg(),
+            access(),
+            Some(dir.clone()),
+            Box::new(MemoryExpiry::default()),
+        )
+        .expect("registry");
         assert!(second.renew(IDENT, &tok, &[], clock.now()).is_ok());
         assert!(matches!(
             second.hello(IDENT, clock.now()),

@@ -256,7 +256,8 @@ impl Fixture {
             broker,
             sink,
             client_for(up),
-        );
+        )
+        .expect("app");
         Fixture {
             app,
             caller,

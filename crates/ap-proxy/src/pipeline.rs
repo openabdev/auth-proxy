@@ -21,6 +21,7 @@ use std::time::{Instant, SystemTime};
 
 use ap_broker::broker::Broker;
 use ap_broker::clock::SystemClock;
+use ap_broker::expiry::{file_in, FileExpiryStore};
 use ap_broker::registry::{sha256_hex, Access, Registry, RegistryCfg};
 use ap_core::audit::{path_only, AuditRec};
 use ap_core::canon;
@@ -83,7 +84,8 @@ pub struct App {
 
 impl App {
     /// Build the shared state. `cfg` is the config read from `policy_path` at startup, and
-    /// `token_dir` holds the authority token hashes.
+    /// `token_dir` holds the authority token hashes and the session expiry store. Fails when
+    /// the expiry store cannot be read, so the proxy never serves sessions without it.
     pub fn new(
         policy_path: PathBuf,
         cfg: Config,
@@ -91,13 +93,15 @@ impl App {
         broker: Arc<dyn Broker>,
         audit: AuditSink,
         client: reqwest::Client,
-    ) -> Arc<App> {
+    ) -> Result<Arc<App>, String> {
         let registry = Registry::new(
             SystemClock,
             RegistryCfg::from_sessions(&cfg.sessions),
             Access::from_config(&cfg),
             Some(token_dir.clone()),
-        );
+            Box::new(FileExpiryStore::new(file_in(&token_dir))),
+        )
+        .map_err(|e| format!("cannot load the session expiry store: {e}"))?;
         let listen_authority = cfg.listen.proxy.to_string();
         let max_body = cfg.limits.max_body_bytes;
         let identity_names = cfg.identities.iter().map(|i| i.name.clone()).collect();
@@ -108,7 +112,7 @@ impl App {
             snap,
             cfg: Arc::new(cfg),
         });
-        Arc::new(App {
+        Ok(Arc::new(App {
             policy_path,
             policy: RwLock::new(policy),
             listen_authority,
@@ -120,7 +124,7 @@ impl App {
             broker,
             audit,
             client,
-        })
+        }))
     }
 
     /// The policy in force now. The file's stamp (mtime and size) is checked on every call. A

@@ -1,0 +1,12 @@
+=== agent UID 1000 (ap-a)
+git-clone-https	rc=128	0.0s	fatal: unable to access 'https://github.com/octocat/Hello-World.git/': Could not resolve host: github.com
+curl-https	rc=6	0.0s	curl: (6) Could not resolve host: example.com
+npm-install	rc=1	70.7s	npm ERR!     /home/agent/.npm/_logs/2026-11-10T00_01_51_162Z-debug-0.log
+pip-download	rc=1	7.9s	ERROR: No matching distribution found for six
+cargo-fetch	rc=101	11.0s	  [6] Couldn't resolve host name (Could not resolve host: index.crates.io)
+=== control: UID 1001 in the proxy container (HOME=/tmp), same pod
+git-clone-https	rc=0	4.4s	Cloning into 'Hello-World'...
+curl-https	rc=0	0.3s	
+npm-install	rc=0	1.0s	added 1 package in 438ms
+pip-download	rc=0	1.1s	Successfully downloaded six
+cargo-fetch	rc=0	7.3s	  Downloaded itoa v1.0.19

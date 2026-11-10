@@ -1,0 +1,4 @@
+#!/bin/sh
+# Starts kiro-cli with the surrogate the platform handed over. The agent never sees
+# the real KIRO_API_KEY; the surrogate is useless without the proxy.
+KIRO_API_KEY="$(cat /handoff/surrogate)" exec kiro-cli "$@"

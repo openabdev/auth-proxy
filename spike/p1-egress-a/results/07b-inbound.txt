@@ -1,0 +1,3 @@
+=== inbound connection to a UID-1000 listener on 0.0.0.0:8080, from the node (curl to the pod IP)
+ap-a (RFC rule only): http=000 connect=0.000000s (handshake never completed) total=5.002787s rc=28
+ap-b (with ESTABLISHED accept): http=200 connect=0.000326s total=0.001368s rc=0

@@ -1,0 +1,14 @@
+table ip filter {
+	chain OUTPUT {
+		type filter hook output priority filter; policy accept;
+		oifname "lo" tcp dport 18190 skuid 1000 counter packets 0 bytes 0 reject with tcp reset
+		oifname != "lo" skuid 1000 counter packets 0 bytes 0 reject
+	}
+}
+table ip6 filter {
+	chain OUTPUT {
+		type filter hook output priority filter; policy accept;
+		oifname "lo" tcp dport 18190 skuid 1000 counter packets 0 bytes 0 reject with tcp reset
+		oifname != "lo" skuid 1000 counter packets 0 bytes 0 reject
+	}
+}

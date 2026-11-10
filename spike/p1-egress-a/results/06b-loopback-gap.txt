@@ -1,0 +1,3 @@
+=== loopback gap: agent -> sidecar broker port
+ap-a: {"admin_stats": "URLError:[Errno 111] Connection refused", "resolve": "URLError:[Errno 111] Connection refused"}
+ap-b: {"admin_stats": 200, "resolve": {"status": 200, "keys": ["credential", "credential_id", "expires_at"], "credential_len": 36}}

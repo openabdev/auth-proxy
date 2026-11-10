@@ -1,0 +1,54 @@
+=== ap-b (shareProcessNamespace: true), as the agent
+{
+ "uid": 1000,
+ "own_mount_secret": "ENOENT",
+ "procs": [
+  {
+   "pid": 1,
+   "uid": 65535,
+   "comm": "pause",
+   "environ": "EACCES",
+   "mem": "EACCES",
+   "maps": "EACCES",
+   "root_secret": "EACCES",
+   "cmdline": "ok:7B"
+  },
+  {
+   "pid": 20,
+   "uid": 1001,
+   "comm": "ap-proxy",
+   "environ": "EACCES",
+   "mem": "EACCES",
+   "maps": "EACCES",
+   "root_secret": "EACCES",
+   "cmdline": "ok:44B"
+  },
+  {
+   "pid": 35,
+   "uid": 1001,
+   "comm": "python3",
+   "environ": "EACCES",
+   "mem": "EACCES",
+   "maps": "EACCES",
+   "root_secret": "EACCES",
+   "cmdline": "ok:68B"
+  }
+ ],
+ "visible_other_uid_procs": 3
+}
+--- agent ps
+    PID   UID COMMAND
+      1 65535 pause
+     20  1001 ap-proxy
+     28  1000 sh
+     35  1001 python3
+     57  1000 sleep
+     64  1000 ps
+--- positive control (host, sudo): proxy-container processes whose environ holds the real key
+pid 2564085 comm ap-proxy key-in-environ: no
+pid 2564119 comm python3 key-in-environ: yes
+--- ap-b: agent signals the proxy (shared PID ns)
+rc=1
+sh: 1: kill: Operation not permitted
+
+--- node: kernel.yama.ptrace_scope = 1

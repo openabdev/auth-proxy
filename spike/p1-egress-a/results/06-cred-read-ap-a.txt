@@ -1,0 +1,17 @@
+=== ap-a (shareProcessNamespace: false), as the agent
+{
+ "uid": 1000,
+ "own_mount_secret": "ENOENT",
+ "procs": [],
+ "visible_other_uid_procs": 0
+}
+--- agent ps
+    PID   UID COMMAND
+      1  1000 sh
+      9  1000 sleep
+    662  1000 ps
+--- agent: Secret path in its own mount ns, /proc/1/root
+ls: cannot access '/run/ap-secret': No such file or directory
+ls: cannot access '/var/run/ap-secret': No such file or directory
+lock
+systemd

@@ -1,0 +1,15 @@
+# One spike image for all three containers; the roles differ by UID, mounts and
+# capabilities in pod.yaml, not by image. Built on the test node with podman and
+# imported into k3s containerd (see build.sh). Spike only.
+#
+# bin/ is filled by build.sh: ap-proxy (cargo build --release of spike/exp2,
+# glibc, built on the node) and kiro-cli 2.37+ (kiro-cli, kiro-cli-chat,
+# kiro-cli-term from the node's install).
+FROM docker.io/library/ubuntu:24.04
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      iptables iproute2 ca-certificates curl git python3 python3-pip nodejs npm cargo procps \
+ && rm -rf /var/lib/apt/lists/*
+COPY bin/ /usr/local/bin/
+COPY broker.py acp_timed.py probe.py netinit.sh proxy-entry.sh agent-entry.sh kiro-run memread.py /opt/ap/
+RUN chmod 755 /opt/ap/* /usr/local/bin/*

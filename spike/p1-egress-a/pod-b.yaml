@@ -1,0 +1,83 @@
+# Variant B of pod-a.yaml: the RFC draft's rule only (no DENY_LO_PORTS), plus
+# ALLOW_INBOUND_REPLIES=1, and shareProcessNamespace: true. Used for tests 6
+# (shared PID namespace), the loopback-reachability gap, and inbound replies.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ap-b
+  namespace: auth-proxy-spike
+  labels: {app: ap-spike, variant: b}
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  shareProcessNamespace: true
+  terminationGracePeriodSeconds: 2
+  securityContext:
+    seccompProfile: {type: RuntimeDefault}
+  initContainers:
+  - name: netinit
+    image: localhost/ap-spike-p1:dev
+    imagePullPolicy: Never
+    command: [sh, /opt/ap/netinit.sh]
+    env:
+    - {name: AGENT_UID, value: "1000"}
+    - {name: ALLOW_INBOUND_REPLIES, value: "1"}
+    securityContext:
+      runAsUser: 0
+      runAsNonRoot: false
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL], add: [NET_ADMIN]}
+    volumeMounts:
+    - {name: init-run, mountPath: /run}
+  containers:
+  - name: proxy
+    image: localhost/ap-spike-p1:dev
+    imagePullPolicy: Never
+    command: [sh, /opt/ap/proxy-entry.sh]
+    securityContext:
+      runAsUser: 1001
+      runAsGroup: 1001
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
+    volumeMounts:
+    - {name: kiro-secret, mountPath: /var/run/ap-secret, readOnly: true}
+    - {name: proxy-run, mountPath: /run/ap}
+    - {name: handoff, mountPath: /handoff}
+    - {name: proxy-tmp, mountPath: /tmp}
+  - name: agent
+    image: localhost/ap-spike-p1:dev
+    imagePullPolicy: Never
+    command: [sh, /opt/ap/agent-entry.sh]
+    workingDir: /work
+    env:
+    - {name: HOME, value: /home/agent}
+    securityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
+    volumeMounts:
+    - {name: agent-home, mountPath: /home/agent}
+    - {name: handoff, mountPath: /handoff, readOnly: true}
+    - {name: agent-tmp, mountPath: /tmp}
+    - {name: work, mountPath: /work}
+  volumes:
+  - name: kiro-secret
+    secret:
+      secretName: ap-kiro
+      # No fsGroup: fsGroup would add the group to the agent container too.
+      # Files are root-owned, so 0444 is needed for UID 1001 to read; only the
+      # proxy container mounts the volume.
+      defaultMode: 0444
+  - {name: init-run, emptyDir: {medium: Memory}}
+  - {name: proxy-run, emptyDir: {medium: Memory}}
+  - {name: handoff, emptyDir: {medium: Memory}}
+  - {name: proxy-tmp, emptyDir: {}}
+  - {name: agent-home, emptyDir: {}}
+  - {name: agent-tmp, emptyDir: {}}
+  - {name: work, emptyDir: {}}

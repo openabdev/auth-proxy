@@ -162,7 +162,9 @@ pub struct Registry<C: Clock> {
     pub(crate) sessions: HashMap<String, HashMap<Key, Session>>,
     /// Surrogate sha256 to (identity, key).
     pub(crate) index: HashMap<String, (String, Key)>,
-    /// Surrogate sha256 values revoked by this process.
+    /// Surrogate sha256 values revoked by this process. Entries are never evicted, so the set
+    /// grows by one 64-byte hex string per revoke until the process restarts. After a restart
+    /// the set is empty and an old surrogate reports `surrogate_unknown`; both codes refuse.
     pub(crate) revoked: HashSet<String>,
 }
 
@@ -332,7 +334,8 @@ impl<C: Clock> Registry<C> {
     }
 
     /// Decide whether a surrogate may be used on `route` by `identity`. Checks run in this
-    /// order: unknown, revoked, expired, wrong caller, wrong route.
+    /// order: unknown, revoked, expired (the session lease, or the owning authority's lease,
+    /// has lapsed), wrong caller, wrong route.
     pub fn authorize(
         &self,
         surrogate_sha256: &str,
@@ -352,7 +355,12 @@ impl<C: Clock> Registry<C> {
             .get(owner)
             .and_then(|m| m.get(key))
             .ok_or(Deny::Unknown)?;
-        if now >= s.lease_expiry {
+        // An authority that lapsed ends all its sessions at once (design: lease lapse).
+        let authority_live = self
+            .authorities
+            .get(owner)
+            .is_some_and(|a| now < a.lease_expiry);
+        if !authority_live || now >= s.lease_expiry {
             return Err(Deny::Expired);
         }
         if owner != identity {
@@ -841,11 +849,29 @@ mod tests {
     }
 
     #[test]
-    fn session_lease_lapse_gives_surrogate_expired_without_renew() {
+    fn authority_lapse_expires_sessions_at_90_s_without_renew() {
         let clock = ManualClock::new(T0);
         let mut r = new_reg(&clock);
         let tok = hello(&mut r, IDENT, T0);
         r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        clock.set(T0 + 89);
+        assert!(r
+            .authorize(&sha("a"), IDENT, "kiro-api", clock.now())
+            .is_ok());
+        clock.set(T0 + 90);
+        assert_eq!(
+            r.authorize(&sha("a"), IDENT, "kiro-api", clock.now()),
+            Err(Deny::Expired)
+        );
+    }
+
+    #[test]
+    fn session_lease_lapse_gives_surrogate_expired_with_renewing_authority() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        keepalive(&mut r, &clock, IDENT, &tok, T0 + 899);
         clock.set(T0 + 899);
         assert!(r
             .authorize(&sha("a"), IDENT, "kiro-api", clock.now())
@@ -902,7 +928,7 @@ mod tests {
         );
         assert_eq!(r.revoke(IDENT, &tok, "never-existed", 9, T0), Ok(()));
         assert_eq!(
-            r.authorize(&sha("zz"), IDENT, "kiro-api", T0),
+            r.authorize(&sha("unrelated"), IDENT, "kiro-api", T0),
             Err(Deny::Unknown)
         );
     }

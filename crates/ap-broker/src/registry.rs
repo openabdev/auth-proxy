@@ -537,3 +537,421 @@ fn parse_hash(s: &str) -> Option<[u8; 32]> {
     }
     Some(out)
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::clock::ManualClock;
+    use std::path::PathBuf;
+
+    pub const IDENT: &str = "pty-a";
+    pub const OTHER: &str = "pty-b";
+    pub const T0: u64 = 1_000;
+
+    pub fn access() -> Access {
+        let mut a = Access {
+            identities: vec![IDENT.into(), OTHER.into()],
+            ..Access::default()
+        };
+        a.grants
+            .insert(IDENT.into(), HashSet::from(["kiro".to_string()]));
+        a.grants
+            .insert(OTHER.into(), HashSet::from(["kiro".to_string()]));
+        a.credential_routes.insert(
+            "kiro".into(),
+            HashSet::from(["kiro-api".to_string(), "kiro-auth".to_string()]),
+        );
+        a
+    }
+
+    pub fn cfg() -> RegistryCfg {
+        RegistryCfg {
+            lease_secs: 900,
+            authority_lease_secs: 90,
+            max_sessions: 2,
+            absolute_ttl_secs: 43_200,
+        }
+    }
+
+    pub fn new_reg(clock: &ManualClock) -> Registry<ManualClock> {
+        Registry::new(clock.clone(), cfg(), access(), None)
+    }
+
+    /// Surrogate hash for a label. Real surrogates are random; labels keep tests readable.
+    pub fn sha(label: &str) -> String {
+        sha256_hex(label)
+    }
+
+    pub fn entry(session: &str, generation: u64, surrogate_label: &str) -> Entry {
+        Entry {
+            session: session.into(),
+            generation,
+            surrogate_sha256: sha(surrogate_label),
+            credentials: vec!["kiro".into()],
+        }
+    }
+
+    /// Every session, index and tombstone as sorted text. Two equal snapshots mean the
+    /// registry is unchanged.
+    pub fn snapshot<C: Clock>(reg: &Registry<C>) -> Vec<String> {
+        let mut out = Vec::new();
+        for (id, m) in &reg.sessions {
+            for ((s, g), v) in m {
+                out.push(format!(
+                    "session|{id}|{s}|{g}|{}|{:?}|{}|{}",
+                    v.surrogate, v.credentials, v.lease_expiry, v.absolute_expiry
+                ));
+            }
+        }
+        for (k, (id, key)) in &reg.index {
+            out.push(format!("index|{k}|{id}|{}|{}", key.0, key.1));
+        }
+        let mut revoked: Vec<&String> = reg.revoked.iter().collect();
+        revoked.sort();
+        out.push(format!("revoked|{revoked:?}"));
+        out.sort();
+        out
+    }
+
+    /// A fresh directory for token-file tests. The caller removes it.
+    pub fn tmp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("ap-broker-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::clock::ManualClock;
+
+    fn hello(r: &mut Registry<ManualClock>, id: &str, now: u64) -> String {
+        r.hello(id, now).expect("hello")
+    }
+
+    /// Renew the authority every 60 s until `until`, so a test can move time past the
+    /// 90 s authority lease.
+    fn keepalive(
+        r: &mut Registry<ManualClock>,
+        clock: &ManualClock,
+        id: &str,
+        tok: &str,
+        until: u64,
+    ) {
+        let mut t = clock.now();
+        while t + 60 < until {
+            t += 60;
+            clock.set(t);
+            r.renew(id, tok, &[], t).expect("keepalive");
+        }
+    }
+
+    #[test]
+    fn hello_while_authority_live_returns_active() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        hello(&mut r, IDENT, T0);
+        assert_eq!(
+            r.hello(IDENT, T0 + 10),
+            Err(HelloErr::AuthorityActive { retry_after: 80 })
+        );
+    }
+
+    #[test]
+    fn hello_lock_refused_at_89_s_and_accepted_at_91_s() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        hello(&mut r, IDENT, T0);
+        clock.set(T0 + 89);
+        assert_eq!(
+            r.hello(IDENT, clock.now()),
+            Err(HelloErr::AuthorityActive { retry_after: 1 })
+        );
+        clock.set(T0 + 91);
+        assert!(r.hello(IDENT, clock.now()).is_ok());
+    }
+
+    #[test]
+    fn hello_after_lapse_revokes_prior_sessions_and_old_token() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let old = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &old, entry("s1", 1, "a"), T0).unwrap();
+        clock.set(T0 + 91);
+        let _new = hello(&mut r, IDENT, clock.now());
+        assert_eq!(
+            r.authorize(&sha("a"), IDENT, "kiro-api", clock.now()),
+            Err(Deny::Revoked)
+        );
+        assert_eq!(
+            r.renew(IDENT, &old, &[], clock.now()),
+            Err(SessErr::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn lapsed_authority_token_is_unauthorized() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        clock.set(T0 + 90);
+        assert_eq!(
+            r.renew(IDENT, &tok, &[], clock.now()),
+            Err(SessErr::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn authority_renew_keeps_hello_locked() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        clock.set(T0 + 80);
+        r.renew(IDENT, &tok, &[], clock.now()).unwrap();
+        clock.set(T0 + 100);
+        assert!(matches!(
+            r.hello(IDENT, clock.now()),
+            Err(HelloErr::AuthorityActive { .. })
+        ));
+    }
+
+    #[test]
+    fn register_rejects_credential_not_granted() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        let mut e = entry("s1", 1, "a");
+        e.credentials = vec!["other-cred".into()];
+        assert_eq!(
+            r.register(IDENT, &tok, e, T0),
+            Err(SessErr::CredentialNotGranted)
+        );
+    }
+
+    #[test]
+    fn register_same_key_identical_is_ok_and_different_hash_is_conflict() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        assert_eq!(r.register(IDENT, &tok, entry("s1", 1, "a"), T0), Ok(900));
+        assert_eq!(
+            r.register(IDENT, &tok, entry("s1", 1, "a"), T0 + 5),
+            Ok(900)
+        );
+        assert_eq!(
+            r.register(IDENT, &tok, entry("s1", 1, "b"), T0 + 5),
+            Err(SessErr::Conflict)
+        );
+    }
+
+    #[test]
+    fn register_over_max_sessions_is_too_many_until_one_lapses() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        r.register(IDENT, &tok, entry("s2", 1, "b"), T0).unwrap();
+        assert_eq!(
+            r.register(IDENT, &tok, entry("s3", 1, "c"), T0),
+            Err(SessErr::TooMany)
+        );
+        keepalive(&mut r, &clock, IDENT, &tok, T0 + 900);
+        clock.set(T0 + 900);
+        assert!(r
+            .register(IDENT, &tok, entry("s3", 1, "c"), clock.now())
+            .is_ok());
+    }
+
+    #[test]
+    fn register_with_bad_token_is_unauthorized() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        hello(&mut r, IDENT, T0);
+        assert_eq!(
+            r.register(IDENT, "apt_bogus", entry("s1", 1, "a"), T0),
+            Err(SessErr::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn register_invalid_entry_is_wire_error() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        let mut e = entry("s1", 1, "a");
+        e.session = "bad/session".into();
+        assert_eq!(
+            r.register(IDENT, &tok, e, T0),
+            Err(SessErr::Invalid(WireErr { field: "session" }))
+        );
+    }
+
+    #[test]
+    fn renew_reports_unknown_ref() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        let refs = [
+            SessionRef {
+                session: "s1".into(),
+                generation: 1,
+            },
+            SessionRef {
+                session: "s9".into(),
+                generation: 1,
+            },
+        ];
+        let resp = r.renew(IDENT, &tok, &refs, T0 + 1).unwrap();
+        assert_eq!(resp.lease_secs, 900);
+        assert_eq!(
+            resp.unknown,
+            vec![SessionRef {
+                session: "s9".into(),
+                generation: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn renew_does_not_revive_a_lapsed_session() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        keepalive(&mut r, &clock, IDENT, &tok, T0 + 900);
+        clock.set(T0 + 900);
+        let refs = [SessionRef {
+            session: "s1".into(),
+            generation: 1,
+        }];
+        let resp = r.renew(IDENT, &tok, &refs, clock.now()).unwrap();
+        assert_eq!(resp.unknown.len(), 1);
+        assert_eq!(
+            r.authorize(&sha("a"), IDENT, "kiro-api", clock.now()),
+            Err(Deny::Expired)
+        );
+    }
+
+    #[test]
+    fn session_lease_lapse_gives_surrogate_expired_without_renew() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        clock.set(T0 + 899);
+        assert!(r
+            .authorize(&sha("a"), IDENT, "kiro-api", clock.now())
+            .is_ok());
+        clock.set(T0 + 900);
+        assert_eq!(
+            r.authorize(&sha("a"), IDENT, "kiro-api", clock.now()),
+            Err(Deny::Expired)
+        );
+    }
+
+    #[test]
+    fn absolute_ttl_caps_lease_and_renewal() {
+        let clock = ManualClock::new(T0);
+        let cfg = RegistryCfg {
+            lease_secs: 60,
+            absolute_ttl_secs: 100,
+            ..cfg()
+        };
+        let mut r = Registry::new(clock.clone(), cfg, access(), None);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        clock.set(T0 + 50);
+        let refs = [SessionRef {
+            session: "s1".into(),
+            generation: 1,
+        }];
+        assert!(r
+            .renew(IDENT, &tok, &refs, clock.now())
+            .unwrap()
+            .unknown
+            .is_empty());
+        clock.set(T0 + 99);
+        assert!(r
+            .authorize(&sha("a"), IDENT, "kiro-api", clock.now())
+            .is_ok());
+        clock.set(T0 + 100);
+        assert_eq!(
+            r.authorize(&sha("a"), IDENT, "kiro-api", clock.now()),
+            Err(Deny::Expired)
+        );
+    }
+
+    #[test]
+    fn revoked_surrogate_is_revoked_and_unknown_delete_is_ok() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        assert_eq!(r.revoke(IDENT, &tok, "s1", 1, T0), Ok(()));
+        assert_eq!(
+            r.authorize(&sha("a"), IDENT, "kiro-api", T0),
+            Err(Deny::Revoked)
+        );
+        assert_eq!(r.revoke(IDENT, &tok, "never-existed", 9, T0), Ok(()));
+        assert_eq!(
+            r.authorize(&sha("zz"), IDENT, "kiro-api", T0),
+            Err(Deny::Unknown)
+        );
+    }
+
+    #[test]
+    fn authorize_checks_caller_and_route_and_returns_bound_credentials() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        hello(&mut r, OTHER, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        assert_eq!(
+            r.authorize(&sha("a"), OTHER, "kiro-api", T0),
+            Err(Deny::WrongCaller)
+        );
+        assert_eq!(
+            r.authorize(&sha("a"), IDENT, "other-api", T0),
+            Err(Deny::WrongRoute)
+        );
+        assert_eq!(
+            r.authorize(&sha("a"), IDENT, "kiro-api", T0),
+            Ok(Bound {
+                identity: IDENT.into(),
+                session: "s1".into(),
+                generation: 1,
+                credentials: vec!["kiro".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn token_is_never_stored_in_clear() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        let stored = &r.authorities[IDENT].token_sha256;
+        assert_eq!(hex(stored).len(), 64);
+        assert_ne!(hex(stored), tok);
+    }
+
+    #[test]
+    fn duplicate_surrogate_on_other_session_is_conflict() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        assert_eq!(
+            r.register(IDENT, &tok, entry("s2", 1, "a"), T0),
+            Err(SessErr::Conflict)
+        );
+    }
+}

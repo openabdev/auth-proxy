@@ -112,3 +112,91 @@ fn valid_part(s: &str) -> bool {
             b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_root(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root =
+            std::env::temp_dir().join(format!("ap-store-{tag}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(root.join("kiro")).expect("create temp root");
+        root
+    }
+
+    #[test]
+    fn parse_source_accepts_only_the_k8s_form() {
+        assert_eq!(
+            parse_source("k8s:kiro-creds:api-key"),
+            Some(("kiro-creds", "api-key"))
+        );
+        assert_eq!(parse_source("k8s:a.b_c:d"), Some(("a.b_c", "d")));
+        assert_eq!(parse_source("aws-sm:secret:key"), None);
+        assert_eq!(parse_source("k8s:onlyone"), None);
+        assert_eq!(parse_source("k8s:a:b:c"), None);
+        assert_eq!(parse_source("k8s::key"), None);
+    }
+
+    #[test]
+    fn parse_source_rejects_traversal_and_bad_characters() {
+        for bad in [
+            "k8s:..:key",
+            "k8s:.:key",
+            "k8s:kiro:..",
+            "k8s:kiro:a/b",
+            "k8s:Kiro:key",
+            "k8s:kiro:key with space",
+            "k8s:kiro:ke%2fy",
+        ] {
+            assert_eq!(parse_source(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn secret_debug_is_redacted() {
+        let s = SecretBytes::new(b"sk-live-123".to_vec());
+        assert_eq!(format!("{s:?}"), "<redacted>");
+        assert_eq!(s.expose(), b"sk-live-123");
+    }
+
+    #[test]
+    fn file_store_reads_the_new_value_after_a_replace() {
+        let root = tmp_root("reload");
+        let file = root.join("kiro").join("api-key");
+        fs::write(&file, b"old-value").unwrap();
+        let store = FileStore::new(&root);
+        assert_eq!(
+            store.read("k8s:kiro:api-key").unwrap().expose(),
+            b"old-value"
+        );
+        fs::write(&file, b"new-value-longer").unwrap();
+        assert_eq!(
+            store.read("k8s:kiro:api-key").unwrap().expose(),
+            b"new-value-longer"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn file_store_is_unavailable_when_the_file_is_missing() {
+        let root = tmp_root("missing");
+        let file = root.join("kiro").join("api-key");
+        let store = FileStore::new(&root);
+        assert_eq!(store.read("k8s:kiro:api-key"), Err(StoreErr::Unavailable));
+        fs::write(&file, b"v").unwrap();
+        assert!(store.read("k8s:kiro:api-key").is_ok());
+        fs::remove_file(&file).unwrap();
+        assert_eq!(store.read("k8s:kiro:api-key"), Err(StoreErr::Unavailable));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn file_store_refuses_a_malformed_source_without_touching_disk() {
+        let store = FileStore::new(std::env::temp_dir());
+        assert_eq!(store.read("k8s:..:passwd"), Err(StoreErr::Unavailable));
+    }
+}

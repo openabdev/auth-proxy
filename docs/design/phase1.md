@@ -1,7 +1,10 @@
 # auth-proxy Phase 1 design
 
-- **Status:** Draft, for the decision council. Q1, Q2 and Q3 are open; everything else in this
-  document follows from decisions already made or is proposed for review with the doc.
+- **Status:** Q1, Q2 and Q3 are decided (Q1-B, Q2-A for Kubernetes only, Q3-A with egress
+  Q3-E2). Each question section records who decided it and the conditions attached. The ECS
+  (Option C) parts are **deferred to a later phase, not rejected**; sections that describe them
+  are marked. Everything else in this document follows from decisions already made or is proposed
+  for review with the doc.
 - **RFC:** openabdev/auth-proxy#1 (including "Placement and egress enforcement" and the Phase 0
   results comment).
 - **Evidence:** branch `spike/phase0`: `spike/exp1/` (CLI surrogate probes), `spike/exp2/`
@@ -52,9 +55,10 @@ fits with the egress allowlist that openab-pty#47 asks for (Q3).
  └────────────────────────────────────────────────────────────────────────┘
 ```
 
-The diagram shows the recommended options (Q1-B, Q2-A, Q3-A with egress Q3-E2). On ECS (Option C)
+The diagram shows the decided options (Q1-B, Q2-A, Q3-A with egress Q3-E2). On ECS (Option C)
 the proxy is a separate service and the session authority is the openab process; section Q2
-covers the mapping.
+covers the mapping. The ECS rollout is deferred out of Phase 1 (Q2 decision), so Phase 1 ships
+the Kubernetes shape only.
 
 ## 2. Fixed inputs
 
@@ -122,7 +126,20 @@ Measured constraints that shape the options:
 
 ## Q1. Who mints the caller key, and how does it bind to one session or one agent process?
 
-**Decision status:** open (council pending)
+**Decision:** Q1-B, decided by the owner. Both council members recommended Q1-B (medium risk,
+reversible) and escalated it, because it amends the RFC's credential-lifetime rule. The owner
+accepted the amendment: the session authority renews a surrogate's lease up to the session's
+absolute TTL (12 h default) instead of a new surrogate being minted every 15 minutes or less.
+Q1-B is the only option that gives per-session revocation while kiro-cli's settings are global and
+HOME is shared, and the runtime sends only hashes, so it never talks to a broker. These conditions
+are binding for Phase 1:
+
+1. A test covers the `hello` race after an authority container restart: the 90 s authority lock
+   holds, and only the fresh runtime process (PID 1) can win `hello`, never an orphaned
+   agent-UID process.
+2. No audit or access log contains the `/ap/<caller-key>` prefix.
+3. The documentation states that audit attribution between sessions of the same UID is best
+   effort, because a same-UID neighbour can read and spend another session's surrogate.
 
 The question covers four things: who mints, lifetime, delivery to the agent, and revocation when
 the session ends, plus whether the key rides in the base-URL path.
@@ -179,7 +196,7 @@ Q1-A. The per-session secret is the surrogate, and the session authority creates
   "TTL ≤ 15 min, renewal mints a new surrogate" for env-delivered surrogates, because env cannot
   change in a running process [I]. Renewal is an explicit call from the authority, never a side
   effect of use, so "surrogates are never silently extended" still holds. **This is an RFC
-  amendment the council has to accept.**
+  amendment; the owner accepted it (see the Q1 decision).**
 - **Delivery:** the surrogate goes into the child env under the CLI's credential variable
   (`KIRO_API_KEY`, `ANTHROPIC_API_KEY`, ...), named in the platform config. openab-pty: a new
   runtime feature next to `OPENAB_TOOLS_MCP_TOKEN`. openab: `pool.rs` adds the variable per spawn,
@@ -262,7 +279,19 @@ id, generation, a short hash prefix and the result, never the surrogate.
 
 ## Q2. Broker placement and store backend
 
-**Decision status:** open (council pending)
+**Decision:** Q2-A for Kubernetes (store S1) only in Phase 1, decided by the owner. Both council
+members recommended Q2-A (reversible; one rated risk low, the other medium) and escalated it,
+because the ECS mapping spends recurring money on one on-demand proxy service per bot, changes
+IAM, secrets and execution roles on production bots, and needs the S2 cache bound as an exception
+to the RFC's "never cached" rule. The owner chose to ship the Kubernetes shape now: the broker
+runs inside the proxy process and reads a Secret file mounted only into the proxy. Q2-A keeps one
+credential holder and meets F1 by construction, because no broker endpoint exists.
+
+The ECS rollout is **deferred to a later phase, not rejected**. Deferred: the S2 Secrets Manager
+store, the per-bot proxy services and `ap-relay`, the IAM, Secrets Manager and execution-role
+changes, and the S2 cache bound (refresh 300 s, max age 900 s). Because S2 is deferred, the RFC's
+"never cached" wording stays unchanged in Phase 1. Sections below that describe S2 or ECS are kept
+as the design for that later phase and are marked deferred.
 
 The broker answers "is this surrogate live, and what real credential does it map to". Phase 0
 fixed that the proxy never caches that answer: with the broker stopped, a surrogate that worked a
@@ -323,17 +352,19 @@ its per-agent keys, secret references (`env:`, `aws:secretsmanager:`, `k8s:`) an
 | Backend | Read path | Rotation | Fit |
 |---|---|---|---|
 | **S1. File** (K8s Secret volume mounted only into the proxy; also Vault Agent or the Secrets Store CSI driver, which render files [I]) | `stat` on every request, re-read when mtime or size changes (the spike's policy-store logic [M exp2 R1]). Missing or unreadable file means `broker_unavailable` | Kubelet replaces Secret volume contents with an atomic symlink swap [I], so the switch is atomic and needs no restart | Kubernetes. Mount rules from the k3s validation: `defaultMode: 0444` on a volume mounted only into the proxy, no `fsGroup` [M k3s] |
-| **S2. AWS Secrets Manager** | Fetched with the proxy's own task role, held in memory, refreshed every `refresh_secs` (default 300). A failed refresh keeps the value until `max_age_secs` (default 900), then requests are refused with `broker_unavailable` | Rotation shows up within one refresh | ECS. The agent's task role gets no access to these secrets |
+| **S2. AWS Secrets Manager** (deferred with the ECS rollout) | Fetched with the proxy's own task role, held in memory, refreshed every `refresh_secs` (default 300). A failed refresh keeps the value until `max_age_secs` (default 900), then requests are refused with `broker_unavailable` | Rotation shows up within one refresh | ECS. The agent's task role gets no access to these secrets |
 | **S3. Vault (native client)** | Token auth and lease renewal in the proxy | Vault leases | No consumer yet; S1 through Vault Agent covers it without code [I] |
 
 The "never cached" rule applies to the binding decision (is this surrogate live, for this
 identity, on this route): the registry is consulted on every request and revocation takes effect
 on the next request. S1 also re-checks the credential value on every request. S2 cannot call
 Secrets Manager per request (latency and API quotas [I]), so it holds the value for a bounded
-time and fails closed after `max_age_secs`. That bound is a deliberate exception and the council
-should confirm it.
+time and fails closed after `max_age_secs`. That bound would be a deliberate exception to the
+RFC; it is deferred with S2 and needs owner approval when the ECS rollout is taken up.
 
-### Mapping onto ECS (Option C)
+### Mapping onto ECS (Option C), deferred to a later phase
+
+Not part of Phase 1 (Q2 decision). Kept as the starting design for the ECS rollout.
 
 - The proxy runs as its own ECS service with the broker in process (Q2-A) and S2 as the store.
   Phase 1 runs **one proxy service per bot**, on on-demand capacity instead of Spot, so one bot's
@@ -369,6 +400,8 @@ should confirm it.
 
 ### Q2 recommendation: Q2-A with S1 (Kubernetes) and S2 (ECS)
 
+Decided as Q2-A with S1 for Phase 1; the S2 and ECS half of this recommendation is deferred.
+
 Q2-A keeps the properties that decided the bake-off (one holder of the credential, explicit
 refusal codes, no extra process) and meets F1 without a rule to maintain, because no broker
 endpoint exists. Share code with octobroker at the crate level instead of the service level:
@@ -380,7 +413,21 @@ Vault stays in the backlog behind S1.
 
 ## Q3. Policy format, location, and composition with openab-pty#47
 
-**Decision status:** open (council pending)
+**Decision:** Q3-A with egress Q3-E2, decided by the council. Both members chose it independently,
+rated it low risk and reversible, and did not escalate. One validated TOML file per identity lets
+the loader cross-check routes, grants and egress, extends the spike's measured policy store, and
+fails closed with `policy_unavailable`. Q3-E2 keeps non-credential traffic out of the credential
+process, never terminates TLS, needs no privilege after the init container, and is easy to remove.
+Follow-ups attached to the decision:
+
+- `ap-egress` connects to the exact address it validated and never resolves the name a second
+  time (DNS rebinding).
+- The platform sets `NO_PROXY=127.0.0.1,localhost` next to `HTTPS_PROXY`.
+- A test confirms that kiro-cli sends `X-Amz-Target` before any grant relies on `aws_targets`.
+- The combined Option A rule set is measured in one pod before release.
+
+Remaining risk, accepted: the agent can still send data to allowlisted hosts such as github.com,
+and tools that ignore the proxy variables fail slowly.
 
 Policy has to express host + method + path or resource, and a credential bound to a set of routes
 (kiro-cli uses one key for 3 hosts, plus `api.q.service` [M exp1, exp2]). It also has to say how
@@ -683,7 +730,7 @@ crates/
                               Small dependency set so both platforms can take it.
 deploy/
   k8s/                        netinit image (iptables-nft rule set), sidecar manifests, PSA note
-  ecs/                        proxy service task definition, security-group example
+  ecs/                        deferred with the ECS rollout: proxy service task definition, security-group example
 docs/
   design/phase1.md            this document
   session-plane.md            normative protocol (Q1-B), so a platform can implement it without ap-client
@@ -740,6 +787,10 @@ nightly or by hand, because it needs a cluster with `NET_ADMIN`.
 
 ## 8. Out of scope and still open
 
+- **ECS rollout (Option C)**, deferred by the Q2 decision: the S2 Secrets Manager store and its
+  cache bound, per-bot proxy services, `ap-relay`, and the IAM, Secrets Manager and
+  execution-role changes. The `aws-sm` feature, the HTTPS session plane and `deploy/ecs/` wait
+  for it.
 - **RFC Q5**, ownership of rotation, revocation and audit retention. Phase 1 writes audit lines to
   stdout and leaves durable audit to Q5.
 - Phase 2 (interception) and Phase 3 (SigV4 re-signing, SSH signing socket).

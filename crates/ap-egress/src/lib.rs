@@ -7,6 +7,8 @@
 pub mod allow;
 pub mod connect;
 pub mod resolve;
+#[cfg(test)]
+mod tests;
 
 /// A refused CONNECT. Each variant maps to the status line the client receives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

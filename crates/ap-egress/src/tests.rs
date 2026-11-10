@@ -197,6 +197,12 @@ fn private_and_special_addresses_are_refused() {
         "::ffff:10.0.0.1",
         "::ffff:127.0.0.1",
         "::10.0.0.1",
+        "64:ff9b::a00:1",
+        "64:ff9b::7f00:1",
+        "64:ff9b:1::1",
+        "2002:0a00:0001::",
+        "2002:7f00:0001::",
+        "::ffff:0:a00:1",
     ] {
         let addr: IpAddr = ip.parse().expect("ip");
         assert!(check_addr(addr).is_err(), "{ip} must be refused");
@@ -205,10 +211,40 @@ fn private_and_special_addresses_are_refused() {
 
 #[test]
 fn public_addresses_pass_the_address_check() {
-    for ip in ["192.0.2.1", "93.184.216.34", "2001:db8::1"] {
+    for ip in [
+        "192.0.2.1",
+        "93.184.216.34",
+        "2001:db8::1",
+        "64:ff9b::5db8:d822",
+        "2002:5db8:d822::",
+    ] {
         let addr: IpAddr = ip.parse().expect("ip");
         assert!(check_addr(addr).is_ok(), "{ip} must pass");
     }
+}
+
+#[test]
+fn ip_literal_is_refused_before_a_mismatched_host_header() {
+    assert_eq!(
+        parse_connect(
+            "CONNECT 127.0.0.1:443 HTTP/1.1",
+            &["Host: other.example.net:443"]
+        ),
+        Err(Refuse::IpLiteral)
+    );
+}
+
+#[tokio::test]
+async fn head_over_8_kib_is_refused_when_the_terminator_is_in_a_later_read() {
+    let resolver = FakeResolver::new(&["192.0.2.1:443"]);
+    let connector = FakeConnector::default();
+    let pad = "a".repeat(8600);
+    let request = format!(
+        "CONNECT api.example.net:443 HTTP/1.1\r\nHost: api.example.net:443\r\nX-Pad: {pad}\r\n\r\n"
+    );
+    let status = exchange(&request, &allow_list(), &resolver, &connector).await;
+    assert_eq!(status, "HTTP/1.1 400 Bad Request");
+    assert_eq!(resolver.calls(), 0);
 }
 
 #[test]

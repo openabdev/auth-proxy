@@ -57,20 +57,21 @@ token back.
 - While the lease is live, another `hello` returns `409 authority_active`.
 - When the lease lapses, the proxy revokes every session that the old authority registered, and
   then it accepts a new `hello`.
-- In openab-pty the runtime is PID 1 of its container. A dead runtime takes its shells with it, so
-  the next `hello` comes from the restarted runtime before any session exists.
+- In openab-pty the runtime is PID 1 of its container. A dead runtime takes its shells with it. The
+  target is that the next `hello` comes from the restarted runtime before any session exists. The
+  Phase 1 code does not enforce this yet (see below).
 
-**Open gap (pending owner decision).** The Phase 1 code does not enforce the PID 1 guarantee above.
-`hello` takes an identity name and no secret. The agent container shares the session socket and
-runs as UID 1000, the same UID as the authority. So during the lease-lapse window, any agent-UID
-process that can reach `session.sock` can call `hello` first and become the authority. Its reach is
-limited to its own identity's grants. The real credential stays in the proxy, and an unknown
-surrogate is still refused. Two options are open, and the owner has not chosen between them:
+**Target guarantee: not yet implemented, tracked as follow-up.** The target is that `hello`
+requires a runtime-only proof, so a process outside the runtime cannot take the authority. The
+Phase 1 code does not enforce this. `hello` takes an identity name and no secret. The agent
+container shares the session socket and runs as UID 1000, the same UID as the authority. So during
+the lease-lapse window, an agent-UID process that can reach `session.sock` can call `hello` first
+and become the authority today. Its reach is limited to its own identity's grants. The real
+credential stays in the proxy, and an unknown surrogate is still refused.
 
-- (a) Add a runtime-only proof to `hello`. This changes the `hello` call.
-- (b) Record acceptance of the gap against design condition 1, and name the test that covers it.
-
-Until the owner decides, the guarantee in the paragraph above is not enforced.
+Limit of the target: a same-UID process can still read the proof from the runtime's environment or
+memory. The proof addresses other containers and processes. It does not address same-UID
+neighbours. Decision record: `M2` in the phase1-impl decision file (owner chose option 1).
 
 On ECS there is no `hello`. The authority token is set in the proxy config as its hash.
 

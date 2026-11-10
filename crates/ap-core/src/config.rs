@@ -258,6 +258,7 @@ impl Config {
             return Err(invalid("at least one [[identity]] is required"));
         }
         let mut identity_names = HashSet::new();
+        let mut caller_keys = HashSet::new();
         for i in &self.identities {
             if !valid_identity_name(&i.name) {
                 return Err(invalid(format!("identity name {:?} is invalid", i.name)));
@@ -268,6 +269,12 @@ impl Config {
             if !is_hex64_lower(&i.caller_key_sha256) {
                 return Err(invalid(format!(
                     "identity {:?}: caller_key_sha256 must be 64 lowercase hex characters",
+                    i.name
+                )));
+            }
+            if !caller_keys.insert(i.caller_key_sha256.as_str()) {
+                return Err(invalid(format!(
+                    "duplicate caller_key_sha256 for identity {:?}",
                     i.name
                 )));
             }
@@ -557,6 +564,48 @@ allow = ["github.com:443"]
     fn rejects_duplicate_identity_name() {
         let dup = format!("\n[[identity]]\nname = \"pty-team-a\"\ncaller_key_sha256 = \"{H64}\"\n");
         expect_invalid(&(base() + &dup), "duplicate identity name");
+    }
+
+    #[test]
+    fn rejects_duplicate_caller_key_across_identities() {
+        let dup = format!("\n[[identity]]\nname = \"pty-team-b\"\ncaller_key_sha256 = \"{H64}\"\n");
+        expect_invalid(&(base() + &dup), "duplicate caller_key_sha256");
+    }
+
+    #[test]
+    fn rejects_identity_name_over_64_bytes() {
+        let long = "a".repeat(65);
+        expect_invalid(
+            &base().replace("name = \"pty-team-a\"", &format!("name = \"{long}\"")),
+            "identity name",
+        );
+    }
+
+    #[test]
+    fn rejects_method_over_16_bytes() {
+        expect_invalid(
+            &base().replace("methods = [\"POST\"]", "methods = [\"AAAAAAAAAAAAAAAAA\"]"),
+            "upper-case token",
+        );
+    }
+
+    #[test]
+    fn rejects_zero_authority_lease() {
+        expect_invalid(
+            &base().replace(
+                "[listen]",
+                "[sessions]\nauthority_lease_secs = 0\n\n[listen]",
+            ),
+            "authority_lease_secs must be in 1..=600",
+        );
+    }
+
+    #[test]
+    fn rejects_zero_max_sessions() {
+        expect_invalid(
+            &base().replace("[listen]", "[sessions]\nmax_sessions = 0\n\n[listen]"),
+            "max_sessions must be in 1..=1024",
+        );
     }
 
     #[test]

@@ -152,10 +152,11 @@ pub fn parse_ap_path(path: &str) -> Result<ApPath<'_>, Code> {
 }
 
 fn is_caller_key(k: &str) -> bool {
-    k.strip_prefix("apk_").is_some_and(is_64_lower_hex)
+    k.strip_prefix("apk_").is_some_and(is_lower_hex_64)
 }
 
-fn is_64_lower_hex(s: &str) -> bool {
+/// True for exactly 64 lowercase hex characters (sha256 hex, or the key and surrogate digests).
+pub fn is_lower_hex_64(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -175,7 +176,7 @@ pub fn surrogate_from_headers(headers: &HeaderMap, header: &str) -> Result<Strin
     let s = value.to_str().map_err(|_| Code::SurrogateMalformed)?;
     let token = s.strip_prefix("Bearer ").ok_or(Code::SurrogateMalformed)?;
     let hex = token.strip_prefix("aps_").ok_or(Code::SurrogateMalformed)?;
-    if !is_64_lower_hex(hex) {
+    if !is_lower_hex_64(hex) {
         return Err(Code::SurrogateMalformed);
     }
     Ok(token.to_string())

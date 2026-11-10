@@ -809,12 +809,12 @@ def main():
     extra = [i for i in ids if i not in EXPECTED]
     passed = sum(1 for r in results if r["verdict"] == "PASS")
     gate = sum(1 for r in results if r["id"] in GATE_IDS and r["verdict"] == "PASS")
-    p1 = sum(1 for r in results if r["id"] in P1_IDS and r["verdict"] == "PASS")
+    probe_target = sum(1 for r in results if r["id"] in P1_IDS and r["verdict"] == "PASS")
     if a.json:
         with open(a.json, "w") as f:
             json.dump({"bin": bindir, "results": results, "missing": missing}, f, indent=1)
     print(f"\nrows: {len(results)} run, {len(EXPECTED)} expected, missing={missing or 'none'} extra={extra or 'none'}")
-    print(f"gate: {gate} PASS of {len(GATE_IDS)}; phase 1: {p1} PASS of {len(P1_IDS)}")
+    print(f"gate: {gate} PASS of {len(GATE_IDS)}; phase 1: {probe_target} PASS of {len(P1_IDS)}")
     print(f"summary: {passed} PASS of {len(EXPECTED)} rows; work dir {work}")
     return 0 if (passed == len(EXPECTED) and not missing and not extra) else 1
 

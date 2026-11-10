@@ -1,0 +1,64 @@
+name: ci
+
+# Manual dispatch only. No other trigger.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert python3 and openssl exist (the matrix must not skip silently)
+        run: |
+          command -v python3
+          command -v openssl
+          python3 --version
+          openssl version
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit and integration tests
+        run: cargo test --workspace
+
+      - name: Release build (default features; the matrix-upstream feature stays off)
+        run: cargo build --release -p ap-proxy -p ap-egress
+
+      - name: Release binary carries no test hooks
+        run: |
+          if grep -q AP_TEST_UPSTREAM_CA target/release/auth-proxy; then
+            echo "test hook strings found in the release binary"; exit 1
+          fi
+
+      - name: ap-egress does not depend on ap-broker
+        run: |
+          if cargo tree -p ap-egress -i ap-broker >/dev/null 2>&1; then
+            echo "ap-broker is in the ap-egress dependency graph"; exit 1
+          fi
+
+      - name: Build test binaries (matrix-upstream feature, separate target dir)
+        run: cargo build -p ap-proxy -p ap-egress --features ap-proxy/matrix-upstream --target-dir target/matrix
+
+      - name: Fail-closed matrix (positive rows run against this feature-enabled test build)
+        run: python3 tests/matrix/matrix.py --bin target/matrix/debug --json matrix.json | tee matrix.txt
+
+      - name: Upload matrix results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix
+          path: |
+            matrix.json
+            matrix.txt

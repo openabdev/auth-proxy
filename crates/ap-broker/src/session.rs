@@ -350,7 +350,9 @@ mod tests {
             cfg(),
             access(),
             Some(dir.clone()),
-            Box::new(MemoryExpiry::default()),
+            Box::new(crate::expiry::FileExpiryStore::new(crate::expiry::file_in(
+                &dir,
+            ))),
         )
         .expect("registry");
         let tok = hello(&mut first, IDENT, T0);
@@ -361,7 +363,9 @@ mod tests {
             cfg(),
             access(),
             Some(dir.clone()),
-            Box::new(MemoryExpiry::default()),
+            Box::new(crate::expiry::FileExpiryStore::new(crate::expiry::file_in(
+                &dir,
+            ))),
         )
         .expect("registry");
         assert!(second.renew(IDENT, &tok, &[], clock.now()).is_ok());

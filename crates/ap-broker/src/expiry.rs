@@ -40,6 +40,10 @@ pub trait ExpiryStore: Send {
     /// or content that is not a valid store, is an error.
     fn load(&self) -> io::Result<HashMap<String, u64>>;
 
+    /// Whether the store has ever been created. A missing store with authority state on disk
+    /// means the store was lost, not that it was never written.
+    fn exists(&self) -> io::Result<bool>;
+
     /// Replace every stored record with `records`. On error the stored records are unchanged.
     fn save(&mut self, records: &HashMap<String, u64>) -> io::Result<()>;
 }
@@ -79,6 +83,10 @@ impl ExpiryStore for FileExpiryStore {
             Err(e) => return Err(e),
         };
         parse(&text)
+    }
+
+    fn exists(&self) -> io::Result<bool> {
+        self.path.try_exists()
     }
 
     fn save(&mut self, records: &HashMap<String, u64>) -> io::Result<()> {
@@ -170,6 +178,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 #[derive(Default)]
 pub(crate) struct MemoryExpiry {
     records: HashMap<String, u64>,
+    created: bool,
 }
 
 #[cfg(test)]
@@ -178,8 +187,13 @@ impl ExpiryStore for MemoryExpiry {
         Ok(self.records.clone())
     }
 
+    fn exists(&self) -> io::Result<bool> {
+        Ok(self.created)
+    }
+
     fn save(&mut self, records: &HashMap<String, u64>) -> io::Result<()> {
         self.records = records.clone();
+        self.created = true;
         Ok(())
     }
 }
@@ -374,6 +388,44 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).expect("read"), *text);
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    #[test]
+    fn store_lost_with_authority_state_refuses_to_start() {
+        let dir = tmp_dir("store-lost");
+        let path = file_in(&dir);
+        let clock = ManualClock::new(T0);
+        let mut first = open(&clock, &dir, &path).expect("start");
+        let tok = first.hello(IDENT, T0).expect("hello");
+        first
+            .register(IDENT, &tok, entry("s1", 1, "a"), T0)
+            .expect("register");
+        drop(first);
+
+        // The store file is lost but the authority hash is still on disk. A restart must not
+        // come up with empty records, because the next resync would give s1 a new TTL.
+        std::fs::remove_file(&path).expect("delete store");
+        clock.set(T0 + 10 * 3600);
+        assert!(open(&clock, &dir, &path).is_err());
+        assert!(
+            !path.exists(),
+            "refused startup must not recreate the store"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_start_creates_store_file_and_serves() {
+        let dir = tmp_dir("first-start");
+        let path = file_in(&dir);
+        let clock = ManualClock::new(T0);
+        let mut r = open(&clock, &dir, &path).expect("first start with no store and no hash");
+        assert!(
+            path.exists(),
+            "first start creates the store before any hash"
+        );
+        assert!(r.hello(IDENT, T0).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

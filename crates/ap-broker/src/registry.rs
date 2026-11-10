@@ -188,16 +188,31 @@ impl<C: Clock> Registry<C> {
     /// file there. A restored hash starts with a full authority lease, so the authority that
     /// still holds the token can renew it, and a hello is refused until that lease lapses.
     ///
-    /// Fails when the expiry store cannot be read. The caller must not serve sessions then,
-    /// because a session restored without its stored absolute expiry would get a new TTL.
+    /// Fails when the expiry store cannot be read, or when it is missing although an authority
+    /// hash exists (the store was lost). The caller must not serve sessions then, because a
+    /// session restored without its stored absolute expiry would get a new TTL. A store that
+    /// does not exist and has no authority hash behind it is a first start: the empty store is
+    /// created here, before any authority hash can be written.
     pub fn new(
         clock: C,
         cfg: RegistryCfg,
         access: Access,
         token_dir: Option<PathBuf>,
-        expiry: Box<dyn ExpiryStore>,
+        mut expiry: Box<dyn ExpiryStore>,
     ) -> io::Result<Self> {
         let records = expiry.load()?;
+        if !expiry.exists()? {
+            if let Some(dir) = &token_dir {
+                for identity in &access.identities {
+                    if session::token_file(dir, identity).try_exists()? {
+                        return Err(io::Error::other(
+                            "session expiry store is missing but authority state exists",
+                        ));
+                    }
+                }
+            }
+            expiry.save(&records)?;
+        }
         let now = clock.now();
         let mut authorities = HashMap::new();
         if let Some(dir) = &token_dir {

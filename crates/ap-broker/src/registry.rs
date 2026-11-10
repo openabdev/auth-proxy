@@ -1,11 +1,14 @@
 //! Session registry: one authority token per identity, session leases, surrogate bindings and
-//! tombstones for revoked surrogates. Everything is in memory except the authority token hash,
-//! which `session::write_token_hash` persists so a proxy restart keeps the authority valid.
+//! tombstones for revoked surrogates. Everything is in memory except two things. The authority
+//! token hash is persisted by `session::write_token_hash`, so a proxy restart keeps the
+//! authority valid. The absolute expiry of each session key is persisted through an
+//! `ExpiryStore`, so a restart cannot extend it.
 //!
 //! Methods take `now` as a plain argument. Production callers pass `Clock::now()`, and tests
 //! pass fixed values.
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::PathBuf;
 
 use ap_core::canon::is_lower_hex_64;
@@ -16,6 +19,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::clock::Clock;
+use crate::expiry::{record_key, ExpiryStore};
 use crate::session;
 
 /// Absolute session lifetime from first registration. Matches the openab-pty default of 12 h.
@@ -94,6 +98,12 @@ pub enum SessErr {
     Conflict,
     /// The identity already has `max_sessions` live sessions. Maps to 429.
     TooMany,
+    /// The session key's absolute TTL, stored when it was first registered, has passed. A
+    /// restart does not reset it. Maps to 403 `session_expired`.
+    AbsoluteExpired,
+    /// The expiry store could not be written, so the session is not recorded. Fails closed.
+    /// Maps to 503.
+    Unavailable,
 }
 
 /// Failure of `hello`.
@@ -166,13 +176,28 @@ pub struct Registry<C: Clock> {
     /// grows by one 64-byte hex string per revoke until the process restarts. After a restart
     /// the set is empty and an old surrogate reports `surrogate_unknown`; both codes refuse.
     pub(crate) revoked: HashSet<String>,
+    /// Where absolute expiry records are persisted. Written before a session is accepted.
+    pub(crate) expiry: Box<dyn ExpiryStore>,
+    /// Record key (see `expiry::record_key`) to absolute expiry in Unix seconds. Loaded from
+    /// `expiry` at startup and never pruned, so a restart cannot reset a session's TTL.
+    pub(crate) records: HashMap<String, u64>,
 }
 
 impl<C: Clock> Registry<C> {
     /// Build a registry. When `token_dir` is set, each identity's authority hash is read from its
     /// file there. A restored hash starts with a full authority lease, so the authority that
     /// still holds the token can renew it, and a hello is refused until that lease lapses.
-    pub fn new(clock: C, cfg: RegistryCfg, access: Access, token_dir: Option<PathBuf>) -> Self {
+    ///
+    /// Fails when the expiry store cannot be read. The caller must not serve sessions then,
+    /// because a session restored without its stored absolute expiry would get a new TTL.
+    pub fn new(
+        clock: C,
+        cfg: RegistryCfg,
+        access: Access,
+        token_dir: Option<PathBuf>,
+        expiry: Box<dyn ExpiryStore>,
+    ) -> io::Result<Self> {
+        let records = expiry.load()?;
         let now = clock.now();
         let mut authorities = HashMap::new();
         if let Some(dir) = &token_dir {
@@ -191,7 +216,7 @@ impl<C: Clock> Registry<C> {
                 }
             }
         }
-        Registry {
+        Ok(Registry {
             clock,
             cfg,
             access,
@@ -200,7 +225,9 @@ impl<C: Clock> Registry<C> {
             sessions: HashMap::new(),
             index: HashMap::new(),
             revoked: HashSet::new(),
-        }
+            expiry,
+            records,
+        })
     }
 
     /// Current time from the injected clock.
@@ -271,7 +298,8 @@ impl<C: Clock> Registry<C> {
     /// Bind a surrogate to one session generation. Returns the session lease in seconds.
     ///
     /// Re-sending an identical entry refreshes the lease. Same session and generation with
-    /// another surrogate or credential set is a conflict.
+    /// another surrogate or credential set is a conflict. A session key whose stored absolute
+    /// expiry has passed is refused with `AbsoluteExpired`.
     pub fn register(
         &mut self,
         identity: &str,
@@ -284,6 +312,7 @@ impl<C: Clock> Registry<C> {
         self.check_grants(identity, &entry.credentials)?;
         self.prune_expired(identity, now);
         let key = (entry.session.clone(), entry.generation);
+        let stored = self.stored_expiry(identity, &key, now)?;
         let existing = self
             .sessions
             .get(identity)
@@ -305,8 +334,16 @@ impl<C: Clock> Registry<C> {
         if self.live_count(identity, now) >= self.cfg.max_sessions {
             return Err(SessErr::TooMany);
         }
+        let absolute = match stored {
+            Some(absolute) => absolute,
+            None => {
+                let absolute = now + self.cfg.absolute_ttl_secs;
+                let pending = [(record_key(identity, &key.0, key.1), absolute)];
+                self.persist(&pending)?;
+                absolute
+            }
+        };
         self.touch(identity, now);
-        let absolute = now + self.cfg.absolute_ttl_secs;
         self.put(
             identity,
             key,
@@ -457,6 +494,36 @@ impl<C: Clock> Registry<C> {
             );
     }
 
+    /// The absolute expiry stored for a session key. `None` means the key was never recorded.
+    /// `AbsoluteExpired` means the stored expiry has passed.
+    pub(crate) fn stored_expiry(
+        &self,
+        identity: &str,
+        key: &Key,
+        now: u64,
+    ) -> Result<Option<u64>, SessErr> {
+        match self.records.get(&record_key(identity, &key.0, key.1)) {
+            None => Ok(None),
+            Some(&absolute) if now < absolute => Ok(Some(absolute)),
+            Some(_) => Err(SessErr::AbsoluteExpired),
+        }
+    }
+
+    /// Write `new` records to the expiry store, then keep them in memory. On failure nothing
+    /// changes, so the caller must not accept the session.
+    pub(crate) fn persist(&mut self, new: &[(String, u64)]) -> Result<(), SessErr> {
+        if new.is_empty() {
+            return Ok(());
+        }
+        let mut next = self.records.clone();
+        for (key, absolute) in new {
+            next.insert(key.clone(), *absolute);
+        }
+        self.expiry.save(&next).map_err(|_| SessErr::Unavailable)?;
+        self.records = next;
+        Ok(())
+    }
+
     fn refresh(&mut self, identity: &str, key: &Key, now: u64) {
         let lease = self.cfg.lease_secs;
         if let Some(s) = self.sessions.get_mut(identity).and_then(|m| m.get_mut(key)) {
@@ -580,6 +647,7 @@ fn parse_hash(s: &str) -> Option<[u8; 32]> {
 pub(crate) mod test_support {
     use super::*;
     use crate::clock::ManualClock;
+    use crate::expiry::MemoryExpiry;
     use std::path::PathBuf;
 
     pub const IDENT: &str = "pty-a";
@@ -612,7 +680,14 @@ pub(crate) mod test_support {
     }
 
     pub fn new_reg(clock: &ManualClock) -> Registry<ManualClock> {
-        Registry::new(clock.clone(), cfg(), access(), None)
+        Registry::new(
+            clock.clone(),
+            cfg(),
+            access(),
+            None,
+            Box::new(MemoryExpiry::default()),
+        )
+        .expect("registry")
     }
 
     /// Surrogate hash for a label. Real surrogates are random; labels keep tests readable.
@@ -669,6 +744,7 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use crate::clock::ManualClock;
+    use crate::expiry::MemoryExpiry;
 
     fn hello(r: &mut Registry<ManualClock>, id: &str, now: u64) -> String {
         r.hello(id, now).expect("hello")
@@ -921,7 +997,14 @@ mod tests {
             absolute_ttl_secs: 100,
             ..cfg()
         };
-        let mut r = Registry::new(clock.clone(), cfg, access(), None);
+        let mut r = Registry::new(
+            clock.clone(),
+            cfg,
+            access(),
+            None,
+            Box::new(MemoryExpiry::default()),
+        )
+        .expect("registry");
         let tok = hello(&mut r, IDENT, T0);
         r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
         clock.set(T0 + 50);

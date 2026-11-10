@@ -2,6 +2,7 @@
 
 pub mod broker;
 pub mod clock;
+pub mod expiry;
 pub mod registry;
 pub mod session;
 pub mod store;

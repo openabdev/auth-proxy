@@ -151,6 +151,8 @@ fn sess_error(e: &SessErr) -> (u16, Value) {
         SessErr::CredentialNotGranted => (403, json!({ "error": "credential_not_granted" })),
         SessErr::Conflict => (409, json!({ "error": "conflict" })),
         SessErr::TooMany => (429, json!({ "error": "too_many_sessions" })),
+        SessErr::AbsoluteExpired => (403, json!({ "error": "session_expired" })),
+        SessErr::Unavailable => (503, json!({ "error": "broker_unavailable" })),
     }
 }
 

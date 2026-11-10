@@ -6,6 +6,8 @@
 
 pub mod allow;
 pub mod connect;
+#[cfg(feature = "matrix-upstream")]
+pub mod matrix_hooks;
 pub mod resolve;
 #[cfg(test)]
 mod tests;

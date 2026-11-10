@@ -35,6 +35,9 @@ pub enum AuthorityError {
     Refused { status: u16, code: String },
     /// The proxy answered with a body that does not parse.
     Decode(serde_json::Error),
+    /// An earlier end of the same session is still unconfirmed by the proxy. The registration
+    /// was not sent. Retry after the next renew round has confirmed the revoke.
+    RevokePending,
 }
 
 /// A surrogate for one registered session. The raw value goes to the child process only.
@@ -133,6 +136,24 @@ impl Authority {
             credentials,
         };
         validate_entry(&entry).map_err(AuthorityError::Invalid)?;
+        let key = (entry.session.clone(), generation);
+        let pending = self
+            .inner
+            .pending
+            .lock()
+            .expect("pending lock")
+            .contains(&key);
+        if pending {
+            // Send the old revoke first. Otherwise it would remove this new registration later.
+            if !revoke_once(&self.inner, &key).await {
+                return Err(AuthorityError::RevokePending);
+            }
+            self.inner
+                .pending
+                .lock()
+                .expect("pending lock")
+                .remove(&key);
+        }
         let token = self.inner.token();
         let reply = uds::post_json(&self.inner.socket, "/v1/sessions", Some(&token), &entry)
             .await
@@ -244,19 +265,20 @@ async fn flush_pending(inner: &Inner) {
         .iter()
         .cloned()
         .collect();
-    for (session, generation) in pending {
-        let token = inner.token();
-        let path = format!("/v1/sessions/{session}/{generation}");
-        let Ok(reply) = uds::delete(&inner.socket, &path, Some(&token)).await else {
-            continue;
-        };
-        if (200..300).contains(&reply.status) || reply.status == 404 {
-            inner
-                .pending
-                .lock()
-                .expect("pending lock")
-                .remove(&(session, generation));
+    for key in pending {
+        if revoke_once(inner, &key).await {
+            inner.pending.lock().expect("pending lock").remove(&key);
         }
+    }
+}
+
+/// Send one DELETE for an ended session. True when the proxy confirmed it (2xx or 404).
+async fn revoke_once(inner: &Inner, key: &(String, u64)) -> bool {
+    let token = inner.token();
+    let path = format!("/v1/sessions/{}/{}", key.0, key.1);
+    match uds::delete(&inner.socket, &path, Some(&token)).await {
+        Ok(reply) => (200..300).contains(&reply.status) || reply.status == 404,
+        Err(_) => false,
     }
 }
 

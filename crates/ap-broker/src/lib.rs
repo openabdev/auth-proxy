@@ -1,1 +1,3 @@
-//! Broker: resolves credentials for the proxy. Phase 1 skeleton.
+//! Broker: session registry, credential store and the `Broker` trait used by the proxy.
+
+pub mod clock;

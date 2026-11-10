@@ -22,6 +22,11 @@ Each of the four kiro-cli services points at one route. The base URL is
 Each entry also sets `"region": "us-east-1"`. The file is an object of the form
 `{"api.cps.service": {"endpoint": "...", "region": "us-east-1"}, ...}`.
 
+**The shipped identity file defines one route only.** `deploy/k8s/identity-configmap.yaml` defines
+`kiro-krs` and its grant. Before the other three services work, add the `kiro-cps`, `kiro-cw` and
+`kiro-q` routes, with a credential grant for each, to `identity.toml`. Until then the proxy answers
+those routes with `404 route_unknown`.
+
 The proxy listens on plain `http://` on loopback, which kiro-cli accepts. The hop from the agent to
 the proxy never leaves the pod.
 

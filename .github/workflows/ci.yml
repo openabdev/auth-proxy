@@ -36,10 +36,13 @@ jobs:
       - name: Release build (default features; the matrix-upstream feature stays off)
         run: cargo build --release -p ap-proxy -p ap-egress
 
-      - name: Release binary carries no test hooks
+      - name: Release binaries carry no test hooks
         run: |
           if grep -q AP_TEST_UPSTREAM_CA target/release/auth-proxy; then
-            echo "test hook strings found in the release binary"; exit 1
+            echo "test hook strings found in the release auth-proxy"; exit 1
+          fi
+          if grep -q AP_TEST_EGRESS_RESOLVE target/release/ap-egress; then
+            echo "test hook strings found in the release ap-egress"; exit 1
           fi
 
       - name: ap-egress does not depend on ap-broker
@@ -48,11 +51,16 @@ jobs:
             echo "ap-broker is in the ap-egress dependency graph"; exit 1
           fi
 
-      - name: Build test binaries (matrix-upstream feature, separate target dir)
-        run: cargo build -p ap-proxy -p ap-egress --features ap-proxy/matrix-upstream --target-dir target/matrix
+      - name: Build test binaries (matrix-upstream feature; debug profile, default target dir)
+        run: cargo build -p ap-proxy -p ap-egress --features ap-proxy/matrix-upstream,ap-egress/matrix-upstream
 
-      - name: Fail-closed matrix (positive rows run against this feature-enabled test build)
-        run: python3 tests/matrix/matrix.py --bin target/matrix/debug --json matrix.json | tee matrix.txt
+      - name: Matrix cargo target (fails unless every row is PASS)
+        run: cargo test -p ap-proxy --features matrix-upstream --test matrix
+
+      - name: Fail-closed matrix driver (writes matrix.json and matrix.txt)
+        run: |
+          set -o pipefail
+          python3 tests/matrix/matrix.py --bin target/debug --json matrix.json | tee matrix.txt
 
       - name: Upload matrix results
         if: always()

@@ -27,6 +27,10 @@ PORT_RESTART = 18103
 PORT_EGRESS = 18110
 PORT_PROBE = 18120
 UPSTREAM_PORTS = dict(good=18443, evil=18444, badca=18445, wrongname=18446)
+# Test name map for ap-egress (matrix-upstream build only). The name is two labels, so the
+# allowlist validator accepts it; it resolves to loopback, so the address check must refuse it.
+EGRESS_NAME = "loop.test"
+EGRESS_RESOLVE = f"{EGRESS_NAME}=127.0.0.1"
 MAX_BODY = 1024 * 1024  # test body cap (limits.max_body_bytes), also the session-plane cap
 
 # Header names that carry a credential. The proxy must strip every one of them from agent requests.
@@ -264,7 +268,8 @@ class Env:
                 f.write(value)
 
     # ------------------------------------------------------------ TOML config
-    def main_text(self, port=PORT_MAIN, lease=900, authority=600, grants=None):
+    def main_text(self, port=PORT_MAIN, lease=900, authority=600, grants=None,
+                  egress_allow=("allowed.test:443",)):
         grants = DEFAULT_GRANTS if grants is None else grants
         out = [
             "version = 1",
@@ -300,7 +305,8 @@ class Env:
                 ts = ", ".join(f'"{t}"' for t in g["aws_targets"])
                 out.append(f"aws_targets = [{ts}]")
             out.append("")
-        out += ["[egress]", 'allow = ["allowed.test:443"]', ""]
+        allow = ", ".join(f'"{x}"' for x in egress_allow)
+        out += ["[egress]", f"allow = [{allow}]", ""]
         return "\n".join(out)
 
     def write_file(self, path, text):
@@ -362,7 +368,8 @@ class Env:
         err = open(os.path.join(self.work, "egress.log"), "ab")
         self.egress = subprocess.Popen(
             [os.path.join(self.bindir, "ap-egress"), "--config", cfg_path, "--listen", f"127.0.0.1:{PORT_EGRESS}"],
-            stdout=err, stderr=err, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+            stdout=err, stderr=err,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "AP_TEST_EGRESS_RESOLVE": EGRESS_RESOLVE})
         err.close()
         if not wait_port(PORT_EGRESS, self.egress):
             raise RuntimeError("ap-egress did not start; see egress.log")

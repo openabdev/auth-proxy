@@ -1,7 +1,8 @@
 //! Runs the fail-closed matrix driver (`tests/matrix/matrix.py`) against the built binaries.
 //!
-//! Build with the test feature, so that the proxy trusts the throwaway CA:
-//!   cargo build -p ap-proxy -p ap-egress --features ap-proxy/matrix-upstream
+//! Build with the test feature in both binaries, so that the proxy trusts the throwaway CA and the
+//! egress proxy maps the test name:
+//!   cargo build -p ap-proxy -p ap-egress --features ap-proxy/matrix-upstream,ap-egress/matrix-upstream
 //!   cargo test -p ap-proxy --features matrix-upstream --test matrix
 //!
 //! The test passes only when the driver exits 0, prints no FAIL row, and reports every registered

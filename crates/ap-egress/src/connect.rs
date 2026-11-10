@@ -48,8 +48,10 @@ pub fn parse_connect(request_line: &str, headers: &[&str]) -> Result<HostPort, R
     if version != "HTTP/1.1" || target.contains('/') {
         return Err(Refuse::BadRequest);
     }
+    // The target is parsed first, so an IP literal is refused as 403 whatever the Host header says.
+    let host_port = split_target(target)?;
     check_host_header(target, headers)?;
-    split_target(target)
+    Ok(host_port)
 }
 
 /// At most one Host header, and when present it must name the same authority as the target.
@@ -97,6 +99,9 @@ pub async fn read_head<S: AsyncRead + Unpin>(client: &mut S) -> Result<(String, 
     let mut chunk = [0u8; 1024];
     loop {
         if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            if end > MAX_HEAD {
+                return Err(Refuse::BadRequest);
+            }
             let head = std::str::from_utf8(&buf[..end])
                 .map_err(|_| Refuse::BadRequest)?
                 .to_string();

@@ -158,9 +158,9 @@ mod tests {
 
     #[test]
     fn secret_debug_is_redacted() {
-        let s = SecretBytes::new(b"sk-live-123".to_vec());
+        let s = SecretBytes::new(b"test-value".to_vec());
         assert_eq!(format!("{s:?}"), "<redacted>");
-        assert_eq!(s.expose(), b"sk-live-123");
+        assert_eq!(s.expose(), b"test-value");
     }
 
     #[test]

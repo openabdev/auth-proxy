@@ -128,3 +128,133 @@ impl<C: Clock> Registry<C> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::ManualClock;
+    use crate::registry::test_support::{
+        access, cfg, entry, new_reg, sha, snapshot, tmp_dir, IDENT, T0,
+    };
+    use crate::registry::{Deny, Registry, SessErr};
+    use ap_core::session_wire::{Entry, WireErr};
+
+    fn hello(r: &mut Registry<ManualClock>, id: &str, now: u64) -> String {
+        r.hello(id, now).expect("hello")
+    }
+
+    #[test]
+    fn resync_with_invalid_entry_applies_nothing() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        let before = snapshot(&r);
+        let mut bad = entry("s9", 1, "z");
+        bad.surrogate_sha256 = "not-hex".into();
+        let list = vec![entry("s2", 1, "b"), bad];
+        assert_eq!(
+            r.resync(IDENT, &tok, list, T0),
+            Err(SessErr::Invalid(WireErr {
+                field: "surrogate_sha256"
+            }))
+        );
+        assert_eq!(snapshot(&r), before);
+        assert!(r.authorize(&sha("a"), IDENT, "kiro-api", T0).is_ok());
+    }
+
+    #[test]
+    fn resync_with_duplicate_key_or_ungranted_credential_applies_nothing() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        let before = snapshot(&r);
+        let dup = vec![entry("s2", 1, "b"), entry("s2", 1, "c")];
+        assert_eq!(r.resync(IDENT, &tok, dup, T0), Err(SessErr::Conflict));
+        let mut ungranted = entry("s3", 1, "d");
+        ungranted.credentials = vec!["other-cred".into()];
+        assert_eq!(
+            r.resync(IDENT, &tok, vec![ungranted], T0),
+            Err(SessErr::CredentialNotGranted)
+        );
+        assert_eq!(snapshot(&r), before);
+    }
+
+    #[test]
+    fn resync_drops_unlisted_sessions_and_revokes_their_surrogates() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        r.register(IDENT, &tok, entry("s2", 1, "b"), T0).unwrap();
+        let resp = r
+            .resync(IDENT, &tok, vec![entry("s1", 1, "a")], T0)
+            .unwrap();
+        assert_eq!(
+            resp,
+            ap_core::session_wire::ResyncResp {
+                registered: 1,
+                dropped: 1
+            }
+        );
+        assert_eq!(
+            r.authorize(&sha("b"), IDENT, "kiro-api", T0),
+            Err(Deny::Revoked)
+        );
+        assert!(r.authorize(&sha("a"), IDENT, "kiro-api", T0).is_ok());
+    }
+
+    #[test]
+    fn resync_keeps_listed_session_with_same_surrogate() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        let tok = hello(&mut r, IDENT, T0);
+        r.register(IDENT, &tok, entry("s1", 1, "a"), T0).unwrap();
+        let list: Vec<Entry> = vec![entry("s1", 1, "a"), entry("s2", 1, "b")];
+        let resp = r.resync(IDENT, &tok, list, T0 + 10).unwrap();
+        assert_eq!(resp.dropped, 0);
+        assert_eq!(resp.registered, 2);
+    }
+
+    #[test]
+    fn resync_requires_a_valid_token() {
+        let clock = ManualClock::new(T0);
+        let mut r = new_reg(&clock);
+        hello(&mut r, IDENT, T0);
+        assert_eq!(
+            r.resync(IDENT, "apt_wrong", vec![entry("s1", 1, "a")], T0),
+            Err(SessErr::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn token_file_holds_only_the_hash() {
+        let clock = ManualClock::new(T0);
+        let dir = tmp_dir("hash-only");
+        let mut r = Registry::new(clock.clone(), cfg(), access(), Some(dir.clone()));
+        let tok = hello(&mut r, IDENT, T0);
+        let text = std::fs::read_to_string(token_file(&dir, IDENT)).unwrap();
+        assert_eq!(text, sha256_hex(&tok));
+        assert!(!text.contains(&tok));
+        assert!(!text.contains("apt_"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn token_hash_reload_keeps_authority_valid() {
+        let clock = ManualClock::new(T0);
+        let dir = tmp_dir("reload");
+        let mut first = Registry::new(clock.clone(), cfg(), access(), Some(dir.clone()));
+        let tok = hello(&mut first, IDENT, T0);
+        drop(first);
+        clock.set(T0 + 10);
+        let mut second = Registry::new(clock.clone(), cfg(), access(), Some(dir.clone()));
+        assert!(second.renew(IDENT, &tok, &[], clock.now()).is_ok());
+        assert!(matches!(
+            second.hello(IDENT, clock.now()),
+            Err(crate::registry::HelloErr::AuthorityActive { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

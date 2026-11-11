@@ -3,13 +3,13 @@
 //! Usage: `ap-egress --config <path> --listen <loopback-addr>`. Exits 2 on a bad argument, an
 //! invalid config, a non-loopback listen address or a bind failure.
 
-use ap_egress::connect::{serve_conn, TcpConnector};
+use ap_egress::accept::serve_listener;
+use ap_egress::connect::TcpConnector;
 #[cfg(not(feature = "matrix-upstream"))]
 use ap_egress::resolve::SystemResolver;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpListener;
 
 const USAGE: &str = "usage: ap-egress --config <path> --listen <loopback-addr>";
@@ -102,19 +102,12 @@ async fn main() -> ExitCode {
     eprintln!("ap-egress: listening");
 
     let allow = Arc::new(cfg.egress.allow);
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let allow = Arc::clone(&allow);
-                let resolver = Arc::clone(&resolver);
-                tokio::spawn(async move {
-                    let _ = serve_conn(stream, &allow, &*resolver, &TcpConnector).await;
-                });
-            }
-            Err(e) => {
-                eprintln!("ap-egress: accept failed: {e}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
+    serve_listener(
+        listener,
+        allow,
+        resolver,
+        Arc::new(TcpConnector),
+        cfg.egress.max_connections,
+    )
+    .await
 }

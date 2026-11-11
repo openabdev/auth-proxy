@@ -156,13 +156,26 @@ pub struct Grant {
     pub aws_targets: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields, default)]
 pub struct Egress {
     /// `host:port` entries read by ap-egress only.
     pub allow: Vec<String>,
     /// Permit egress hosts that are also credential route hosts. Off by default.
     pub allow_route_hosts: bool,
+    /// Maximum CONNECT connections ap-egress serves at once, at least 1. Default 256. A
+    /// connection accepted over the cap is closed at once.
+    pub max_connections: usize,
+}
+
+impl Default for Egress {
+    fn default() -> Self {
+        Egress {
+            allow: Vec::new(),
+            allow_route_hosts: false,
+            max_connections: 256,
+        }
+    }
 }
 
 fn default_port() -> u16 {
@@ -437,6 +450,9 @@ impl Config {
             .flat_map(|c| c.routes.iter())
             .filter_map(|r| route_hosts.get(r.as_str()).copied())
             .collect();
+        if self.egress.max_connections == 0 {
+            return Err(invalid("egress max_connections must be at least 1"));
+        }
         for entry in &self.egress.allow {
             let (host, port) = entry
                 .rsplit_once(':')

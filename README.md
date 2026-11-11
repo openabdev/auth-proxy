@@ -58,6 +58,7 @@ Implemented and tested in Phase 1:
 - File-backed credential store that re-reads a file when it changes
 - Kubernetes pod with per-UID iptables (Option A) and separate volumes ([pod.yaml](deploy/k8s/pod.yaml))
 - 41-row fail-closed matrix, run by the manual-dispatch CI workflow ([matrix](tests/matrix/matrix.py))
+- [Phase 1 status](docs/status/phase1.md)
 
 ## Todos
 

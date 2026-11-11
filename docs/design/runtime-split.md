@@ -173,11 +173,13 @@ rules for `iptables` and `ip6tables`:
 | 1002 (runtime) | Accept ESTABLISHED. Reject all other output. The runtime needs no network: `session.sock` and `runtime.sock` are Unix sockets, which netfilter does not see. |
 | 1003 (egress) | None (unchanged). |
 
-The runtime gets no rule for the proxy listener. Its session plane is a Unix socket, so a rule
-would only widen its network reach. The brief asked for UID 1002 to be allowed `session.sock` and
-the proxy listener. This design allows neither TCP path: netfilter does not filter Unix sockets, so
-`session.sock` needs no rule, and the runtime has no reason to open a TCP connection. The result is
-tighter than the brief. Owner acknowledgment is pending.
+The runtime gets no rule for the proxy listener, and it gets no TCP rule at all, on purpose. Its
+session plane is a Unix socket, which netfilter does not filter, so `session.sock` needs no rule.
+The runtime has no reason to open a TCP connection, and a TCP rule would only widen its network
+reach. The brief asked for UID 1002 to be allowed `session.sock` and the proxy listener. The owner
+approved the tighter rule set (decision after review, recorded in the report). That approval
+withdraws the earlier assumption that the runtime needs TCP to the proxy port. This rule set is the
+shipped one.
 
 `netinit.sh` takes `RUNTIME_UID` (default 1002), rejects a value equal to `AGENT_UID`, and rejects
 non-numeric values as before.

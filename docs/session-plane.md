@@ -11,20 +11,25 @@ in a later phase.
 
 ## Transport
 
-- Kubernetes: HTTP/1.1 with JSON bodies over the Unix socket `/run/auth-proxy/session.sock`. The
-  socket sits in a volume that the agent container and the proxy container both mount. The admin
-  socket is a separate socket that only the proxy mounts, and it does not serve these calls.
-- Known limitation: the agent container mounts the session socket volume writable, and the socket
-  is created with mode 0666. An agent-UID process can unlink and rebind `session.sock`. That breaks
-  the authority's calls, and it can capture the bearer token on `renew`. The effect is limited to
-  the identity's own sessions. The pod spec does not yet move the socket out of agent reach.
-- Every call except `hello` carries `Authorization: Bearer <authority-token>`.
+- Kubernetes: HTTP/1.1 with JSON bodies over the Unix socket `/run/auth-proxy-session/session.sock`.
+  The socket sits in the `session-plane` volume, which only the proxy and the runtime container
+  mount. The agent container does not mount it.
+- The socket is created with mode 0660 in a setgid directory owned by UID 1001 and group 1002, so
+  the socket's group is 1002. Only the proxy (UID 1001) and the runtime (UID 1002) can connect. The
+  agent (UID 1000) is in neither group, and no mount shows it the path.
+- The admin socket is a separate socket that only the proxy mounts, and it does not serve these
+  calls.
+- The runtime serves the agent over its own socket, `/run/auth-proxy-agent/runtime.sock`. The
+  agent never calls the session socket. See "Agent-runtime socket" below.
+- Every call except `hello` and `GET /v1/hello/challenge` carries `Authorization: Bearer
+  <authority-token>`.
 
 ## Calls
 
 | Call | Body | Success | Failure |
 |---|---|---|---|
-| `POST /v1/hello` (Kubernetes only) | `{identity}`, where `identity` is the name of an identity in the config | `201 {authority_token, lease_secs}` | `400 identity_unknown` for a name not in the config, `400 invalid_body` for a body without a string `identity`; `409 authority_active` while the current authority's lease is live |
+| `GET /v1/hello/challenge` (Kubernetes only) | none | `200 {nonce, ttl_secs}`. `nonce` is 64 lowercase hex, usable once, for 30 s. | none. The call writes an audit line with no nonce. |
+| `POST /v1/hello` (Kubernetes only) | `{identity, nonce, proof}`, where `identity` names an identity in the config and `proof` is the Ed25519 signature described under "Hello proof" | `201 {authority_token, lease_secs}` | the hello error table under "Hello proof"; `503 broker_unavailable` |
 | `POST /v1/sessions` | `{session, generation, surrogate_sha256, credentials: [id]}` | `201 {lease_secs}` | `401` bad token; `400` invalid field; `403 credential_not_granted`; `403 session_expired`; `409` same session and generation already registered with another hash; `429` over `max_sessions`; `503 broker_unavailable` |
 | `POST /v1/renew` | `{sessions: [{session, generation}]}` | `200 {lease_secs, unknown: [...]}` | `401` |
 | `DELETE /v1/sessions/{session}/{generation}` | none | `204` (also when unknown) | `401` |
@@ -53,6 +58,9 @@ lock is poisoned. It is not a store failure, and it is not the code above.
    authority).
 3. Only after step 2, enable expiry-driven resync. Until then, a resync that names an expired key
    can break an older client.
+4. The hello proof needs the proxy and the runtime shim together. A proxy with the gate refuses a
+   hello with no proof, so a client that does not sign cannot start an authority. Deploy the proxy
+   and `ap-runtime-shim` in the same pod revision.
 
 ## Validation
 
@@ -79,7 +87,7 @@ init container without truncating an existing file.
 
 ## Hello lock
 
-On Kubernetes the runtime calls `hello` before it binds its listeners, and it gets an authority
+On Kubernetes the runtime calls `hello` before it binds its agent socket, and it gets an authority
 token back.
 
 - The authority holds a lease of 90 s. It renews the lease, and every live session, with one
@@ -90,23 +98,74 @@ token back.
 - While the lease is live, another `hello` returns `409 authority_active`.
 - When the lease lapses, the proxy revokes every session that the old authority registered, and
   then it accepts a new `hello`.
-- In openab-pty the runtime is PID 1 of its container. A dead runtime takes its shells with it. The
-  target is that the next `hello` comes from the restarted runtime before any session exists. The
-  Phase 1 code does not enforce this yet (see below).
+- Only a `hello` that carries a valid proof can take the lease. The proof is described next.
 
-**Target guarantee: not yet implemented, tracked as follow-up.** The target is that `hello`
-requires a runtime-only proof, so a process outside the runtime cannot take the authority. The
-Phase 1 code does not enforce this. `hello` takes an identity name and no secret. The agent
-container shares the session socket and runs as UID 1000, the same UID as the authority. So during
-the lease-lapse window, an agent-UID process that can reach `session.sock` can call `hello` first
-and become the authority today. Its reach is limited to its own identity's grants. The real
-credential stays in the proxy, and an unknown surrogate is still refused.
+### Hello proof
 
-Limit of the target: a same-UID process can still read the proof from the runtime's environment or
-memory. The proof addresses other containers and processes. It does not address same-UID
-neighbours. Decision record: `M2` in the phase1-impl decision file (owner chose option 1).
+The runtime holds an Ed25519 seed. The proxy holds only the public key. A process without the seed
+cannot take the authority, even during a lease lapse.
+
+- **Keys.** The runtime's seed is standard base64 of 32 bytes, in Secret `auth-proxy-runtime-key`,
+  key `runtime_ed25519.seed`. The runtime container mounts it read-only, and no other container
+  does. The proxy's identity config holds the public key as `runtime_pubkey` (standard base64 of 32
+  bytes). The public key is not a secret. A malformed key stops the proxy at startup.
+- **Flow.** `GET /v1/hello/challenge` returns a nonce. The runtime signs the hello message below
+  and posts `{identity, nonce, proof}`, where `proof` is the standard base64 of the 64-byte
+  signature.
+
+  ```
+  "auth-proxy hello v1\n" || u32_be(len(identity)) || identity || "\n" || nonce
+  ```
+
+- **Nonces.** 32 bytes from the OS RNG, as 64 lowercase hex. Each nonce works once and expires
+  after 30 s. At most 64 are outstanding, and the oldest is evicted first. Nonces live in memory,
+  so a proxy restart clears them.
+- **Checks, in order.** The first failure returns, and nothing after it runs.
+
+  | Step | Failure | Status and code |
+  |---|---|---|
+  | body shape; `nonce`, when present, is 64 lowercase hex | wrong types, unknown fields, or a bad nonce | `400 invalid_body` |
+  | identity is in the config | not in the config | `400 identity_unknown` |
+  | identity has a `runtime_pubkey` | none configured | `403 runtime_key_missing` |
+  | `proof` is present | no proof. A body with only `identity` stops here. | `401 proof_missing` |
+  | `nonce` is present, issued, unexpired and unused | missing, unknown, expired or spent. The entry is removed on lookup. | `401 nonce_invalid` |
+  | `proof` is 64 bytes and verifies strictly over the message | wrong key, wrong identity, or wrong nonce | `401 proof_invalid` |
+  | lease | a live lease holds the identity | `409 authority_active` |
+
+  A refusal before the nonce check does not spend the nonce, so the same nonce works with a proof.
+  The audit line for `hello` carries the identity and the result. It never carries the proof, the
+  nonce or the token.
+
+- **What the proof does not cover.** A process inside the runtime container can still sign, since
+  the seed is in that container's memory. The runtime container runs only `ap-runtime-shim`, so
+  this residual is limited to that one image. The proof stops the agent container and any other
+  container in the pod. The decision record is `docs/design/runtime-split.md`.
 
 On ECS there is no `hello`. The authority token is set in the proxy config as its hash.
+
+## Agent-runtime socket
+
+Kubernetes only. The runtime container serves this socket. The agent container mounts it, and the
+proxy does not. It is the only interface the agent has to the session plane.
+
+- Transport: HTTP/1.1 with JSON bodies over `/run/auth-proxy-agent/runtime.sock`. The socket is
+  owned by UID 1002, group 1000, mode 0660. The agent sends no identity and no token. The runtime
+  serves one identity, from its own `--identity` argument.
+- Bodies are capped at 1 MiB (`413 body_too_large`).
+
+| Operation | Request | Success | Failure |
+|---|---|---|---|
+| register | `POST /v1/session` with `{session, generation, credentials}` | `201 {surrogate}`. The runtime makes the surrogate (`aps_` plus 64 lowercase hex) and sends the proxy its digest only. | `400 invalid_body`; `400 invalid_field` with `field`; `403 credential_not_granted`; `403 session_expired`; `409 conflict`; `409 revoke_pending`; `429 too_many_sessions`; `503 broker_unavailable` |
+| revoke | `DELETE /v1/session/{session}/{generation}` | `204`. A key the runtime did not register also gets `204`, with no proxy call. | `400 invalid_field` with `field`; `503 broker_unavailable` |
+| status | `GET /v1/status` | `200 {identity, authority: "live", sessions: [{session, generation}]}` | none beyond `404` and `405` |
+
+- The proxy's refusal codes pass through unchanged. `revoke_pending` is returned while an earlier
+  end of the same key is still unconfirmed.
+- Every other path returns `404 unknown_operation`. That includes `/v1/hello` and
+  `/v1/hello/challenge`, which are the proxy's paths and never the agent's. A listed path with a
+  different method returns `405 method_not_allowed`.
+- The runtime binds `runtime.sock` only after its `hello` succeeds, so the socket never answers
+  before the authority exists.
 
 ## Revocation and audit
 
@@ -114,11 +173,13 @@ On ECS there is no `hello`. The authority token is set in the proxy config as it
   authority.
 - A process that outlives its session is refused on its next request.
 - Every call writes an audit line with the session id, the generation, a short hash prefix and the
-  result. An audit line never contains a surrogate or the caller key.
+  result. An audit line never contains a surrogate, the caller key, a nonce, a proof or a token.
 
 ## Amendments to the design table
 
 - The design's Q1-B table lists the `hello` body as `{}`. The implementation requires
-  `{"identity": "<identity name>"}`, and the matrix driver sends it. This document uses the
-  implemented body. The design copy at `docs/design/phase1.md` is unchanged.
+  `{identity, nonce, proof}`, and `{identity}` alone is refused with `401 proof_missing`. The
+  matrix driver and `ap-client` send the full body. This document uses the implemented body. The
+  design copy at `docs/design/phase1.md` is unchanged, and it still names the old session socket
+  path and the old hello body.
 - The `400 identity_unknown` row is added. It is returned for a name not in the config.

@@ -48,7 +48,7 @@ Implemented and tested in Phase 1:
 
 - Caller-key routing and surrogate credential swap ([design](docs/design/phase1.md))
 - Runtime proof for `hello`: Ed25519, the seed held by the runtime container only. A process inside that container can still sign ([session plane](docs/session-plane.md))
-- Agent-runtime socket: the agent registers, revokes and reads status through the runtime, and nothing else ([session plane](docs/session-plane.md))
+- Agent-runtime socket: the agent registers, revokes and reads status through the runtime, and nothing else ([session plane](docs/session-plane.md)). The status read is unit-tested, not pod-tested
 - Per-identity TOML policy with fail-closed checks ([design](docs/design/phase1.md))
 - Canonicalization, and refusal of ambiguous hosts and paths
 - 12 h absolute session TTL, lease renewal, and synchronous revoke ([session plane](docs/session-plane.md))

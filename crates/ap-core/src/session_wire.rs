@@ -77,8 +77,9 @@ pub struct ResyncResp {
     pub dropped: usize,
     /// Session keys in the list that were skipped because their stored absolute expiry has
     /// passed. The client must drop them and must not resend them. Absent in responses from an
-    /// older proxy, which reads as an empty list.
-    #[serde(default)]
+    /// older proxy, which reads as an empty list. Omitted when empty, so a response with nothing
+    /// expired has the older wire shape exactly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expired: Vec<SessionRef>,
 }
 
@@ -286,6 +287,20 @@ mod tests {
                 dropped: 1,
                 expired: vec![],
             }
+        );
+    }
+
+    #[test]
+    fn resync_response_with_nothing_expired_keeps_the_old_wire_shape() {
+        // An older client denies unknown fields, so an empty `expired` must not be written.
+        let resp = ResyncResp {
+            registered: 2,
+            dropped: 1,
+            expired: vec![],
+        };
+        assert_eq!(
+            serde_json::to_string(&resp).unwrap(),
+            r#"{"registered":2,"dropped":1}"#
         );
     }
 

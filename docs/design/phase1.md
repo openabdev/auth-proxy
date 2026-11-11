@@ -262,7 +262,7 @@ on the proxy service. Every call except `hello` carries `Authorization: Bearer <
 | Call | Body | Success | Failure |
 |---|---|---|---|
 | `POST /v1/hello` (Kubernetes only) | `{}` | `201 {authority_token, lease_secs}` | `409 authority_active` while the current authority's lease is live |
-| `POST /v1/sessions` | `{session, generation, surrogate_sha256, credentials: [id]}` | `201 {lease_secs}` | `401` bad token; `400` invalid field; `403 credential_not_granted`; `409` same session and generation already registered with another hash; `429` over `max_sessions` |
+| `POST /v1/sessions` | `{session, generation, surrogate_sha256, credentials: [id]}` | `201 {lease_secs}` | `401` bad token; `400` invalid field; `403 credential_not_granted`; `403 session_expired`; `409` same session and generation already registered with another hash; `429` over `max_sessions`; `503 broker_unavailable` (see `docs/session-plane.md`) |
 | `POST /v1/renew` | `{sessions: [{session, generation}]}` | `200 {lease_secs, unknown: [...]}` | `401` |
 | `DELETE /v1/sessions/{session}/{generation}` | none | `204` (also when unknown) | `401` |
 | `PUT /v1/sessions` (resync) | full list as in `POST` | `200 {registered, dropped, expired}`; sessions not in the list are revoked; `expired` lists listed keys skipped because their absolute expiry has passed | `401`, `400` (whole request rejected, nothing applied), `503 broker_unavailable` (nothing applied) |

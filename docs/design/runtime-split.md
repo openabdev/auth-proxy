@@ -140,6 +140,10 @@ the nonce or the token.
 The runtime signs with the seed it loaded at startup. The shim exits non-zero when hello fails, and
 the restart policy retries it.
 
+Row 6 of the order table is a signature check, not a secret comparison. The proxy holds only the public key and
+compares no secret, so no constant-time byte comparison applies. `verify_strict` rejects
+non-canonical signatures and small-order keys, and that check is the whole rule.
+
 ## Failure codes
 
 | Layer | Status and code | When |
@@ -170,8 +174,13 @@ rules for `iptables` and `ip6tables`:
 | 1003 (egress) | None (unchanged). |
 
 The runtime gets no rule for the proxy listener. Its session plane is a Unix socket, so a rule
-would only widen its network reach. `netinit.sh` takes `RUNTIME_UID` (default 1002), rejects a
-value equal to `AGENT_UID`, and rejects non-numeric values as before.
+would only widen its network reach. The brief asked for UID 1002 to be allowed `session.sock` and
+the proxy listener. This design allows neither TCP path: netfilter does not filter Unix sockets, so
+`session.sock` needs no rule, and the runtime has no reason to open a TCP connection. The result is
+tighter than the brief. Owner acknowledgment is pending.
+
+`netinit.sh` takes `RUNTIME_UID` (default 1002), rejects a value equal to `AGENT_UID`, and rejects
+non-numeric values as before.
 
 ## Verification
 

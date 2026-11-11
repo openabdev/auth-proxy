@@ -71,6 +71,8 @@ Implemented and tested in Phase 1:
 - Live run of the K8s pod on a cluster is not in CI: the validator checks the manifest only
 - The signature check on the runtime proof is not a constant-time comparison. The design note explains why; revisit if the proof path changes.
 - The manifest validator does not catch the runtime proof seed being exposed through env or secretKeyRef. Add a check.
+- The 503 error code on the hello path is `unavailable` in the code and `broker_unavailable` elsewhere in the design. Align them.
+- The final checks summary lists one test target with 0 passed; the workspace total (289) appears only in the report.
 
 ## Kubernetes deployment (Option A)
 
@@ -80,10 +82,10 @@ loopback, and the runtime over its own Unix socket. It has no path to the sessio
 cannot read the proxy's credential Secret or the runtime's proof seed.
 
 Measured: the runtime split ran on an OrbStack cluster (arm64) and on a second k3s node (amd64).
-Both runs used `pod.yaml` with a mock upstream and dummy credentials. These checks passed on both:
+Both runs used `pod.yaml` with a mock upstream and dummy credentials, with these caveats: the proxy was a test-only build with the `matrix-upstream` feature, which prints a TEST BUILD banner; the images were test-tagged; and checks A(i-b) and A(iii) used a test-only overlay pod with a shell wrapper. Not run: the real upstream, real credentials, the 12 h lapse on a cluster, and ECS. These checks passed on both:
 all init containers exited 0 and all app containers became ready; the netinit rules for UID 1002
 were in place; the agent reached the proxy and egress on loopback; direct TCP and DNS from the
-agent were blocked; register, revoke and status worked through `runtime.sock`; the upstream saw the
+agent were blocked; register and revoke worked through `runtime.sock`; the upstream saw the
 real credential and never the surrogate or the caller key; no secret appeared in container logs;
 the expiry store survived a pod delete and recreate; and the agent could not read the runtime key
 or open `session.sock`. The proxy accepted the runtime's signed `hello`, and `runtime.sock`
@@ -92,6 +94,8 @@ agent in all 60 samples over about 4 minutes.
 
 Not measured: a real upstream with real credentials; the 12 h TTL lapse on a cluster (unit tests
 only); NetworkPolicy, which Phase 1 does not use; and ECS, which is not started.
+
+The evidence record for the runtime split is [docs/evidence/runtime-split.md](docs/evidence/runtime-split.md).
 
 ```mermaid
 flowchart TB

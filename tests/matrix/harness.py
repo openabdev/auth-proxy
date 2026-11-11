@@ -71,6 +71,74 @@ def sh(*cmd):
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# Ed25519 through openssl 3 (pkeyutl -rawin). A seed becomes a PKCS8 DER key by prefixing the
+# fixed 16-byte header. The public key is the last 32 bytes of the SubjectPublicKeyInfo.
+PKCS8_ED25519_HEAD = bytes.fromhex("302e020100300506032b657004220420")
+HELLO_VECTOR_SEED = b"\x07" * 32
+HELLO_VECTOR_IDENTITY = "pty-team-a"
+HELLO_VECTOR_NONCE = "0" * 64
+
+
+def hello_message(identity, nonce):
+    """The bytes the runtime signs: the constant line, a u32 big-endian length, the identity, a
+    newline and the nonce. Mirrors ap_core::session_wire::hello_message."""
+    raw = identity.encode()
+    return b"auth-proxy hello v1\n" + len(raw).to_bytes(4, "big") + raw + b"\n" + nonce.encode()
+
+
+def _key_der(work, seed):
+    path = os.path.join(work, "rt-%s.der" % secrets.token_hex(6))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(PKCS8_ED25519_HEAD + seed)
+    return path
+
+
+def ed25519_pubkey_b64(work, seed):
+    """Standard base64 of the 32-byte public key for `seed`, as the proxy config holds it."""
+    import base64
+    key = _key_der(work, seed)
+    spki = subprocess.run(["openssl", "pkey", "-inform", "DER", "-in", key, "-pubout", "-outform", "DER"],
+                          check=True, capture_output=True).stdout
+    os.remove(key)
+    return base64.b64encode(spki[-32:]).decode()
+
+
+def ed25519_sign_hello(work, seed, identity, nonce):
+    """Standard base64 of the Ed25519 signature over hello_message, made with openssl."""
+    import base64
+    key = _key_der(work, seed)
+    msg = os.path.join(work, "hello-%s.bin" % secrets.token_hex(6))
+    sig = msg + ".sig"
+    with open(msg, "wb") as f:
+        f.write(hello_message(identity, nonce))
+    try:
+        subprocess.run(["openssl", "pkeyutl", "-sign", "-inkey", key, "-keyform", "DER", "-rawin",
+                        "-in", msg, "-out", sig], check=True, capture_output=True)
+        with open(sig, "rb") as f:
+            raw = f.read()
+    finally:
+        for p in (key, msg, sig):
+            if os.path.exists(p):
+                os.remove(p)
+    if len(raw) != 64:
+        raise RuntimeError("openssl returned %d signature bytes" % len(raw))
+    return base64.b64encode(raw).decode()
+
+
+def check_hello_vector(work):
+    """Pin the signing path against the value the Rust test ap-client proof::tests pins. Both
+    sides sign the same seed, identity and nonce, and Ed25519 is deterministic, so the two must
+    agree byte for byte. A mismatch means the wire message or the key format differs."""
+    got = ed25519_sign_hello(work, HELLO_VECTOR_SEED, HELLO_VECTOR_IDENTITY, HELLO_VECTOR_NONCE)
+    if got != HELLO_VECTOR_PROOF:
+        raise RuntimeError("hello signing vector mismatch: got %s, want %s" % (got, HELLO_VECTOR_PROOF))
+    return got
+
+
+HELLO_VECTOR_PROOF = "0gzaf9i0GWkxQUg/sALsKLMChV90x4st2hZgF2HEl3NQCs6riM7m+AtUZRrQKddz6+gj5eF4sdkGwXD+287QBQ=="
+
+
 def wait_port(port, proc=None, timeout=15.0):
     end = time.time() + timeout
     while time.time() < end:
@@ -225,6 +293,9 @@ class Env:
         self.admin_sock = os.path.join(self.run_dir, "admin.sock")
         self.audit_file = os.path.join(work, "audit.jsonl")
         self.keys = {i: "apk_" + secrets.token_hex(32) for i in IDENTITIES}
+        # One runtime seed per identity. The config holds only the public key.
+        self.runtime_seeds = {i: secrets.token_bytes(32) for i in IDENTITIES}
+        self.runtime_pub = {i: ed25519_pubkey_b64(work, self.runtime_seeds[i]) for i in IDENTITIES}
         self.creds = {c: "real-" + secrets.token_hex(24) for c in CREDENTIALS}
         self.minted = []  # every surrogate issued this run, for the secret scan
         self.sessions = {}  # surrogate -> (identity, session, generation, credentials)
@@ -287,7 +358,8 @@ class Env:
             "",
         ]
         for name in IDENTITIES:
-            out += ["[[identity]]", f'name = "{name}"', f'caller_key_sha256 = "{sha256_hex(self.keys[name])}"', ""]
+            out += ["[[identity]]", f'name = "{name}"', f'runtime_pubkey = "{self.runtime_pub[name]}"',
+                    f'caller_key_sha256 = "{sha256_hex(self.keys[name])}"', ""]
         for route, (host, port_key, extra) in ROUTE_HOSTS.items():
             out += ["[[route]]", f'name = "{route}"', f'host = "{host}"', f"port = {UPSTREAM_PORTS[port_key]}"]
             if extra:
@@ -337,6 +409,10 @@ class Env:
             self.tokens = {}
             self.tokens_dir = os.path.join(self.work, f"tokens-{port}-{secrets.token_hex(4)}")
             os.makedirs(self.tokens_dir)
+            # The proxy refuses to start without its expiry store. The pod creates it once in
+            # expiry-store-bootstrap (pod.yaml); the harness does the same, with the same header.
+            with open(os.path.join(self.tokens_dir, "session-expiry.v1"), "x") as f:
+                f.write("auth-proxy session expiry v1\n")
         self.port = port
         self.cur_cfg = cfg_path
         out = open(self.audit_file, "ab")
@@ -404,8 +480,18 @@ class Env:
             j = None
         return r.status, j
 
-    def hello(self, identity):
-        st, j = self.sp("POST", "/v1/hello", {"identity": identity})
+    def sign_hello(self, identity, nonce, seed=None):
+        """A proof over the hello message. Uses the identity's runtime seed unless `seed` is given."""
+        return ed25519_sign_hello(self.work, seed or self.runtime_seeds[identity], identity, nonce)
+
+    def hello(self, identity, seed=None):
+        """Fetch a challenge, sign it, and post the hello. Stores the token on 201."""
+        st, ch = self.sp("GET", "/v1/hello/challenge")
+        if st != 200:
+            return st, ch
+        nonce = ch["nonce"]
+        proof = self.sign_hello(identity, nonce, seed)
+        st, j = self.sp("POST", "/v1/hello", {"identity": identity, "nonce": nonce, "proof": proof})
         if st == 201:
             self.tokens[identity] = j["authority_token"]
         return st, j

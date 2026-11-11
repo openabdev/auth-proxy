@@ -27,7 +27,7 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (  # noqa: E402
     AUTH, DEFAULT_GRANTS, EGRESS_NAME, MAX_BODY, PORT_AUTHORITY, PORT_EGRESS, PORT_LEASE, PORT_MAIN, PORT_PROBE,
-    PORT_RESTART, UPSTREAM_PORTS, Env, read_response, sha256_hex, tls_get,
+    PORT_RESTART, UPSTREAM_PORTS, Env, check_hello_vector, read_response, sha256_hex, tls_get,
 )
 
 CASES = []  # (id, row, name, instance, fn)
@@ -38,7 +38,7 @@ GATE_IDS = [
     "R7-1", "R8-1", "R8-2", "R8-3", "X4-1", "X5-1", "X6-1",
 ]
 P1_IDS = ["P1-01", "P1-02", "P1-03", "P1-04", "P1-05", "P1-06", "P1-07", "P1-08", "P1-09", "P1-10",
-          "P1-11"]
+          "P1-11", "P1-12", "P1-13"]
 EXPECTED = GATE_IDS + P1_IDS
 
 
@@ -591,7 +591,7 @@ def _(e):
       instance="authority")
 def _(e):
     st1, _ = e.hello("agent-1")
-    st2, j2 = e.sp("POST", "/v1/hello", {"identity": "agent-1"})
+    st2, j2 = e.hello("agent-1")
     s = e.mint("agent-1", ("c-up",))
     time.sleep(2.5)
     st3, _ = e.hello("agent-1")
@@ -603,6 +603,25 @@ def _(e):
         and st4 == 403 and code4 == "surrogate_revoked"
     return ok, (f"hello={st1} second_hello={st2}/{err2} hello_after_lapse={st3} "
                 f"old_surrogate={st4}/{code4}")
+
+
+@case("P1-12", "P1", "hello with only an identity (no proof) refused as proof_missing")
+def _(e):
+    st, j = e.sp("POST", "/v1/hello", {"identity": "agent-1"})
+    err = (j or {}).get("error")
+    return st == 401 and err == "proof_missing", f"status={st} error={err}"
+
+
+@case("P1-13", "P1", "hello with a proof signed by another key refused as proof_invalid")
+def _(e):
+    st0, ch = e.sp("GET", "/v1/hello/challenge")
+    if st0 != 200:
+        return False, f"challenge status={st0}"
+    nonce = ch["nonce"]
+    wrong = e.sign_hello("agent-1", nonce, seed=secrets.token_bytes(32))
+    st, j = e.sp("POST", "/v1/hello", {"identity": "agent-1", "nonce": nonce, "proof": wrong})
+    err = (j or {}).get("error")
+    return st == 401 and err == "proof_invalid", f"status={st} error={err}"
 
 
 @case("P1-04", "P1", "session PUT with one bad entry: 400 and nothing applied")
@@ -794,6 +813,8 @@ def main():
             return 2
     work = os.path.abspath(a.work) if a.work else tempfile.mkdtemp(prefix="apm-")
     os.makedirs(work, exist_ok=True)
+    # Refuse to run the matrix if the proof signing path disagrees with the Rust vector.
+    check_hello_vector(work)
     e = Env(bindir, work)
     results = []
     try:

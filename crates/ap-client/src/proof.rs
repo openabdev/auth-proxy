@@ -99,6 +99,14 @@ mod tests {
     }
 
     #[test]
+    fn signature_matches_the_pinned_vector() {
+        // The same value tests/matrix/harness.py pins (HELLO_VECTOR_PROOF). Ed25519 is
+        // deterministic, so the Rust and the openssl paths must agree byte for byte.
+        let want = "0gzaf9i0GWkxQUg/sALsKLMChV90x4st2hZgF2HEl3NQCs6riM7m+AtUZRrQKddz6+gj5eF4sdkGwXD+287QBQ==";
+        assert_eq!(key().sign_hello("pty-team-a", &"0".repeat(64)), want);
+    }
+
+    #[test]
     fn seed_text_may_end_with_a_newline() {
         let text = format!("{}\n", STANDARD.encode(SEED));
         assert!(RuntimeKey::from_seed_b64(&text).is_ok());

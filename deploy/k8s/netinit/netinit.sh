@@ -33,15 +33,18 @@ for v in "$AGENT_UID" "$PROXY_PORT" "$EGRESS_PORT" $OTHER_LO_PORTS; do
   esac
 done
 
+# Loopback REJECTs use the default reject (icmp-port-unreachable). Do not add --reject-with
+# tcp-reset: iptables-nft 1.8.13 on the OrbStack kernel rejects it on the lo OUTPUT path
+# (RULE_APPEND failed, Invalid argument). A TCP client still sees a refused connection.
 for T in iptables ip6tables; do
   $T -F OUTPUT
   $T -A OUTPUT -m owner --uid-owner "$AGENT_UID" -m conntrack --ctstate ESTABLISHED -j ACCEPT
   $T -A OUTPUT -o lo -p tcp --dport "$PROXY_PORT" -m owner --uid-owner "$AGENT_UID" -j ACCEPT
   $T -A OUTPUT -o lo -p tcp --dport "$EGRESS_PORT" -m owner --uid-owner "$AGENT_UID" -j ACCEPT
   for p in $OTHER_LO_PORTS; do
-    $T -A OUTPUT -o lo -p tcp --dport "$p" -m owner --uid-owner "$AGENT_UID" -j REJECT --reject-with tcp-reset
+    $T -A OUTPUT -o lo -p tcp --dport "$p" -m owner --uid-owner "$AGENT_UID" -j REJECT
   done
-  $T -A OUTPUT -o lo -m owner --uid-owner "$AGENT_UID" -j REJECT --reject-with tcp-reset
+  $T -A OUTPUT -o lo -m owner --uid-owner "$AGENT_UID" -j REJECT
   $T -A OUTPUT ! -o lo -m owner --uid-owner "$AGENT_UID" -j REJECT
 done
 

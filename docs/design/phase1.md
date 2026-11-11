@@ -584,7 +584,7 @@ Option A rule set with Q3-E2 (`P` = auth-proxy listener, `E` = `ap-egress` liste
 -A OUTPUT -m owner --uid-owner <agent> -m conntrack --ctstate ESTABLISHED -j ACCEPT
 -A OUTPUT -o lo -p tcp --dport P -m owner --uid-owner <agent> -j ACCEPT
 -A OUTPUT -o lo -p tcp --dport E -m owner --uid-owner <agent> -j ACCEPT
--A OUTPUT -o lo -p tcp --dport <each other sidecar port> -m owner --uid-owner <agent> -j REJECT --reject-with tcp-reset
+-A OUTPUT -o lo -p tcp --dport <each other sidecar port> -m owner --uid-owner <agent> -j REJECT
 -A OUTPUT ! -o lo -m owner --uid-owner <agent> -j REJECT
 ```
 

@@ -314,8 +314,12 @@ class Env:
     def _certs(self):
         d = self.pki
         for ca in ("ca", "evilca"):
+            # The CA carries basicConstraints and keyUsage. OpenSSL 3.5 and Python 3.13 reject a CA
+            # without a key-usage extension (matrix row R4-2).
             sh("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-               "-keyout", f"{d}/{ca}.key", "-out", f"{d}/{ca}.pem", "-days", "2", "-subj", f"/CN=ap-test-{ca}")
+               "-keyout", f"{d}/{ca}.key", "-out", f"{d}/{ca}.pem", "-days", "2", "-subj", f"/CN=ap-test-{ca}",
+               "-addext", "basicConstraints=critical,CA:TRUE",
+               "-addext", "keyUsage=critical,keyCertSign,cRLSign")
         for name, ca in (("api.up.test", "ca"), ("evil.up.test", "ca"), ("badca.up.test", "evilca"),
                          ("other.up.test", "ca")):
             sh("openssl", "req", "-newkey", "rsa:2048", "-nodes",

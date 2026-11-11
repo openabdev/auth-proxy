@@ -47,7 +47,7 @@ flowchart LR
 Implemented and tested in Phase 1:
 
 - Caller-key routing and surrogate credential swap ([design](docs/design/phase1.md))
-- Runtime proof for `hello`: Ed25519, the seed held by the runtime container only ([session plane](docs/session-plane.md))
+- Runtime proof for `hello`: Ed25519, the seed held by the runtime container only. A process inside that container can still sign ([session plane](docs/session-plane.md))
 - Agent-runtime socket: the agent registers, revokes and reads status through the runtime, and nothing else ([session plane](docs/session-plane.md))
 - Per-identity TOML policy with fail-closed checks ([design](docs/design/phase1.md))
 - Canonicalization, and refusal of ambiguous hosts and paths
@@ -64,7 +64,6 @@ Implemented and tested in Phase 1:
 - ECS / Fargate deployment (Option C): deferred to a later phase
 - Secrets Manager store (S2): deferred with ECS
 - Phase 2 TLS interception (CONNECT with CA): no current CLI needs it
-- Runtime-proof for `hello`: only the target is documented; same-UID processes can still read the proof
 - Connection cap for ap-egress: every connection spawns a task
 - Pruning of expiry records: pruning would let a re-registered key reset its 12 h cap
 - 12 h absolute TTL has no config key: it is a fixed default

@@ -12,10 +12,43 @@ pub const BODY_CAP: usize = 1_048_576;
 /// Most credentials one session may hold.
 pub const MAX_CREDENTIALS: usize = 16;
 
+/// `POST /v1/hello` body. `nonce` and `proof` are optional on the wire, so a body with only
+/// `identity` parses and is refused later with `proof_missing`. The proxy checks them in the order
+/// in `docs/design/runtime-split.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelloReq {
     pub identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
+}
+
+/// `GET /v1/hello/challenge` reply: one nonce for one hello.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelloChallenge {
+    pub nonce: String,
+    pub ttl_secs: u64,
+}
+
+/// The bytes the runtime signs for a hello:
+/// `"auth-proxy hello v1\n" || u32_be(len(identity)) || identity || "\n" || nonce`.
+/// The length prefix keeps the message unambiguous for any identity string.
+pub fn hello_message(identity: &str, nonce: &str) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(20 + 4 + identity.len() + 1 + nonce.len());
+    msg.extend_from_slice(b"auth-proxy hello v1\n");
+    msg.extend_from_slice(&(identity.len() as u32).to_be_bytes());
+    msg.extend_from_slice(identity.as_bytes());
+    msg.push(b'\n');
+    msg.extend_from_slice(nonce.as_bytes());
+    msg
+}
+
+/// A nonce as the proxy issues it: 64 lowercase hex characters.
+pub fn is_nonce(s: &str) -> bool {
+    is_lower_hex_64(s)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +285,69 @@ mod tests {
     fn hello_rejects_unknown_key() {
         let r: Result<HelloReq, _> = serde_json::from_str(r#"{"identity":"a","extra":1}"#);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn hello_accepts_identity_alone_so_the_proxy_can_refuse_it_as_proof_missing() {
+        let r: HelloReq = serde_json::from_str(r#"{"identity":"pty-team-a"}"#).unwrap();
+        assert_eq!(r.nonce, None);
+        assert_eq!(r.proof, None);
+    }
+
+    #[test]
+    fn hello_accepts_nonce_and_proof() {
+        let r: HelloReq =
+            serde_json::from_str(r#"{"identity":"a","nonce":"n","proof":"p"}"#).unwrap();
+        assert_eq!(r.nonce.as_deref(), Some("n"));
+        assert_eq!(r.proof.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn hello_request_omits_absent_fields_on_the_wire() {
+        let r = HelloReq {
+            identity: "a".into(),
+            nonce: None,
+            proof: None,
+        };
+        assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"identity":"a"}"#);
+    }
+
+    #[test]
+    fn hello_message_matches_the_fixed_vector() {
+        // "auth-proxy hello v1\n", then the identity length as u32 big-endian (10 for
+        // "pty-team-a"), the identity, a newline, and the 64-character nonce.
+        let mut want = b"auth-proxy hello v1\n\x00\x00\x00\x0apty-team-a\n".to_vec();
+        want.extend(std::iter::repeat_n(b'0', 64));
+        assert_eq!(hello_message("pty-team-a", &"0".repeat(64)), want);
+    }
+
+    #[test]
+    fn hello_message_length_prefix_keeps_identities_apart() {
+        // An identity that contains a newline must not be readable as another identity plus nonce.
+        let nonce = "0".repeat(64);
+        let a = hello_message("a\nb", &nonce);
+        let b = hello_message("a", &nonce);
+        assert_ne!(a, b);
+        assert_eq!(&a[20..24], &[0, 0, 0, 3]);
+    }
+
+    #[test]
+    fn is_nonce_accepts_only_64_lowercase_hex() {
+        assert!(is_nonce(&"a".repeat(64)));
+        assert!(!is_nonce(&"A".repeat(64)));
+        assert!(!is_nonce(&"a".repeat(63)));
+        assert!(!is_nonce(""));
+    }
+
+    #[test]
+    fn challenge_serializes_to_exactly_two_fields() {
+        let c = HelloChallenge {
+            nonce: "0".repeat(64),
+            ttl_secs: 30,
+        };
+        let v: serde_json::Value = serde_json::to_value(&c).unwrap();
+        assert_eq!(v.as_object().unwrap().len(), 2);
+        assert_eq!(v["ttl_secs"], 30);
     }
 
     #[test]

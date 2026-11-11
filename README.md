@@ -4,13 +4,14 @@
 
 An agent never holds a real credential. It sends requests to a loopback proxy with a caller key
 and a surrogate. The proxy checks both, applies one real credential, and forwards the request
-over TLS. A session authority registers each session's surrogate over a Unix socket. Non-model
-traffic such as git goes through a separate allowlisting CONNECT proxy.
+over TLS. A runtime registers each session's surrogate with the proxy over a Unix socket, and it
+proves its identity to the proxy with a signature only it can make. Non-model traffic such as git
+goes through a separate allowlisting CONNECT proxy.
 
 ```mermaid
 flowchart LR
     agent["Agent CLI<br/>caller key + surrogate only"]
-    authority["Session authority<br/>ap-client"]
+    runtime["Runtime<br/>ap-runtime-shim, holds the hello proof"]
     egress["ap-egress<br/>CONNECT allowlist"]
     git["git, registries"]
     upstream["Model API<br/>over TLS"]
@@ -30,8 +31,8 @@ flowchart LR
         store[("Credential files<br/>proxy-only mount")]
     end
 
-    authority -. "spawns child with surrogate" .-> agent
-    authority -- "Unix socket<br/>hello, register, renew" --> registry
+    agent -- "runtime.sock<br/>register, revoke, status" --> runtime
+    runtime -- "session.sock<br/>hello with proof, register, renew" --> registry
     registry --> expiry
     agent -- "base URL on loopback" --> check
     lookup --> registry
@@ -46,6 +47,8 @@ flowchart LR
 Implemented and tested in Phase 1:
 
 - Caller-key routing and surrogate credential swap ([design](docs/design/phase1.md))
+- Runtime proof for `hello`: Ed25519, the seed held by the runtime container only ([session plane](docs/session-plane.md))
+- Agent-runtime socket: the agent registers, revokes and reads status through the runtime, and nothing else ([session plane](docs/session-plane.md))
 - Per-identity TOML policy with fail-closed checks ([design](docs/design/phase1.md))
 - Canonicalization, and refusal of ambiguous hosts and paths
 - 12 h absolute session TTL, lease renewal, and synchronous revoke ([session plane](docs/session-plane.md))
@@ -70,21 +73,29 @@ Implemented and tested in Phase 1:
 
 ## Kubernetes deployment (Option A)
 
-One pod runs three app containers (agent, proxy, egress) and two init containers (netinit and
-expiry-store-bootstrap). The agent can reach only the proxy and egress loopback ports, and it
-cannot read the proxy's credential Secret. The netinit rules and the proxy/agent split were checked
-on a single-node k3s test cluster. The egress container and the expiry store in `pod.yaml` were
-not part of that run. ECS is not done yet.
+One pod runs four app containers (agent, runtime, proxy, egress) and three init containers
+(volume-prep, netinit, expiry-store-bootstrap). The agent reaches the proxy and egress over
+loopback, and the runtime over its own Unix socket. It has no path to the session socket, and it
+cannot read the proxy's credential Secret or the runtime's proof seed.
+
+Measured so far: a single-node k3s run measured the pod before the runtime container existed, with
+the agent, the proxy and the netinit rules. The runtime container, the socket permissions and the
+proof path are not yet measured on a cluster. The egress container and the expiry store in
+`pod.yaml` were not part of that run either. ECS is not done yet.
 
 ```mermaid
 flowchart TB
     subgraph pod["Pod auth-proxy-phase1, shareProcessNamespace false"]
+        volprep["init volume-prep<br/>root, CHOWN only<br/>sets socket directory owners"]
         netinit["init netinit<br/>root, NET_ADMIN only<br/>per-UID iptables and ip6tables"]
         bootstrap["init expiry-store-bootstrap<br/>UID 1001"]
         agent["agent<br/>UID 1000, read-only root fs"]
+        runtime["runtime<br/>UID 1002, ap-runtime-shim, no network"]
         proxy["proxy<br/>UID 1001, loopback port 18080"]
-        egress["egress<br/>UID 1002, loopback port 18081"]
-        handoff[("session-socket emptyDir<br/>shared with proxy")]
+        egress["egress<br/>UID 1003, loopback port 18081"]
+        agentrt[("agent-runtime emptyDir<br/>runtime.sock, agent and runtime")]
+        session[("session-plane emptyDir<br/>session.sock, proxy and runtime")]
+        proof[("Secret auth-proxy-runtime-key<br/>runtime only, read-only")]
         tokens[("proxy-tokens emptyDir<br/>proxy only")]
         store[("expiry-store PVC<br/>proxy only")]
         kiro[("Secret auth-proxy-kiro<br/>proxy only")]
@@ -94,12 +105,17 @@ flowchart TB
     model["Model API<br/>over TLS"]
     git["git, registries<br/>allowlist"]
 
-    netinit -. "rules for UID 1000" .-> agent
+    volprep -. "owners and modes" .-> agentrt
+    volprep -. "owners and modes" .-> session
+    netinit -. "rules for UID 1000 and 1002" .-> agent
     bootstrap -- "creates store file once" --> store
     agent -- "loopback 18080" --> proxy
     agent -- "loopback 18081" --> egress
-    agent --- handoff
-    proxy --- handoff
+    agent -- "register, revoke, status" --> agentrt
+    runtime --- agentrt
+    runtime -- "hello with proof, register, renew" --> session
+    proof --- runtime
+    proxy --- session
     proxy --- tokens
     store --- proxy
     kiro --- proxy
@@ -113,7 +129,12 @@ flowchart TB
 - **Loopback rules:** netinit lets UID 1000 reach only ports 18080 and 18081 on loopback. Any other
   packet from that UID that leaves loopback is rejected. Replies on established connections stay
   allowed. The rules repeat for IPv6. Without them, the agent could reach the sidecar's internal
-  ports and read the real credential, which the k3s run measured.
+  ports and read the real credential, which the k3s run measured. UID 1002 (the runtime) gets
+  replies on established connections and nothing else, since its sockets are all Unix sockets.
+- **Runtime split:** the agent holds no hello proof and no route to `session.sock`. Its one
+  session-plane path is `runtime.sock`, which serves register, revoke and status. The socket
+  directories are owned by the proxy and runtime UIDs and setgid, so the agent is in neither group
+  that can connect to `session.sock` (mode 0660).
 - **shareProcessNamespace is false:** the agent container cannot list or read the proxy's processes
   through `/proc`.
 - **DNS is blocked for UID 1000:** the same reject rule drops the agent's DNS queries. Names resolve

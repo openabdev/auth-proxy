@@ -103,6 +103,46 @@ async fn session_plane_registers_renews_and_refuses_a_wrong_token() {
 }
 
 #[tokio::test]
+async fn resync_response_omits_expired_when_nothing_expired() {
+    let up = start_upstream().await;
+    let f = Fixture::new("resync-wire", &up);
+    let app = Arc::clone(&f.app);
+
+    let (status, hello) = call(
+        router(Arc::clone(&app)),
+        "POST",
+        "/v1/hello",
+        None,
+        json!({ "identity": IDENTITY }),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let token = hello["authority_token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    let entry = json!({
+        "session": "sess-resync",
+        "generation": 1,
+        "surrogate_sha256": sha256_hex(&surrogate_token()),
+        "credentials": ["kiro"],
+    });
+    let (status, resp) = call(
+        router(Arc::clone(&app)),
+        "PUT",
+        "/v1/sessions",
+        Some(&token),
+        json!({ "sessions": [entry] }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(resp["registered"], json!(1));
+    // Nothing expired, so the reply keeps the shape an older client parses.
+    assert!(resp.get("expired").is_none(), "{resp}");
+}
+
+#[tokio::test]
 async fn unauthenticated_call_writes_one_audit_line_and_no_token() {
     let up = start_upstream().await;
     let f = Fixture::new("unauth", &up);

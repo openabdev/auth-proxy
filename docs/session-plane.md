@@ -30,6 +30,12 @@ in a later phase.
 | `DELETE /v1/sessions/{session}/{generation}` | none | `204` (also when unknown) | `401` |
 | `PUT /v1/sessions` (resync) | full list as in `POST /v1/sessions` | `200 {registered, dropped, expired: [{session, generation}]}`; sessions not in the list are revoked; `expired` lists the listed keys skipped because their absolute expiry has passed | `401`, `400` (whole request rejected, nothing applied), `503 broker_unavailable` (nothing applied) |
 
+The `expired` field is additive. The proxy writes it only when the list is not empty, so a resync
+response with nothing expired has the older shape exactly. An older client denies unknown fields
+and fails to decode a resync response that names an expired key. Upgrade every client before any
+proxy can return `expired`. The proxy can return it once one of the resynced keys is past its
+absolute expiry.
+
 ### `POST /v1/sessions` error codes
 
 | Status and code | Meaning | Registered? | Client action |

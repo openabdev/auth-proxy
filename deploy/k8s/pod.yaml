@@ -21,6 +21,9 @@ kind: PersistentVolumeClaim
 metadata:
   name: auth-proxy-expiry-store
   namespace: auth-proxy
+# Precondition, checked by the operator and not by the manifest: the storage class must give a
+# volume root that UID 1001 can write. A fresh root owned by root makes expiry-store-bootstrap fail,
+# and the pod stays in Init. No chown step runs, since that would need root in the init container.
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: REPLACE_STORAGE_CLASS

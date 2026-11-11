@@ -4,6 +4,7 @@
 //! is resolved here, every address it returns must be public, and the tunnel connects to that
 //! exact address. Bytes are copied without inspection, so no credential is seen or added.
 
+pub mod accept;
 pub mod allow;
 pub mod connect;
 #[cfg(feature = "matrix-upstream")]

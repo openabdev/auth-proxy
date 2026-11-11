@@ -1,6 +1,7 @@
 //! Refusal list, exact-address connect and single lookup, through doubles for the resolver and
 //! the connector. No test touches the network.
 
+use crate::accept::serve_listener;
 use crate::allow::allowed;
 use crate::connect::{parse_connect, serve_conn, Connector, HostPort};
 use crate::resolve::{check_addr, Resolver};
@@ -8,9 +9,10 @@ use crate::Refuse;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::net::{TcpListener, TcpStream};
 
 struct FakeResolver {
     answers: Vec<SocketAddr>,
@@ -279,4 +281,189 @@ fn connect_head_rejects_zero_port_and_mismatched_host() {
             port: 443,
         })
     );
+}
+
+/// Upstream double for the accept-loop tests. With `keep` the far end of each upstream stream is
+/// held, so a tunnel stays open until the client closes. Without it the far end is dropped at once.
+struct Upstreams {
+    keep: bool,
+    peers: Mutex<Vec<DuplexStream>>,
+}
+
+impl Upstreams {
+    fn new(keep: bool) -> Self {
+        Upstreams {
+            keep,
+            peers: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.peers.lock().expect("lock").len()
+    }
+
+    /// Close the far end of the oldest held upstream stream.
+    fn close_oldest(&self) {
+        self.peers.lock().expect("lock").remove(0);
+    }
+}
+
+impl Connector for Upstreams {
+    type Stream = DuplexStream;
+
+    async fn connect(&self, _addr: SocketAddr) -> io::Result<DuplexStream> {
+        let (ours, peer) = tokio::io::duplex(64);
+        if self.keep {
+            self.peers.lock().expect("lock").push(peer);
+        }
+        Ok(ours)
+    }
+}
+
+const CONNECT: &str = "CONNECT api.example.net:443 HTTP/1.1\r\nHost: api.example.net:443\r\n\r\n";
+const ESTABLISHED: &str = "HTTP/1.1 200 Connection Established";
+
+/// Run the accept loop on a loopback listener with the given cap.
+async fn start_loop(
+    cap: usize,
+    connector: Arc<Upstreams>,
+) -> (SocketAddr, tokio::task::AbortHandle) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let resolver = Arc::new(FakeResolver::new(&["192.0.2.1:443"]));
+    let task = tokio::spawn(serve_listener(
+        listener,
+        Arc::new(allow_list()),
+        resolver,
+        connector,
+        cap,
+    ));
+    (addr, task.abort_handle())
+}
+
+/// Read a response head. Returns the status line, or an empty string when the server closed or
+/// reset the socket first.
+async fn read_status(stream: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte).await {
+            Ok(1) => buf.push(byte[0]),
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Open a connection, send a CONNECT and return the socket with the status line it received.
+async fn open_tunnel(addr: SocketAddr) -> (TcpStream, String) {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let _ = stream.write_all(CONNECT.as_bytes()).await;
+    let status = read_status(&mut stream).await;
+    (stream, status)
+}
+
+/// Retry until a connection is accepted, to wait for a permit to come back.
+async fn retry_until_accepted(addr: SocketAddr) -> (TcpStream, String) {
+    for _ in 0..200 {
+        let (stream, status) = open_tunnel(addr).await;
+        if status == ESTABLISHED {
+            return (stream, status);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no connection was accepted after the permit should have been released");
+}
+
+#[tokio::test]
+async fn cap_serves_n_connections_and_closes_the_next() {
+    let upstreams = Arc::new(Upstreams::new(true));
+    let (addr, task) = start_loop(2, Arc::clone(&upstreams)).await;
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let (stream, status) = open_tunnel(addr).await;
+        assert_eq!(status, ESTABLISHED);
+        held.push(stream);
+    }
+    let (_extra, status) = tokio::time::timeout(Duration::from_secs(2), open_tunnel(addr))
+        .await
+        .expect("the connection over the cap is closed promptly");
+    assert_eq!(status, "", "the connection over the cap gets no answer");
+    assert_eq!(
+        upstreams.count(),
+        2,
+        "the refused connection never reached upstream"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn permit_returns_after_a_connection_finishes() {
+    let upstreams = Arc::new(Upstreams::new(true));
+    let (addr, task) = start_loop(1, Arc::clone(&upstreams)).await;
+    let (first, status) = open_tunnel(addr).await;
+    assert_eq!(status, ESTABLISHED);
+    let (_refused, status) = open_tunnel(addr).await;
+    assert_eq!(status, "", "the single permit is in use");
+    upstreams.close_oldest();
+    drop(first);
+    let (_second, status) = retry_until_accepted(addr).await;
+    assert_eq!(status, ESTABLISHED);
+    task.abort();
+}
+
+#[tokio::test]
+async fn failed_connection_releases_its_permit() {
+    // The far end is dropped, so bytes sent after the request head fail the upstream write.
+    let upstreams = Arc::new(Upstreams::new(false));
+    let (addr, task) = start_loop(1, upstreams).await;
+    let mut failing = TcpStream::connect(addr).await.expect("connect");
+    failing
+        .write_all(format!("{CONNECT}x").as_bytes())
+        .await
+        .expect("write");
+    assert_eq!(read_status(&mut failing).await, ESTABLISHED);
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), failing.read_to_end(&mut rest))
+        .await
+        .expect("the failed tunnel closes")
+        .ok();
+    let (_next, status) = retry_until_accepted(addr).await;
+    assert_eq!(status, ESTABLISHED);
+    task.abort();
+}
+
+#[tokio::test]
+async fn timed_out_connection_releases_its_permit() {
+    let upstreams = Arc::new(Upstreams::new(true));
+    let (addr, task) = start_loop(1, upstreams).await;
+    // Sends nothing, so the head read times out and the server answers 400 and closes.
+    let mut idle = TcpStream::connect(addr).await.expect("connect");
+    let (_refused, status) = open_tunnel(addr).await;
+    assert_eq!(status, "", "the idle connection holds the only permit");
+    let answer = tokio::time::timeout(Duration::from_secs(20), read_status(&mut idle))
+        .await
+        .expect("the idle connection times out");
+    assert_eq!(answer, "HTTP/1.1 400 Bad Request");
+    let (_next, status) = retry_until_accepted(addr).await;
+    assert_eq!(status, ESTABLISHED);
+    task.abort();
+}
+
+#[test]
+fn egress_max_connections_defaults_to_256_and_honours_override() {
+    let key = "0".repeat(64);
+    let base = format!(
+        "version = 1\n[listen]\nproxy = \"127.0.0.1:8443\"\n[[identity]]\nname = \"ap-egress-test\"\ncaller_key_sha256 = \"{key}\"\n[egress]\nallow = [\"api.example.net:443\"]\n"
+    );
+    let default = ap_core::config::load(&base).expect("base config is valid");
+    assert_eq!(default.egress.max_connections, 256);
+    let set =
+        ap_core::config::load(&format!("{base}max_connections = 7\n")).expect("override is valid");
+    assert_eq!(set.egress.max_connections, 7);
+    assert!(ap_core::config::load(&format!("{base}max_connections = 0\n")).is_err());
 }

@@ -30,6 +30,7 @@ fn test_key() -> Arc<RuntimeKey> {
 }
 
 fn config_text(caller_sha: &str) -> String {
+    let runtime_pubkey = test_key().public_key_b64();
     format!(
         r#"version = 1
 
@@ -38,6 +39,7 @@ proxy = "127.0.0.1:8443"
 
 [[identity]]
 name = "pty-a"
+runtime_pubkey = "{runtime_pubkey}"
 caller_key_sha256 = "{caller_sha}"
 
 [[route]]

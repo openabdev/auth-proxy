@@ -13,6 +13,7 @@
 //! Every refusal writes an audit line and sends nothing upstream. A policy file that fails to
 //! load drops the snapshot, and every request that needs it gets 503 until a valid file appears.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +23,7 @@ use std::time::{Instant, SystemTime};
 use ap_broker::broker::Broker;
 use ap_broker::clock::SystemClock;
 use ap_broker::expiry::FileExpiryStore;
-use ap_broker::proof::NonceTable;
+use ap_broker::proof::{parse_public_key, NonceTable};
 use ap_broker::registry::{sha256_hex, Access, Registry, RegistryCfg};
 use ap_core::audit::{path_only, AuditRec};
 use ap_core::canon;
@@ -76,6 +77,8 @@ pub struct App {
     max_body: u64,
     pub(crate) token_dir: PathBuf,
     pub(crate) identity_names: Vec<String>,
+    /// Runtime public key per identity. An identity without a key is absent, so hello refuses it.
+    pub(crate) runtime_keys: HashMap<String, ed25519_dalek::VerifyingKey>,
     pub(crate) authority_lease_secs: u64,
     pub(crate) registry: Arc<Mutex<Registry<SystemClock>>>,
     /// Nonces handed out by `GET /v1/hello/challenge` and not yet spent by a hello.
@@ -110,6 +113,15 @@ impl App {
         let listen_authority = cfg.listen.proxy.to_string();
         let max_body = cfg.limits.max_body_bytes;
         let identity_names = cfg.identities.iter().map(|i| i.name.clone()).collect();
+        // A malformed key stops startup, so the proxy never runs with a key it cannot use.
+        let mut runtime_keys = HashMap::new();
+        for id in &cfg.identities {
+            if let Some(b64) = &id.runtime_pubkey {
+                let key = parse_public_key(b64)
+                    .map_err(|_| format!("identity {} has an invalid runtime_pubkey", id.name))?;
+                runtime_keys.insert(id.name.clone(), key);
+            }
+        }
         let authority_lease_secs = cfg.sessions.authority_lease_secs;
         let snap = Arc::new(Snapshot::from_config(&cfg));
         let policy = stamp_of(&policy_path).map(|stamp| Loaded {
@@ -124,6 +136,7 @@ impl App {
             max_body,
             token_dir,
             identity_names,
+            runtime_keys,
             authority_lease_secs,
             registry: Arc::new(Mutex::new(registry)),
             nonces: Mutex::new(NonceTable::new()),

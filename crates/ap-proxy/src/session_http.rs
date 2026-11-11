@@ -15,12 +15,12 @@ use std::sync::{Arc, MutexGuard};
 use std::time::Duration;
 
 use ap_broker::clock::{Clock, SystemClock};
-use ap_broker::proof::NONCE_TTL_SECS;
+use ap_broker::proof::{verify, NONCE_TTL_SECS};
 use ap_broker::registry::{sha256_hex, HelloErr, Registry, SessErr};
 use ap_broker::session::{read_token_hash, token_file};
 use ap_core::session_wire::{
-    Entry, HelloChallenge, HelloReq, HelloResp, RegisterResp, RenewReq, ResyncReq, SessionRef,
-    BODY_CAP,
+    is_nonce, Entry, HelloChallenge, HelloReq, HelloResp, RegisterResp, RenewReq, ResyncReq,
+    SessionRef, BODY_CAP,
 };
 use axum::body::{to_bytes, Body};
 use axum::extract::{Path, State};
@@ -254,23 +254,43 @@ async fn hello_challenge(State(app): State<Arc<App>>) -> Response {
     )
 }
 
+/// `POST /v1/hello`. The checks run in the order of `docs/design/runtime-split.md`, "Verification
+/// order". The first failure refuses and nothing after it runs.
 async fn hello(State(app): State<Arc<App>>, body: Body) -> Response {
     let req: HelloReq = match read_json(body).await {
         Ok(r) => r,
         Err(r) => return refused(&app, Event::bare("hello", ""), r),
     };
-    if !app.identity_names.contains(&req.identity) {
-        audit(
-            &app,
-            Event {
-                status: 400,
-                result: "identity_unknown",
-                ..Event::bare("hello", &req.identity)
-            },
-        );
-        return error_reply(400, "identity_unknown");
-    }
     let identity = req.identity.clone();
+    let ev = || Event::bare("hello", &identity);
+    if req.nonce.as_deref().is_some_and(|n| !is_nonce(n)) {
+        return refused(&app, ev(), refusal(400, "invalid_body"));
+    }
+    if !app.identity_names.contains(&identity) {
+        return refused(&app, ev(), refusal(400, "identity_unknown"));
+    }
+    let Some(key) = app.runtime_keys.get(&identity) else {
+        return refused(&app, ev(), refusal(403, "runtime_key_missing"));
+    };
+    let Some(proof) = req.proof.as_deref() else {
+        return refused(&app, ev(), refusal(401, "proof_missing"));
+    };
+    let Some(nonce) = req.nonce.as_deref() else {
+        return refused(&app, ev(), refusal(401, "nonce_invalid"));
+    };
+    // `consume` removes the nonce whether or not it is valid, so a nonce works once.
+    let now = SystemClock.now();
+    let spent = match app.nonces.lock() {
+        Ok(mut table) => table.consume(nonce, now),
+        Err(_) => return refused(&app, ev(), refusal(503, "unavailable")),
+    };
+    if !spent {
+        return refused(&app, ev(), refusal(401, "nonce_invalid"));
+    }
+    if verify(key, &identity, nonce, proof).is_err() {
+        return refused(&app, ev(), refusal(401, "proof_invalid"));
+    }
+
     let outcome = with_registry(&app, |reg, now| reg.hello(&identity, now));
     let (status, reply, result) = match outcome {
         None => (
@@ -304,7 +324,7 @@ async fn hello(State(app): State<Arc<App>>, body: Body) -> Response {
         Event {
             status,
             result: &result,
-            ..Event::bare("hello", &req.identity)
+            ..ev()
         },
     );
     reply

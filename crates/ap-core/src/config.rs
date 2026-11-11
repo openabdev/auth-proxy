@@ -112,6 +112,10 @@ pub struct Identity {
     pub name: String,
     /// Lowercase hex sha256 of the caller key. The raw key never enters the config.
     pub caller_key_sha256: String,
+    /// Standard base64 of the runtime's Ed25519 public key (32 bytes). Not a secret. Without it,
+    /// hello for this identity is refused with 403 `runtime_key_missing`.
+    #[serde(default)]
+    pub runtime_pubkey: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -606,6 +610,22 @@ allow = ["github.com:443"]
             &base().replace("[listen]", "[sessions]\nmax_sessions = 0\n\n[listen]"),
             "max_sessions must be in 1..=1024",
         );
+    }
+
+    #[test]
+    fn identity_without_runtime_pubkey_still_loads() {
+        let cfg = load(&base()).expect("config without runtime_pubkey loads");
+        assert_eq!(cfg.identities[0].runtime_pubkey, None);
+    }
+
+    #[test]
+    fn identity_keeps_its_runtime_pubkey() {
+        let text = base().replace(
+            "caller_key_sha256 = \"",
+            "runtime_pubkey = \"AAAA\"\ncaller_key_sha256 = \"",
+        );
+        let cfg = load(&text).expect("config with runtime_pubkey loads");
+        assert_eq!(cfg.identities[0].runtime_pubkey.as_deref(), Some("AAAA"));
     }
 
     #[test]

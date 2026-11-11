@@ -307,6 +307,14 @@ mod tests {
             .expect("expired entry is skipped, not a batch error");
         assert_eq!(resp.registered, 0);
         assert_eq!(
+            resp.expired,
+            vec![SessionRef {
+                session: "s1".into(),
+                generation: 1,
+            }],
+            "the skipped key is listed for the client"
+        );
+        assert_eq!(
             second.register(IDENT, &tok, entry("s1", 1, "a"), past),
             Err(SessErr::AbsoluteExpired)
         );
@@ -348,6 +356,13 @@ mod tests {
             )
             .expect("batch with one expired entry still applies");
         assert_eq!(resp.registered, 1);
+        assert_eq!(
+            resp.expired,
+            vec![SessionRef {
+                session: "s1".into(),
+                generation: 1,
+            }]
+        );
         assert!(second.authorize(&sha("b"), IDENT, "kiro-api", now).is_ok());
         assert_eq!(
             second.authorize(&sha("a"), IDENT, "kiro-api", now),

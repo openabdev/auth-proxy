@@ -21,7 +21,7 @@ use std::time::{Instant, SystemTime};
 
 use ap_broker::broker::Broker;
 use ap_broker::clock::SystemClock;
-use ap_broker::expiry::{file_in, FileExpiryStore};
+use ap_broker::expiry::FileExpiryStore;
 use ap_broker::registry::{sha256_hex, Access, Registry, RegistryCfg};
 use ap_core::audit::{path_only, AuditRec};
 use ap_core::canon;
@@ -84,12 +84,14 @@ pub struct App {
 
 impl App {
     /// Build the shared state. `cfg` is the config read from `policy_path` at startup, and
-    /// `token_dir` holds the authority token hashes and the session expiry store. Fails when
-    /// the expiry store cannot be read, so the proxy never serves sessions without it.
+    /// `token_dir` holds the authority token hashes. `expiry_store` is the session expiry store
+    /// file. Fails when the expiry store cannot be read, so the proxy never serves sessions
+    /// without it.
     pub fn new(
         policy_path: PathBuf,
         cfg: Config,
         token_dir: PathBuf,
+        expiry_store: PathBuf,
         broker: Arc<dyn Broker>,
         audit: AuditSink,
         client: reqwest::Client,
@@ -99,7 +101,7 @@ impl App {
             RegistryCfg::from_sessions(&cfg.sessions),
             Access::from_config(&cfg),
             Some(token_dir.clone()),
-            Box::new(FileExpiryStore::new(file_in(&token_dir))),
+            Box::new(FileExpiryStore::new(expiry_store)),
         )
         .map_err(|e| format!("cannot load the session expiry store: {e}"))?;
         let listen_authority = cfg.listen.proxy.to_string();

@@ -253,6 +253,7 @@ impl Fixture {
             policy_path.clone(),
             cfg,
             root.join("tokens"),
+            ap_broker::expiry::file_in(&root.join("tokens")),
             broker,
             sink,
             client_for(up),

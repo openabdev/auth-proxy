@@ -35,6 +35,8 @@ except ImportError:
 CREDENTIAL_SECRET = "auth-proxy-kiro"
 CREDENTIAL_KEY = "api_key"
 CALLER_SECRET = "auth-proxy-caller"
+BOOTSTRAP_NAME = "expiry-store-bootstrap"
+STORE_FILE_NAME = "session-expiry.v1"
 SECRET_FILE_MODE = 0o444  # 292 decimal, the value written in pod.yaml
 EXPECTED_UIDS = {"agent": 1000, "proxy": 1001, "egress": 1002}
 
@@ -92,8 +94,8 @@ def main():
 
     inits = spec.get("initContainers", [])
     check(
-        "init-netinit-only",
-        [c.get("name") for c in inits] == ["netinit"],
+        "init-netinit-and-store-bootstrap",
+        [c.get("name") for c in inits] == ["netinit", BOOTSTRAP_NAME],
         "initContainers are %s" % [c.get("name") for c in inits],
     )
     netinit = inits[0] if inits else {}
@@ -222,6 +224,62 @@ def main():
             token_mounts[0].get("name")
             not in (mount_names("agent") | mount_names("egress")),
         )
+    # --expiry-store (M-3): the store file is on its own volume. Read "the authority container" as
+    # the proxy container, which runs the session authority. Agent, egress and netinit must not
+    # mount the store.
+    store_path = flag_value("--expiry-store")
+    store_dir = os.path.dirname(store_path) if store_path else None
+    store_mounts = [m for m in proxy_mounts if m.get("mountPath") == store_dir]
+    check(
+        "expiry-store-flag-points-at-store-file",
+        store_path is not None
+        and os.path.basename(store_path) == STORE_FILE_NAME
+        and len(store_mounts) == 1,
+        "--expiry-store %s has no proxy volumeMount for its directory" % store_path,
+    )
+    store_vol = store_mounts[0].get("name") if len(store_mounts) == 1 else None
+    store_volume = volumes.get(store_vol, {}) if store_vol else {}
+    # (1) store volume is separate from the token volume.
+    token_vol_name = None
+    proxy_token_mounts = [m for m in proxy_mounts if m.get("mountPath") == flag_value("--token-dir")]
+    if len(proxy_token_mounts) == 1:
+        token_vol_name = proxy_token_mounts[0].get("name")
+    check(
+        "expiry-store-volume-separate-from-token-volume",
+        store_vol is not None
+        and store_vol != token_vol_name
+        and "persistentVolumeClaim" in store_volume
+        and store_volume != volumes.get(token_vol_name),
+        "store volume %s must be a PVC and differ from token volume %s"
+        % (store_vol, token_vol_name),
+    )
+    # (2) the bootstrap init container exists, creates the file, and never truncates it.
+    bootstrap = next((c for c in inits if c.get("name") == BOOTSTRAP_NAME), {})
+    cmd_text = "\n".join(str(x) for x in bootstrap.get("command", []))
+    bootstrap_mounts = {m.get("name") for m in bootstrap.get("volumeMounts", [])}
+    check(
+        "store-bootstrap-creates-store-file",
+        bool(bootstrap)
+        and STORE_FILE_NAME in cmd_text
+        and "printf" in cmd_text
+        and "mv " in cmd_text
+        and "[ ! -e" in cmd_text
+        and store_vol in bootstrap_mounts,
+        "bootstrap init must mount the store volume and create %s only when absent" % STORE_FILE_NAME,
+    )
+    # (3) the store volume is mounted only into the proxy and the bootstrap init container.
+    mounting = sorted(
+        [c.get("name") for c in containers.values()
+         if store_vol in {m.get("name") for m in c.get("volumeMounts", [])}]
+        + [c.get("name") for c in inits
+           if store_vol in {m.get("name") for m in c.get("volumeMounts", [])}]
+    )
+    check(
+        "store-volume-mounted-only-by-proxy-and-bootstrap",
+        mounting == sorted(["proxy", BOOTSTRAP_NAME]),
+        "store volume is mounted by %s" % mounting,
+    )
+
     for flag in ("--session-socket", "--admin-socket"):
         path = flag_value(flag)
         parent = os.path.dirname(path) if path else None

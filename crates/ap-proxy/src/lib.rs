@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ap_broker::broker::Broker;
+use ap_broker::expiry::file_in;
 use ap_broker::store::FileStore;
 use axum::extract::Request;
 use axum::response::Response;
@@ -33,7 +34,7 @@ mod tests;
 
 /// Command-line usage, printed with every argument error.
 pub const USAGE: &str = "usage: auth-proxy --config <path> [--session-socket <path>] \
-[--admin-socket <path>] [--secret-root <dir>] [--token-dir <dir>]";
+[--admin-socket <path>] [--secret-root <dir>] [--token-dir <dir>] [--expiry-store <file>]";
 
 /// Where the process reads its config, binds its sockets, and finds its secrets and tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,9 @@ pub struct Options {
     pub admin_socket: PathBuf,
     pub secret_root: PathBuf,
     pub token_dir: PathBuf,
+    /// Session expiry store file. `None` means `<token_dir>/session-expiry.v1`, the default
+    /// location. The pod puts it on its own durable volume.
+    pub expiry_store: Option<PathBuf>,
 }
 
 /// Parse the arguments after the program name. `--config` is required. The other paths default
@@ -56,6 +60,7 @@ where
     let mut admin_socket = PathBuf::from("/run/auth-proxy-private/admin.sock");
     let mut secret_root = PathBuf::from("/var/run/auth-proxy/secrets");
     let mut token_dir = PathBuf::from("/run/auth-proxy-private/tokens");
+    let mut expiry_store = None;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let value = args
@@ -67,6 +72,7 @@ where
             "--admin-socket" => admin_socket = PathBuf::from(value),
             "--secret-root" => secret_root = PathBuf::from(value),
             "--token-dir" => token_dir = PathBuf::from(value),
+            "--expiry-store" => expiry_store = Some(PathBuf::from(value)),
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
     }
@@ -77,6 +83,7 @@ where
         admin_socket,
         secret_root,
         token_dir,
+        expiry_store,
     })
 }
 
@@ -100,6 +107,22 @@ pub async fn run(opts: Options) -> i32 {
         }
     };
     let listen = cfg.listen.proxy;
+    // The store is never created here. A missing file means it was lost or never provisioned,
+    // and the proxy must not start over it.
+    let expiry_store = opts
+        .expiry_store
+        .clone()
+        .unwrap_or_else(|| file_in(&opts.token_dir));
+    match expiry_store.try_exists() {
+        Ok(true) => {}
+        _ => {
+            eprintln!(
+                "auth-proxy: session expiry store is missing: {}",
+                expiry_store.display()
+            );
+            return 2;
+        }
+    }
     let broker: Arc<dyn Broker> = Arc::new(FileStore::new(&opts.secret_root));
     let client = match forward::client() {
         Ok(c) => c,
@@ -112,6 +135,7 @@ pub async fn run(opts: Options) -> i32 {
         opts.config.clone(),
         cfg,
         opts.token_dir.clone(),
+        expiry_store,
         broker,
         AuditSink::stdout(),
         client,

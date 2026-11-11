@@ -291,7 +291,13 @@ async fn resync(inner: &Inner) -> Result<(), AuthorityError> {
         .await
         .map_err(AuthorityError::Transport)?;
     check(&reply, |s| (200..300).contains(&s))?;
-    let _: ResyncResp = decode(&reply)?;
+    let resp: ResyncResp = decode(&reply)?;
+    // The proxy skipped these keys because their absolute TTL has passed. Keep them out of the
+    // live map, so renew and later resyncs do not send them again.
+    let mut live = inner.live.lock().expect("live lock");
+    for r in &resp.expired {
+        live.remove(&(r.session.clone(), r.generation));
+    }
     Ok(())
 }
 

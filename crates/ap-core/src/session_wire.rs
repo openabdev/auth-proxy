@@ -75,6 +75,11 @@ pub struct ResyncReq {
 pub struct ResyncResp {
     pub registered: usize,
     pub dropped: usize,
+    /// Session keys in the list that were skipped because their stored absolute expiry has
+    /// passed. The client must drop them and must not resend them. Absent in responses from an
+    /// older proxy, which reads as an empty list.
+    #[serde(default)]
+    pub expired: Vec<SessionRef>,
 }
 
 /// A rejected field. `field` names the field that failed.
@@ -267,6 +272,39 @@ mod tests {
         };
         let text = serde_json::to_string(&resp).unwrap();
         let back: RenewResp = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn resync_response_without_expired_still_parses() {
+        // The shape an older proxy sends: no `expired` field.
+        let old: ResyncResp = serde_json::from_str(r#"{"registered":2,"dropped":1}"#).unwrap();
+        assert_eq!(
+            old,
+            ResyncResp {
+                registered: 2,
+                dropped: 1,
+                expired: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn resync_response_carries_expired_session_keys() {
+        let resp = ResyncResp {
+            registered: 1,
+            dropped: 0,
+            expired: vec![SessionRef {
+                session: "s1".into(),
+                generation: 1,
+            }],
+        };
+        let value: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            value["expired"],
+            serde_json::json!([{"session": "s1", "generation": 1}])
+        );
+        let back: ResyncResp = serde_json::from_value(value).unwrap();
         assert_eq!(back, resp);
     }
 

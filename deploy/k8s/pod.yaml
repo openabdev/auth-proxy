@@ -1,6 +1,11 @@
 # Option A pod: one init container and three app containers, each with its own UID.
 # Images are placeholders. Replace every REPLACE_* value before use.
 #
+# Session expiry store (M-3): the store file lives on its own durable volume, claim
+# auth-proxy-expiry-store, separate from the proxy-tokens emptyDir that holds the authority token
+# hashes. The claim is a PersistentVolumeClaim, so the store survives pod recreation. The proxy
+# refuses to start if the store file is missing, and expiry-store-bootstrap creates it once.
+#
 # Do not add a KIRO_API_KEY env var or a credential Secret mount to the agent container.
 # Do not set shareProcessNamespace to true (finding F3).
 # The namespace needs PSA "privileged" because netinit requires NET_ADMIN.
@@ -10,6 +15,19 @@ metadata:
   name: auth-proxy
   labels:
     pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: auth-proxy-expiry-store
+  namespace: auth-proxy
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: REPLACE_STORAGE_CLASS
+  resources:
+    # One line per session key, at most 76 bytes, never removed (see docs/design/phase1.md).
+    requests:
+      storage: 64Mi
 ---
 apiVersion: v1
 kind: Pod
@@ -45,6 +63,32 @@ spec:
       volumeMounts:
         - name: netinit-run
           mountPath: /run
+    # Creates the session expiry store on its durable volume, then exits. It writes the file only
+    # when it is absent, so a recreated pod keeps the existing records. The image must provide
+    # /bin/sh and mv (for example the alpine base pinned for netinit). The volume root must be
+    # writable by UID 1001, the proxy UID, because the proxy writes its temp file next to the store.
+    - name: expiry-store-bootstrap
+      image: REPLACE_BOOTSTRAP_IMAGE
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          f=/var/lib/auth-proxy/store/session-expiry.v1
+          if [ ! -e "$f" ]; then
+            printf '%s\n' 'auth-proxy session expiry v1' > "$f.tmp"
+            mv "$f.tmp" "$f"
+          fi
+      securityContext:
+        runAsUser: 1001
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: expiry-store
+          mountPath: /var/lib/auth-proxy/store
   containers:
     # The agent: no credential, no KIRO_API_KEY, and loopback reaches only P and E.
     - name: agent
@@ -92,6 +136,8 @@ spec:
         - /var/run/auth-proxy/secrets
         - --token-dir
         - /var/lib/auth-proxy/tokens
+        - --expiry-store
+        - /var/lib/auth-proxy/store/session-expiry.v1
       securityContext:
         runAsUser: 1001
         runAsNonRoot: true
@@ -116,6 +162,10 @@ spec:
         # must exist before the first hello. Only the proxy mounts it.
         - name: proxy-tokens
           mountPath: /var/lib/auth-proxy/tokens
+        # --expiry-store points here. This is the durable store volume, separate from proxy-tokens.
+        # Only the proxy and expiry-store-bootstrap mount it.
+        - name: expiry-store
+          mountPath: /var/lib/auth-proxy/store
     # The egress proxy: no credential and no broker. It only tunnels to allow-listed host:port.
     - name: egress
       image: REPLACE_EGRESS_IMAGE
@@ -147,6 +197,13 @@ spec:
       emptyDir: {}
     - name: proxy-tokens
       emptyDir: {}
+    # Deploy choice (M-3): a PersistentVolumeClaim, so the expiry records outlive the pod. Losing
+    # them lets a restarted proxy give an old session key a new absolute TTL, so the claim must not
+    # be an emptyDir or a node-local path that a pod recreation can lose. ReadWriteOnce fits a
+    # single proxy pod. The claim is defined in this file.
+    - name: expiry-store
+      persistentVolumeClaim:
+        claimName: auth-proxy-expiry-store
     - name: home
       emptyDir: {}
     - name: work

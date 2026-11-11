@@ -12,7 +12,7 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p ap-proxy -p ap-egress -p ap-runtime-shim
 
-# volume-prep: sets the owner and mode of the two socket volume roots. Needs only sh and chown.
+# volume-prep: sets the owner and mode of the two socket volume roots. Needs only sh, chmod and chown.
 FROM docker.io/library/alpine@sha256:REPLACE_ALPINE_DIGEST AS prep
 
 FROM docker.io/library/alpine@sha256:REPLACE_ALPINE_DIGEST AS netinit

@@ -86,7 +86,7 @@ proof path are not yet measured on a cluster. The egress container and the expir
 ```mermaid
 flowchart TB
     subgraph pod["Pod auth-proxy-phase1, shareProcessNamespace false"]
-        volprep["init volume-prep<br/>root, CHOWN only<br/>sets socket directory owners"]
+        volprep["init volume-prep<br/>root, CHOWN + FSETID (init only)<br/>sets socket directory owners"]
         netinit["init netinit<br/>root, NET_ADMIN only<br/>per-UID iptables and ip6tables"]
         bootstrap["init expiry-store-bootstrap<br/>UID 1001"]
         agent["agent<br/>UID 1000, read-only root fs"]

@@ -53,9 +53,11 @@ spec:
       type: RuntimeDefault
   initContainers:
     # Sets the owner, group and mode of the two socket volume roots, then exits. Runs as root with
-    # CHOWN only. The session-plane root becomes 1001:1002 (the proxy creates session.sock, the
-    # runtime connects) and the agent-runtime root becomes 1002:1000 (the runtime creates
-    # runtime.sock, the agent connects). Both are setgid, so new sockets inherit the group.
+    # CHOWN and FSETID only (init only, no network). Mode comes first: chmod on a root-owned directory
+    # needs no extra capability, and FSETID stops chown from clearing the setgid bit. Then chown sets
+    # the owner and group. The session-plane root becomes 1001:1002 (the proxy creates session.sock,
+    # the runtime connects) and the agent-runtime root becomes 1002:1000 (the runtime creates
+    # runtime.sock, the agent connects). Both stay setgid, so new sockets inherit the group.
     - name: volume-prep
       image: REPLACE_PREP_IMAGE
       command:
@@ -63,17 +65,17 @@ spec:
         - -c
         - |
           set -eu
-          chown 1001:1002 /run/auth-proxy-session
           chmod 2750 /run/auth-proxy-session
-          chown 1002:1000 /run/auth-proxy-agent
+          chown 1001:1002 /run/auth-proxy-session
           chmod 2750 /run/auth-proxy-agent
+          chown 1002:1000 /run/auth-proxy-agent
       securityContext:
         runAsUser: 0
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
         capabilities:
           drop: ["ALL"]
-          add: ["CHOWN"]
+          add: ["CHOWN", "FSETID"]
       volumeMounts:
         - name: session-plane
           mountPath: /run/auth-proxy-session

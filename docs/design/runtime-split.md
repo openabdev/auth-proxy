@@ -14,7 +14,7 @@ produce. The proxy listener (`127.0.0.1:18080`) and the agent's base URL do not 
 
 | Container | Kind | UID:GID | Capabilities | Mounts |
 |---|---|---|---|---|
-| `volume-prep` | init, new, first | 0:0 | `CHOWN` only | `session-plane` and `agent-runtime` (sets owner, group and mode of both volume roots, then exits) |
+| `volume-prep` | init, new, first | 0:0 | `CHOWN` and `FSETID`, init only, no network | `session-plane` and `agent-runtime` (sets owner, group and mode of both volume roots, then exits) |
 | `netinit` | init, rules changed | 0:0 | `NET_ADMIN` only | `netinit-run` |
 | `expiry-store-bootstrap` | init, unchanged | 1001 | none | `expiry-store` |
 | `agent` | app | 1000:1000 | none | `agent-runtime` at `/run/auth-proxy-agent`; caller key, home, work, tmp. No `session-plane`. |
@@ -34,7 +34,12 @@ Every app container sets `runAsGroup`, so no container runs with GID 0 by accide
 | `/run/auth-proxy-admin/admin.sock` (unchanged) | proxy | operator tooling | `1001` | `0600` | proxy |
 
 The two socket directories are the roots of the `session-plane` and `agent-runtime` volumes.
-`volume-prep` sets each root to owner and group as above, mode `2750`. The setgid bit makes each
+`volume-prep` sets each root to mode `2750` first, then owner and group as above. Order and
+capabilities matter. With `CHOWN` alone, the `chmod` after `chown` fails with EPERM, because the
+owner is no longer root. With `CHOWN` and `FSETID` in that order, the setgid bit survives: a probe
+gave `1001:1002 2750`. With `FOWNER` in place of `FSETID`, the chown cleared setgid and the probe
+gave `1001:1002 750`. The owner approved `CHOWN` and `FSETID` for this init container only. It runs as
+root with no network, and its capabilities are dropped when it exits. The setgid bit makes each
 new socket inherit the group of its directory, so the proxy and the runtime both produce sockets
 with the group the table shows. Only the group 1002 and UID 1002 can connect to `session.sock`.
 UID 1000 has neither the group nor a mount that shows the path.

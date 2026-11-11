@@ -77,10 +77,19 @@ One pod runs four app containers (agent, runtime, proxy, egress) and three init 
 loopback, and the runtime over its own Unix socket. It has no path to the session socket, and it
 cannot read the proxy's credential Secret or the runtime's proof seed.
 
-Measured so far: a single-node k3s run measured the pod before the runtime container existed, with
-the agent, the proxy and the netinit rules. The runtime container, the socket permissions and the
-proof path are not yet measured on a cluster. The egress container and the expiry store in
-`pod.yaml` were not part of that run either. ECS is not done yet.
+Measured: the runtime split ran on an OrbStack cluster (arm64) and on a second k3s node (amd64).
+Both runs used `pod.yaml` with a mock upstream and dummy credentials. These checks passed on both:
+all init containers exited 0 and all app containers became ready; the netinit rules for UID 1002
+were in place; the agent reached the proxy and egress on loopback; direct TCP and DNS from the
+agent were blocked; register, revoke and status worked through `runtime.sock`; the upstream saw the
+real credential and never the surrogate or the caller key; no secret appeared in container logs;
+the expiry store survived a pod delete and recreate; and the agent could not read the runtime key
+or open `session.sock`. The proxy accepted the runtime's signed `hello`, and `runtime.sock`
+refused `hello` for the agent. With the runtime killed, `session.sock` stayed unreachable to the
+agent in all 60 samples over about 4 minutes.
+
+Not measured: a real upstream with real credentials; the 12 h TTL lapse on a cluster (unit tests
+only); NetworkPolicy, which Phase 1 does not use; and ECS, which is not started.
 
 ```mermaid
 flowchart TB

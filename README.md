@@ -69,6 +69,8 @@ Implemented and tested in Phase 1:
 - 12 h absolute TTL has no config key: it is a fixed default
 - Matrix positive rows run against a feature-enabled test binary, not the release binary
 - Live run of the K8s pod on a cluster is not in CI: the validator checks the manifest only
+- The signature check on the runtime proof is not a constant-time comparison. The design note explains why; revisit if the proof path changes.
+- The manifest validator does not catch the runtime proof seed being exposed through env or secretKeyRef. Add a check.
 
 ## Kubernetes deployment (Option A)
 

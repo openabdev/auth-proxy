@@ -2,13 +2,18 @@
 #   podman build -f deploy/k8s/Containerfile --target proxy   -t REPLACE_PROXY_IMAGE .
 #   podman build -f deploy/k8s/Containerfile --target egress  -t REPLACE_EGRESS_IMAGE .
 #   podman build -f deploy/k8s/Containerfile --target netinit -t REPLACE_NETINIT_IMAGE .
+#   podman build -f deploy/k8s/Containerfile --target prep    -t REPLACE_PREP_IMAGE .
+#   podman build -f deploy/k8s/Containerfile --target runtime -t REPLACE_RUNTIME_IMAGE .
 # Replace each *_DIGEST placeholder with a pinned digest before release.
 
 # Release builds use default features only. The matrix-upstream feature stays off.
 FROM docker.io/library/rust@sha256:REPLACE_RUST_DIGEST AS builder
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p ap-proxy -p ap-egress
+RUN cargo build --release --locked -p ap-proxy -p ap-egress -p ap-runtime-shim
+
+# volume-prep: sets the owner and mode of the two socket volume roots. Needs only sh and chown.
+FROM docker.io/library/alpine@sha256:REPLACE_ALPINE_DIGEST AS prep
 
 FROM docker.io/library/alpine@sha256:REPLACE_ALPINE_DIGEST AS netinit
 RUN apk add --no-cache iptables
@@ -22,3 +27,7 @@ ENTRYPOINT ["/usr/local/bin/auth-proxy"]
 FROM gcr.io/distroless/cc-debian12@sha256:REPLACE_DISTROLESS_DIGEST AS egress
 COPY --from=builder /src/target/release/ap-egress /usr/local/bin/ap-egress
 ENTRYPOINT ["/usr/local/bin/ap-egress"]
+
+FROM gcr.io/distroless/cc-debian12@sha256:REPLACE_DISTROLESS_DIGEST AS runtime
+COPY --from=builder /src/target/release/ap-runtime-shim /usr/local/bin/ap-runtime-shim
+ENTRYPOINT ["/usr/local/bin/ap-runtime-shim"]

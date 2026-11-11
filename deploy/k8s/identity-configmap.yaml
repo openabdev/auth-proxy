@@ -15,6 +15,9 @@ data:
 
     [[identity]]
     name = "pty-team-a"
+    # Standard base64 of the runtime's Ed25519 public key. Not a secret. It pairs with the seed in
+    # Secret auth-proxy-runtime-key. REPLACE before use.
+    runtime_pubkey = "REPLACE"
     caller_key_sha256 = "0000000000000000000000000000000000000000000000000000000000000000" # REPLACE
 
     [[route]]

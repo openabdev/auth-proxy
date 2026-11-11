@@ -4,8 +4,12 @@
 Exits 0 when every check passes and 1 otherwise. Prints one PASS or FAIL line per check.
 Needs PyYAML. TOML is parsed with tomllib or tomli when either is importable; otherwise a
 structural check runs and the output says so.
+
+    --root <dir>   check the manifests under <dir> (default: this script's directory). The
+                   mutation tests in test_validate_manifests.py use it on modified copies.
 """
 
+import argparse
 import os
 import re
 import sys
@@ -35,10 +39,18 @@ except ImportError:
 CREDENTIAL_SECRET = "auth-proxy-kiro"
 CREDENTIAL_KEY = "api_key"
 CALLER_SECRET = "auth-proxy-caller"
+RUNTIME_KEY_SECRET = "auth-proxy-runtime-key"
+RUNTIME_KEY_ITEM = "runtime_ed25519.seed"
 BOOTSTRAP_NAME = "expiry-store-bootstrap"
+PREP_NAME = "volume-prep"
 STORE_FILE_NAME = "session-expiry.v1"
 SECRET_FILE_MODE = 0o444  # 292 decimal, the value written in pod.yaml
-EXPECTED_UIDS = {"agent": 1000, "proxy": 1001, "egress": 1002}
+SESSION_DIR = "/run/auth-proxy-session"
+AGENT_DIR = "/run/auth-proxy-agent"
+EXPECTED_UIDS = {"agent": 1000, "proxy": 1001, "runtime": 1002, "egress": 1003}
+# Every app container sets runAsGroup to its UID, so no container runs with GID 0 by default.
+EXPECTED_GIDS = dict(EXPECTED_UIDS)
+APP_CONTAINERS = ("agent", "proxy", "runtime", "egress")
 
 
 def check(name, ok, detail=""):
@@ -72,6 +84,10 @@ def rule_index(lines, pred):
     return -1
 
 
+def mount_names_of(container):
+    return {m.get("name") for m in container.get("volumeMounts", [])}
+
+
 def main():
     print("INFO toml parser: " + TOML_MODE)
 
@@ -93,12 +109,13 @@ def main():
     spec = pods[0]["spec"]
 
     inits = spec.get("initContainers", [])
+    init_names = [c.get("name") for c in inits]
     check(
-        "init-netinit-and-store-bootstrap",
-        [c.get("name") for c in inits] == ["netinit", BOOTSTRAP_NAME],
-        "initContainers are %s" % [c.get("name") for c in inits],
+        "init-volume-prep-netinit-and-store-bootstrap",
+        init_names == [PREP_NAME, "netinit", BOOTSTRAP_NAME],
+        "initContainers are %s" % init_names,
     )
-    netinit = inits[0] if inits else {}
+    netinit = next((c for c in inits if c.get("name") == "netinit"), {})
     sc = netinit.get("securityContext", {})
     check(
         "netinit-net-admin-only",
@@ -107,9 +124,20 @@ def main():
     )
     check("netinit-runs-as-root", sc.get("runAsUser") == 0)
 
+    prep = next((c for c in inits if c.get("name") == PREP_NAME), {})
+    psc = prep.get("securityContext", {})
+    check(
+        "volume-prep-root-chown-only",
+        psc.get("runAsUser") == 0
+        and psc.get("capabilities", {}).get("drop") == ["ALL"]
+        and psc.get("capabilities", {}).get("add") == ["CHOWN"]
+        and psc.get("allowPrivilegeEscalation") is False
+        and psc.get("readOnlyRootFilesystem") is True,
+    )
+
     containers = {c.get("name"): c for c in spec.get("containers", [])}
     check(
-        "containers-agent-proxy-egress",
+        "containers-agent-proxy-runtime-egress",
         set(containers) == set(EXPECTED_UIDS),
         "containers are %s" % sorted(containers),
     )
@@ -119,6 +147,17 @@ def main():
             "uid-%s-%d" % (name, uid),
             c.get("securityContext", {}).get("runAsUser") == uid,
         )
+    for name, gid in sorted(EXPECTED_GIDS.items()):
+        c = containers.get(name, {})
+        check(
+            "gid-%s-%d" % (name, gid),
+            c.get("securityContext", {}).get("runAsGroup") == gid,
+        )
+    check(
+        "runtime-uid-differs-from-agent",
+        containers.get("runtime", {}).get("securityContext", {}).get("runAsUser")
+        != containers.get("agent", {}).get("securityContext", {}).get("runAsUser"),
+    )
 
     check(
         "share-process-namespace-false",
@@ -178,8 +217,93 @@ def main():
         ),
     )
 
-    # Container hardening on the three app containers (FEAT-006 step 2).
-    for name in sorted(EXPECTED_UIDS):
+    # The runtime-key Secret: one volume, mode 0444, mounted read-only into the runtime alone.
+    runtime_key_vols = [
+        n for n, v in secret_vols.items()
+        if v["secret"].get("secretName") == RUNTIME_KEY_SECRET
+    ]
+    check("runtime-key-secret-volume-present", len(runtime_key_vols) == 1)
+    rk_name = runtime_key_vols[0] if len(runtime_key_vols) == 1 else None
+    if rk_name:
+        rk = volumes[rk_name]["secret"]
+        check(
+            "runtime-key-mode-0444",
+            rk.get("defaultMode") == SECRET_FILE_MODE,
+            "defaultMode is %s" % rk.get("defaultMode"),
+        )
+        items = [i.get("key") for i in rk.get("items", [])]
+        check(
+            "runtime-key-item-is-the-seed",
+            items == [RUNTIME_KEY_ITEM],
+            "items are %s" % items,
+        )
+    holders = sorted(
+        [c.get("name") for c in containers.values()
+         if rk_name in mount_names_of(c)]
+        + [c.get("name") for c in inits if rk_name in mount_names_of(c)]
+    ) if rk_name else []
+    check(
+        "runtime-key-mounted-only-by-runtime",
+        rk_name is not None and holders == ["runtime"],
+        "runtime-key is mounted by %s" % holders,
+    )
+    rk_mounts = [
+        m for m in containers.get("runtime", {}).get("volumeMounts", [])
+        if m.get("name") == rk_name
+    ] if rk_name else []
+    check(
+        "runtime-key-mount-read-only",
+        len(rk_mounts) == 1 and rk_mounts[0].get("readOnly") is True,
+    )
+
+    # The two socket volumes. session-plane holds session.sock: the proxy and the runtime, never
+    # the agent. agent-runtime holds runtime.sock: the runtime and the agent.
+    session_vol = "session-plane"
+    agent_vol = "agent-runtime"
+    check(
+        "session-plane-is-emptydir",
+        "emptyDir" in volumes.get(session_vol, {}),
+    )
+    check(
+        "agent-runtime-is-emptydir",
+        "emptyDir" in volumes.get(agent_vol, {}),
+    )
+    holders = sorted(
+        [c.get("name") for c in containers.values() if session_vol in mount_names_of(c)]
+        + [c.get("name") for c in inits if session_vol in mount_names_of(c)]
+    )
+    check(
+        "session-plane-mounted-only-by-proxy-runtime-volume-prep",
+        holders == sorted(["proxy", "runtime", PREP_NAME]),
+        "session-plane is mounted by %s" % holders,
+    )
+    check(
+        "session-plane-not-in-agent",
+        session_vol not in mount_names("agent")
+        and not any(
+            m.get("mountPath", "").startswith(SESSION_DIR)
+            for m in containers.get("agent", {}).get("volumeMounts", [])
+        ),
+    )
+    holders = sorted(
+        [c.get("name") for c in containers.values() if agent_vol in mount_names_of(c)]
+        + [c.get("name") for c in inits if agent_vol in mount_names_of(c)]
+    )
+    check(
+        "agent-runtime-mounted-only-by-agent-runtime-volume-prep",
+        holders == sorted(["agent", "runtime", PREP_NAME]),
+        "agent-runtime is mounted by %s" % holders,
+    )
+
+    runtime_mounts = containers.get("runtime", {}).get("volumeMounts", [])
+    runtime_mount_paths = {m.get("mountPath") for m in runtime_mounts}
+    check(
+        "runtime-mounts-only-sockets-and-key",
+        runtime_mount_paths == {SESSION_DIR, AGENT_DIR, "/var/run/auth-proxy-runtime"},
+        "runtime mounts %s" % sorted(p or "" for p in runtime_mount_paths),
+    )
+
+    for name in sorted(APP_CONTAINERS):
         c = containers.get(name, {})
         sec = c.get("securityContext", {})
         problems = []
@@ -197,11 +321,11 @@ def main():
     # writable mount of a proxy volume. Without it, the first hello fails.
     proxy_args = containers.get("proxy", {}).get("command", [])
 
-    def flag_value(flag):
-        if flag in proxy_args:
-            i = proxy_args.index(flag)
-            if i + 1 < len(proxy_args):
-                return proxy_args[i + 1]
+    def flag_value(flag, args=proxy_args):
+        if flag in args:
+            i = args.index(flag)
+            if i + 1 < len(args):
+                return args[i + 1]
         return None
 
     token_dir = flag_value("--token-dir")
@@ -289,6 +413,31 @@ def main():
             and any(m.get("mountPath") == parent for m in proxy_mounts),
             "%s %s has no proxy volumeMount for its directory" % (flag, path),
         )
+    check(
+        "session-socket-path-is-in-session-plane",
+        flag_value("--session-socket") == SESSION_DIR + "/session.sock",
+        "--session-socket is %s" % flag_value("--session-socket"),
+    )
+
+    # The runtime's flags point into its own mounts, and the seed is under the runtime-key mount.
+    runtime_args = containers.get("runtime", {}).get("command", [])
+    rt_session = flag_value("--session-socket", runtime_args)
+    rt_agent = flag_value("--agent-socket", runtime_args)
+    rt_seed = flag_value("--seed-file", runtime_args)
+    rt_key_mount = next(
+        (m.get("mountPath") for m in runtime_mounts if m.get("name") == rk_name), None
+    )
+    check(
+        "runtime-flags-point-into-its-mounts",
+        rt_session is not None
+        and rt_session.startswith(SESSION_DIR + "/")
+        and rt_agent is not None
+        and rt_agent.startswith(AGENT_DIR + "/")
+        and rt_seed is not None
+        and rt_key_mount is not None
+        and rt_seed.startswith(rt_key_mount + "/"),
+        "runtime flags: session=%s agent=%s seed=%s" % (rt_session, rt_agent, rt_seed),
+    )
 
     # Port consistency: netinit, agent proxy env and the identity file must agree.
     netinit_env = {e["name"]: e.get("value") for e in netinit.get("env", [])}
@@ -297,10 +446,21 @@ def main():
         "netinit-agent-uid-matches-agent",
         netinit_env.get("AGENT_UID") == str(EXPECTED_UIDS["agent"]),
     )
+    check(
+        "netinit-runtime-uid-matches-runtime",
+        netinit_env.get("RUNTIME_UID") == str(EXPECTED_UIDS["runtime"]),
+    )
     egress_port = netinit_env.get("EGRESS_PORT", "")
     check(
         "agent-https-proxy-is-egress-port",
         agent_env.get("HTTPS_PROXY") == "http://127.0.0.1:" + egress_port,
+    )
+
+    # secrets.template.yaml names the runtime-key Secret.
+    secret_names = {d.get("metadata", {}).get("name") for d in load_docs("secrets.template.yaml")}
+    check(
+        "secrets-template-names-runtime-key",
+        RUNTIME_KEY_SECRET in secret_names,
     )
 
     # identity-configmap.yaml
@@ -326,9 +486,15 @@ def main():
     if toml_lib is not None:
         parsed = toml_lib.loads(text)
         check("identity-toml-parses", parsed.get("version") == 1)
+        identities = parsed.get("identity", [])
         check(
             "identity-has-one-identity",
-            len(parsed.get("identity", [])) >= 1,
+            len(identities) >= 1,
+        )
+        check(
+            "identity-has-runtime-pubkey",
+            bool(identities) and all("runtime_pubkey" in i for i in identities),
+            "an [[identity]] has no runtime_pubkey",
         )
     else:
         check(
@@ -341,8 +507,13 @@ def main():
             and "[egress]" in text,
             "required tables missing",
         )
+        check(
+            "identity-has-runtime-pubkey",
+            re.search(r"^\s*runtime_pubkey = ", text, re.M) is not None,
+            "an [[identity]] has no runtime_pubkey",
+        )
 
-    # netinit.sh rule order (F1, F2, design Q3-E2)
+    # netinit.sh rule order (F1, F2, design Q3-E2, and the runtime rules)
     with open(os.path.join(ROOT, "netinit", "netinit.sh")) as f:
         lines = f.read().splitlines()
     loop = rule_index(lines, lambda l: l.startswith("for T in iptables ip6tables"))
@@ -388,6 +559,20 @@ def main():
         and all(a < b for a, b in zip(found, found[1:])),
         "order must be ESTABLISHED < proxy < egress < other-lo < lo-catch-all < non-lo",
     )
+    runtime_est = rule_index(
+        lines,
+        lambda l: "$RUNTIME_UID" in l and "ctstate ESTABLISHED" in l and "ACCEPT" in l,
+    )
+    runtime_rej = rule_index(
+        lines,
+        lambda l: "$RUNTIME_UID" in l and "REJECT" in l and "ctstate" not in l,
+    )
+    check(
+        "netinit-runtime-rules-present",
+        runtime_est > non_lo >= 0 and runtime_rej > runtime_est,
+        "runtime ESTABLISHED = %d, runtime REJECT = %d, after the agent non-lo rule (%d)"
+        % (runtime_est, runtime_rej, non_lo),
+    )
 
     print()
     if FAILURES:
@@ -396,6 +581,14 @@ def main():
         print("all checks passed")
 
 
+def parse_args(argv):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--root", default=ROOT, help="directory holding pod.yaml and friends")
+    return ap.parse_args(argv)
+
+
 if __name__ == "__main__":
+    args = parse_args(sys.argv[1:])
+    ROOT = os.path.abspath(args.root)
     main()
     sys.exit(1 if FAILURES else 0)

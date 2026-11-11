@@ -3,5 +3,6 @@
 
 pub mod authority;
 pub mod caller;
+pub mod proof;
 pub mod surrogate;
 pub mod uds;

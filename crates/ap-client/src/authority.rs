@@ -2,11 +2,12 @@
 //! memory. Sessions are registered under it, renewed every 30 s, ended synchronously, and
 //! resynced when the proxy reports a session it does not know.
 
+use crate::proof::RuntimeKey;
 use crate::surrogate::new_surrogate;
 use crate::uds::{self, Reply, UdsError};
 use ap_core::session_wire::{
-    validate_entry, validate_session, Entry, HelloReq, HelloResp, RenewReq, RenewResp, ResyncReq,
-    ResyncResp, SessionRef, WireErr,
+    validate_entry, validate_session, Entry, HelloChallenge, HelloReq, HelloResp, RenewReq,
+    RenewResp, ResyncReq, ResyncResp, SessionRef, WireErr,
 };
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,6 +55,8 @@ impl Surrogate {
 struct Inner {
     socket: PathBuf,
     identity: String,
+    /// Signs each hello. The seed never leaves the runtime process.
+    key: Arc<RuntimeKey>,
     token: Mutex<String>,
     live: Mutex<BTreeMap<(String, u64), Entry>>,
     /// Ended sessions whose DELETE the proxy has not confirmed. They are not renewed or resynced.
@@ -101,17 +104,19 @@ impl Drop for Authority {
 }
 
 impl Authority {
-    /// Take an authority token for `identity` from the proxy at `socket`, then start the renew
-    /// loop. Must run inside a Tokio runtime.
+    /// Take an authority token for `identity` from the proxy at `socket`, signing the hello with
+    /// `key`, then start the renew loop. Must run inside a Tokio runtime.
     pub async fn start(
         identity: &str,
         socket: impl Into<PathBuf>,
+        key: Arc<RuntimeKey>,
     ) -> Result<Authority, AuthorityError> {
         let socket = socket.into();
-        let token = hello(&socket, identity).await?;
+        let token = hello(&socket, identity, &key).await?;
         let inner = Arc::new(Inner {
             socket,
             identity: identity.to_string(),
+            key,
             token: Mutex::new(token),
             live: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeSet::new()),
@@ -201,11 +206,19 @@ impl Authority {
     }
 }
 
-async fn hello(socket: &Path, identity: &str) -> Result<String, AuthorityError> {
+/// Take a nonce from the proxy, sign it with the runtime key, and post the hello. Returns the
+/// authority token.
+async fn hello(socket: &Path, identity: &str, key: &RuntimeKey) -> Result<String, AuthorityError> {
+    let reply = uds::get_json(socket, "/v1/hello/challenge")
+        .await
+        .map_err(AuthorityError::Transport)?;
+    check(&reply, |s| (200..300).contains(&s))?;
+    let challenge: HelloChallenge = decode(&reply)?;
+    let proof = key.sign_hello(identity, &challenge.nonce);
     let req = HelloReq {
         identity: identity.to_string(),
-        nonce: None,
-        proof: None,
+        nonce: Some(challenge.nonce),
+        proof: Some(proof),
     };
     let reply = uds::post_json(socket, "/v1/hello", None, &req)
         .await
@@ -226,7 +239,7 @@ async fn renew_round(inner: &Inner) -> Result<(), AuthorityError> {
         .map_err(AuthorityError::Transport)?;
     if reply.status == 401 {
         // The proxy no longer accepts this token. Take a new one, then restore every session.
-        let fresh = hello(&inner.socket, &inner.identity).await?;
+        let fresh = hello(&inner.socket, &inner.identity, &inner.key).await?;
         *inner.token.lock().expect("token lock") = fresh;
         return resync(inner).await;
     }

@@ -204,6 +204,8 @@ impl Authority {
 async fn hello(socket: &Path, identity: &str) -> Result<String, AuthorityError> {
     let req = HelloReq {
         identity: identity.to_string(),
+        nonce: None,
+        proof: None,
     };
     let reply = uds::post_json(socket, "/v1/hello", None, &req)
         .await

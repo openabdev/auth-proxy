@@ -34,7 +34,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Release build (default features; the matrix-upstream feature stays off)
-        run: cargo build --release -p ap-proxy -p ap-egress
+        run: cargo build --release -p ap-proxy -p ap-egress -p ap-runtime-shim
 
       - name: Release binaries carry no test hooks
         run: |
@@ -43,6 +43,9 @@ jobs:
           fi
           if grep -q AP_TEST_EGRESS_RESOLVE target/release/ap-egress; then
             echo "test hook strings found in the release ap-egress"; exit 1
+          fi
+          if grep -q AP_TEST_UPSTREAM_CA target/release/ap-runtime-shim; then
+            echo "test hook strings found in the release ap-runtime-shim"; exit 1
           fi
 
       - name: ap-egress does not depend on ap-broker

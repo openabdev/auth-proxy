@@ -31,6 +31,11 @@ pub struct Reply {
     pub body: Bytes,
 }
 
+/// `GET path` with no body.
+pub async fn get_json(sock: &Path, path: &str) -> Result<Reply, UdsError> {
+    send(sock, "GET", path, None, None).await
+}
+
 /// `POST path` with a JSON body.
 pub async fn post_json<T: Serialize + ?Sized>(
     sock: &Path,

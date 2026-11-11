@@ -5,6 +5,7 @@
 use ap_broker::store::FileStore;
 use ap_client::authority::Authority;
 use ap_client::caller::{caller_sha256, new_caller_key};
+use ap_client::proof::RuntimeKey;
 use ap_client::uds;
 use ap_proxy::admin_http;
 use ap_proxy::audit_sink::AuditSink;
@@ -13,6 +14,8 @@ use ap_proxy::session_http::serve_unix;
 use ap_proxy::{forward, listener, session_http};
 use axum::body::Body;
 use axum::http::Request;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use http_body_util::BodyExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +23,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
+
+/// The runtime key the tests sign hellos with. The seed is a fixed test value.
+fn test_key() -> Arc<RuntimeKey> {
+    Arc::new(RuntimeKey::from_seed_b64(&STANDARD.encode([7u8; 32])).expect("test seed"))
+}
 
 fn config_text(caller_sha: &str) -> String {
     format!(
@@ -145,7 +153,7 @@ async fn restart_restores_live_sessions_and_keeps_ended_ones_refused() {
     let server = start_server(&root, &caller_sha).await;
     let socket = root.join("session.sock");
 
-    let auth = Authority::start("pty-a", socket.clone())
+    let auth = Authority::start("pty-a", socket.clone(), test_key())
         .await
         .expect("hello");
     let s1 = auth
@@ -198,7 +206,7 @@ async fn failed_end_is_retried_and_not_resynced_after_restart() {
     let server = start_server(&root, &caller_sha).await;
     let socket = root.join("session.sock");
 
-    let auth = Authority::start("pty-a", socket.clone())
+    let auth = Authority::start("pty-a", socket.clone(), test_key())
         .await
         .expect("hello");
     let s1 = auth
@@ -241,7 +249,7 @@ async fn revoke_all_recovers_without_restart() {
     let admin = start_admin(&root, Arc::clone(&server.app));
     let socket = root.join("session.sock");
 
-    let auth = Authority::start("pty-a", socket.clone())
+    let auth = Authority::start("pty-a", socket.clone(), test_key())
         .await
         .expect("hello");
     let s1 = auth

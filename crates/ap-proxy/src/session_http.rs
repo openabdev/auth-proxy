@@ -14,18 +14,20 @@
 use std::sync::{Arc, MutexGuard};
 use std::time::Duration;
 
-use ap_broker::clock::SystemClock;
+use ap_broker::clock::{Clock, SystemClock};
+use ap_broker::proof::NONCE_TTL_SECS;
 use ap_broker::registry::{sha256_hex, HelloErr, Registry, SessErr};
 use ap_broker::session::{read_token_hash, token_file};
 use ap_core::session_wire::{
-    Entry, HelloReq, HelloResp, RegisterResp, RenewReq, ResyncReq, SessionRef, BODY_CAP,
+    Entry, HelloChallenge, HelloReq, HelloResp, RegisterResp, RenewReq, ResyncReq, SessionRef,
+    BODY_CAP,
 };
 use axum::body::{to_bytes, Body};
 use axum::extract::{Path, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
-use axum::routing::{delete, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
@@ -45,6 +47,7 @@ mod tests;
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/v1/hello", post(hello))
+        .route("/v1/hello/challenge", get(hello_challenge))
         .route("/v1/sessions", post(register).put(resync))
         .route("/v1/renew", post(renew))
         .route("/v1/sessions/{session}/{generation}", delete(revoke))
@@ -215,6 +218,40 @@ fn refused(app: &App, mut ev: Event<'_>, r: Refusal) -> Response {
     ev.result = r.code;
     audit(app, ev);
     error_reply(r.status, r.code)
+}
+
+/// `GET /v1/hello/challenge`: one nonce for one hello. Writes one audit line with no nonce value.
+async fn hello_challenge(State(app): State<Arc<App>>) -> Response {
+    let now = SystemClock.now();
+    let nonce = match app.nonces.lock() {
+        Ok(mut table) => table.issue(now),
+        Err(_) => {
+            audit(
+                &app,
+                Event {
+                    status: 503,
+                    result: "unavailable",
+                    ..Event::bare("hello_challenge", "")
+                },
+            );
+            return error_reply(503, "unavailable");
+        }
+    };
+    audit(
+        &app,
+        Event {
+            status: 200,
+            result: "ok",
+            ..Event::bare("hello_challenge", "")
+        },
+    );
+    json_reply(
+        200,
+        &HelloChallenge {
+            nonce,
+            ttl_secs: NONCE_TTL_SECS,
+        },
+    )
 }
 
 async fn hello(State(app): State<Arc<App>>, body: Body) -> Response {

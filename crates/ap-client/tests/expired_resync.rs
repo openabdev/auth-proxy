@@ -4,12 +4,15 @@
 //! `expired`. It records the body of every renew and resync it receives.
 
 use ap_client::authority::Authority;
+use ap_client::proof::RuntimeKey;
 use ap_proxy::session_http::serve_unix;
 use axum::body::{to_bytes, Body};
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use std::sync::{Arc, Mutex};
 use tokio::net::UnixListener;
 
@@ -36,6 +39,14 @@ async fn answer(log: &Mutex<Log>, req: Request) -> Response {
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
     let mut log = log.lock().expect("log lock");
+    // Stand-in: the challenge is a fixed nonce, and the hello is accepted without checking the
+    // proof.
+    if method == Method::GET && path == "/v1/hello/challenge" {
+        return reply(
+            StatusCode::OK,
+            r#"{"nonce":"0000000000000000000000000000000000000000000000000000000000000000","ttl_secs":30}"#,
+        );
+    }
     if method == Method::POST && path == "/v1/hello" {
         return reply(
             StatusCode::CREATED,
@@ -67,6 +78,11 @@ async fn answer(log: &Mutex<Log>, req: Request) -> Response {
     reply(StatusCode::NOT_FOUND, r#"{"error":"not_found"}"#)
 }
 
+/// The runtime key the tests sign hellos with. The seed is a fixed test value.
+fn test_key() -> Arc<RuntimeKey> {
+    Arc::new(RuntimeKey::from_seed_b64(&STANDARD.encode([7u8; 32])).expect("test seed"))
+}
+
 #[tokio::test]
 async fn expired_in_resync_reply_drops_the_session_from_renew_and_resync() {
     let socket = std::path::PathBuf::from(format!("/tmp/apc-ex-{}.sock", std::process::id()));
@@ -82,7 +98,7 @@ async fn expired_in_resync_reply_drops_the_session_from_renew_and_resync() {
     let listener = UnixListener::bind(&socket).expect("bind stand-in socket");
     let server = tokio::spawn(serve_unix(listener, fake));
 
-    let auth = Authority::start("pty-a", socket.clone())
+    let auth = Authority::start("pty-a", socket.clone(), test_key())
         .await
         .expect("hello");
     auth.register("s1", 1, vec!["kiro".into()])

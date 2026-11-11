@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 ap-core = { workspace = true }
+base64 = "0.22"
 bytes = "1"
+ed25519-dalek = "2"
 getrandom = "0.2"
 http = "1"
 http-body-util = "0.1"

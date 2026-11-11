@@ -22,6 +22,7 @@ use std::time::{Instant, SystemTime};
 use ap_broker::broker::Broker;
 use ap_broker::clock::SystemClock;
 use ap_broker::expiry::FileExpiryStore;
+use ap_broker::proof::NonceTable;
 use ap_broker::registry::{sha256_hex, Access, Registry, RegistryCfg};
 use ap_core::audit::{path_only, AuditRec};
 use ap_core::canon;
@@ -77,6 +78,8 @@ pub struct App {
     pub(crate) identity_names: Vec<String>,
     pub(crate) authority_lease_secs: u64,
     pub(crate) registry: Arc<Mutex<Registry<SystemClock>>>,
+    /// Nonces handed out by `GET /v1/hello/challenge` and not yet spent by a hello.
+    pub(crate) nonces: Mutex<NonceTable>,
     broker: Arc<dyn Broker>,
     pub(crate) audit: AuditSink,
     client: reqwest::Client,
@@ -123,6 +126,7 @@ impl App {
             identity_names,
             authority_lease_secs,
             registry: Arc::new(Mutex::new(registry)),
+            nonces: Mutex::new(NonceTable::new()),
             broker,
             audit,
             client,

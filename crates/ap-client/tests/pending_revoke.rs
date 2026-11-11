@@ -3,12 +3,15 @@
 //! with 500, so the end stays pending. It records each request it receives.
 
 use ap_client::authority::{Authority, AuthorityError};
+use ap_client::proof::RuntimeKey;
 use ap_proxy::session_http::serve_unix;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use std::sync::{Arc, Mutex};
 use tokio::net::UnixListener;
 
@@ -25,6 +28,14 @@ fn answer(log: &Mutex<Vec<String>>, req: &Request) -> Response {
     log.lock()
         .expect("log lock")
         .push(format!("{} {}", req.method(), req.uri().path()));
+    // Stand-in: the challenge is a fixed nonce, and the hello is accepted without checking the
+    // proof. The real proxy checks it (ap-proxy session_http tests).
+    if req.method() == Method::GET && req.uri().path() == "/v1/hello/challenge" {
+        return reply(
+            StatusCode::OK,
+            r#"{"nonce":"0000000000000000000000000000000000000000000000000000000000000000","ttl_secs":30}"#,
+        );
+    }
     if req.method() == Method::POST && req.uri().path() == "/v1/hello" {
         return reply(
             StatusCode::OK,
@@ -35,6 +46,11 @@ fn answer(log: &Mutex<Vec<String>>, req: &Request) -> Response {
         return reply(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"down"}"#);
     }
     reply(StatusCode::OK, "{}")
+}
+
+/// The runtime key the tests sign hellos with. The seed is a fixed test value.
+fn test_key() -> Arc<RuntimeKey> {
+    Arc::new(RuntimeKey::from_seed_b64(&STANDARD.encode([7u8; 32])).expect("test seed"))
 }
 
 #[tokio::test]
@@ -52,7 +68,7 @@ async fn register_is_refused_while_an_earlier_revoke_is_pending() {
     let listener = UnixListener::bind(&socket).expect("bind stand-in socket");
     let server = tokio::spawn(serve_unix(listener, fake));
 
-    let auth = Authority::start("pty-a", socket.clone())
+    let auth = Authority::start("pty-a", socket.clone(), test_key())
         .await
         .expect("hello");
     auth.register("s1", 1, vec!["kiro".into()])

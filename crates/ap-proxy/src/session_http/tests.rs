@@ -212,3 +212,39 @@ async fn admin_lists_sessions_and_revoke_all_revokes_them() {
     let denied = reg.authorize(&sha256_hex(&surrogate), IDENTITY, ROUTE, now);
     assert_eq!(denied, Err(Deny::Revoked));
 }
+
+#[tokio::test]
+async fn hello_challenge_issues_a_fresh_nonce_and_audits_without_it() {
+    let up = start_upstream().await;
+    let f = Fixture::new("challenge", &up);
+    let app = Arc::clone(&f.app);
+
+    let (status, a) = call(
+        router(Arc::clone(&app)),
+        "GET",
+        "/v1/hello/challenge",
+        None,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, b) = call(
+        router(Arc::clone(&app)),
+        "GET",
+        "/v1/hello/challenge",
+        None,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let first = a["nonce"].as_str().expect("nonce").to_string();
+    let second = b["nonce"].as_str().expect("nonce").to_string();
+    assert!(ap_core::canon::is_lower_hex_64(&first));
+    assert_ne!(first, second);
+    assert_eq!(a["ttl_secs"], json!(30));
+
+    let text = f.audit_text();
+    assert!(text.contains("\"op\":\"hello_challenge\""), "{text}");
+    assert!(!text.contains(&first), "nonce in audit");
+}

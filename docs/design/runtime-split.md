@@ -42,6 +42,12 @@ UID 1000 has neither the group nor a mount that shows the path.
 The proxy creates `session.sock` as UID 1001 (a non-root process cannot give a file to another
 user), so the owner is 1001, not 1002. The group is what matters for the connect check.
 
+**Recorded deviation (owner decision, approved).** The brief asked for `session.sock` owned by UID
+1002. The shipped owner is 1001 with group 1002, mode `0660`. The reason is the one above: the
+proxy creates the socket, and giving it to UID 1002 would need `CAP_CHOWN` on the proxy, which
+widens the proxy's privilege. The approved alternative is this layout. The agent still cannot
+connect: it has no mount of the volume, and it is not in group 1002.
+
 `bind_session_socket` changes its mode from `0666` to `0660`.
 
 ## Agent-runtime socket operations
@@ -177,11 +183,14 @@ Manifest checks (`validate_manifests.py`): the proof Secret is mounted only into
 container sets `runAsGroup`.
 
 Pod checks (run after the code): check A has three parts. (i) As UID 1000, `connect` to
-`session.sock` fails. The real manifest does not mount the path into the agent, so the expected
-error is "no such file". A test-only overlay mounts the volume at a probe path and expects
-"permission denied", which shows the mode bits work alone. (ii) As UID 1000, `hello` and the
-challenge on `runtime.sock` return `404 unknown_operation`. (iii) As UID 1000, a lease-lapse attempt
-is refused and never reaches the proxy.
+`session.sock` fails. The owner approved this split (recorded decision). (i-a) The real manifest does
+not mount the path into the agent, so the expected error is "no such file" (ENOENT). (i-b) A
+test-only overlay pod mounts the same volume into the agent at a probe path. A UID 1000 process
+then gets "permission denied" (EACCES) on the socket, which shows the mode and group bits block the
+agent alone. The overlay is not a manifest change, and its pod is deleted after the run. Both
+results are the evidence for "the agent cannot connect". (ii) As UID 1000, `hello` and the challenge
+on `runtime.sock` return `404 unknown_operation`. (iii) As UID 1000, a lease-lapse attempt is
+refused and never reaches the proxy.
 
 ## Compatibility
 

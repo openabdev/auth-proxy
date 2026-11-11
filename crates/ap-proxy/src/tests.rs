@@ -48,6 +48,7 @@ async fn invalid_config_exits_with_status_2_and_binds_nothing() {
         admin_socket: scratch.path().join("admin.sock"),
         secret_root: scratch.path().join("secrets"),
         token_dir: scratch.path().join("tokens"),
+        expiry_store: None,
     })
     .await;
     assert_eq!(code, 2);
@@ -63,7 +64,37 @@ async fn missing_config_exits_with_status_2() {
         admin_socket: scratch.path().join("a.sock"),
         secret_root: scratch.path().join("secrets"),
         token_dir: scratch.path().join("tokens"),
+        expiry_store: None,
     })
     .await;
     assert_eq!(code, 2);
+}
+
+#[tokio::test]
+async fn missing_expiry_store_exits_with_status_2_and_binds_nothing() {
+    let scratch = Scratch::new("nostore");
+    let config = scratch.path().join("policy.toml");
+    let text = crate::test_support::policy_text(&"a".repeat(64), 8443);
+    std::fs::write(&config, text).expect("write");
+    let tokens = scratch.path().join("tokens");
+    std::fs::create_dir_all(&tokens).expect("token dir");
+    let session = scratch.path().join("session.sock");
+    let code = run(Options {
+        config,
+        session_socket: session.clone(),
+        admin_socket: scratch.path().join("admin.sock"),
+        secret_root: scratch.path().join("secrets"),
+        token_dir: tokens.clone(),
+        expiry_store: None,
+    })
+    .await;
+    assert_eq!(code, 2, "a missing store must stop the start");
+    assert!(
+        !session.exists(),
+        "no socket may be bound without the store"
+    );
+    assert!(
+        !tokens.join(ap_broker::expiry::FILE_NAME).exists(),
+        "a refused start must not create the store"
+    );
 }

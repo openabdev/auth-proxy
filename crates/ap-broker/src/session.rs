@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use ap_core::session_wire::{validate_entry, Entry, ResyncResp};
+use ap_core::session_wire::{validate_entry, Entry, ResyncResp, SessionRef};
 
 use crate::clock::Clock;
 use crate::expiry::record_key;
@@ -85,6 +85,7 @@ impl<C: Clock> Registry<C> {
         let mut surrogates: HashSet<String> = HashSet::new();
         let mut plan: Vec<(Entry, u64)> = Vec::with_capacity(list.len());
         let mut pending: Vec<(String, u64)> = Vec::new();
+        let mut expired: Vec<SessionRef> = Vec::new();
         for e in list {
             let key = (e.session.clone(), e.generation);
             if !keys.insert(key.clone()) || !surrogates.insert(e.surrogate_sha256.clone()) {
@@ -115,7 +116,13 @@ impl<C: Clock> Registry<C> {
                 }
                 // Past its stored absolute expiry: leave it out of the batch. The key stays
                 // unbound, so its surrogate is refused as unknown, and the rest still applies.
-                Err(SessErr::AbsoluteExpired) => continue,
+                Err(SessErr::AbsoluteExpired) => {
+                    expired.push(SessionRef {
+                        session: e.session.clone(),
+                        generation: e.generation,
+                    });
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
             plan.push((e, absolute));
@@ -167,6 +174,7 @@ impl<C: Clock> Registry<C> {
         Ok(ResyncResp {
             registered,
             dropped,
+            expired,
         })
     }
 }
@@ -286,7 +294,8 @@ mod tests {
             resp,
             ap_core::session_wire::ResyncResp {
                 registered: 1,
-                dropped: 1
+                dropped: 1,
+                expired: vec![],
             }
         );
         assert_eq!(

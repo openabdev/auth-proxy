@@ -76,6 +76,7 @@ async fn start_server(root: &Path, caller_sha: &str) -> Server {
         cfg_path,
         cfg,
         root.join("tokens"),
+        ap_broker::expiry::file_in(&root.join("tokens")),
         Arc::new(FileStore::new(root.join("secrets"))),
         AuditSink::new(Box::new(std::io::sink())),
         forward::client().expect("upstream client"),

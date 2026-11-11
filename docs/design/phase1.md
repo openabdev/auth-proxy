@@ -265,7 +265,7 @@ on the proxy service. Every call except `hello` carries `Authorization: Bearer <
 | `POST /v1/sessions` | `{session, generation, surrogate_sha256, credentials: [id]}` | `201 {lease_secs}` | `401` bad token; `400` invalid field; `403 credential_not_granted`; `409` same session and generation already registered with another hash; `429` over `max_sessions` |
 | `POST /v1/renew` | `{sessions: [{session, generation}]}` | `200 {lease_secs, unknown: [...]}` | `401` |
 | `DELETE /v1/sessions/{session}/{generation}` | none | `204` (also when unknown) | `401` |
-| `PUT /v1/sessions` (resync) | full list as in `POST` | `200 {registered, dropped}`; sessions not in the list are revoked | `401`, `400` (whole request rejected, nothing applied) |
+| `PUT /v1/sessions` (resync) | full list as in `POST` | `200 {registered, dropped, expired}`; sessions not in the list are revoked; `expired` lists listed keys skipped because their absolute expiry has passed | `401`, `400` (whole request rejected, nothing applied), `503 broker_unavailable` (nothing applied) |
 
 Validation, all fail with `400` and change nothing: `session` 1 to 128 characters of
 `[A-Za-z0-9._:-]` (fits openab-pty names and openab thread keys); `generation` a u64;
@@ -274,6 +274,16 @@ config and granted to the identity, else `403`. Bodies over 1 MiB are refused wi
 resync list is validated in full before anything is applied, so a partly bad list registers
 nothing and the response says which entry failed. Every call writes an audit line with the session
 id, generation, a short hash prefix and the result, never the surrogate.
+
+### Expiry record retention (Phase 1)
+
+Phase 1 does not prune absolute-expiry records. Every session key that the proxy records keeps
+its record in the expiry store, and no record is removed. Pruning is not safe yet. If a record
+were removed, a later resync or register of the same `(identity, session, generation)` would find
+no record, and it would start a new absolute TTL. That is the extension the store exists to stop.
+Pruning is a follow-up with its own design. Until then the store grows by one line of at most 76
+bytes (64 hex digits, a space, a 10-digit expiry, a newline) for each session key ever registered. The Kubernetes pod sizes its claim with this growth
+in mind (64 Mi in `deploy/k8s/pod.yaml`).
 
 ---
 

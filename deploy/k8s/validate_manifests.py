@@ -127,10 +127,10 @@ def main():
     prep = next((c for c in inits if c.get("name") == PREP_NAME), {})
     psc = prep.get("securityContext", {})
     check(
-        "volume-prep-root-chown-only",
+        "volume-prep-root-chown-fsetid-only",
         psc.get("runAsUser") == 0
         and psc.get("capabilities", {}).get("drop") == ["ALL"]
-        and psc.get("capabilities", {}).get("add") == ["CHOWN"]
+        and psc.get("capabilities", {}).get("add") == ["CHOWN", "FSETID"]
         and psc.get("allowPrivilegeEscalation") is False
         and psc.get("readOnlyRootFilesystem") is True,
     )

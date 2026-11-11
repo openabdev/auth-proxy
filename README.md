@@ -41,25 +41,32 @@ flowchart LR
     egress --> git
 ```
 
-Implemented:
+## Features
 
-- Caller key and surrogate checks, canonicalization, per-identity policy, credential swap, and
-  audit lines that never contain a key, surrogate, or credential.
-- Session plane over a Unix socket: `hello` lock on Kubernetes, register, renew, resync, and
-  revoke. Each session has an absolute TTL of 12 h, stored durably. The proxy fails closed when
-  the expiry store is not writable.
-- Credentials read from files in a proxy-only mount, re-read when the file changes.
-- ap-egress: CONNECT allowlist, DNS resolved by ap-egress itself, and refusal of private
-  addresses and IP-literal targets.
+Implemented and tested in Phase 1:
 
-Not implemented:
+- Caller-key routing and surrogate credential swap ([design](docs/design/phase1.md))
+- Per-identity TOML policy with fail-closed checks ([design](docs/design/phase1.md))
+- Canonicalization, and refusal of ambiguous hosts and paths
+- 12 h absolute session TTL, lease renewal, and synchronous revoke ([session plane](docs/session-plane.md))
+- Absolute expiry persisted across proxy restarts; the proxy fails closed without the store ([session plane](docs/session-plane.md))
+- Resync with an explicit `expired` list ([session plane](docs/session-plane.md))
+- ap-egress CONNECT allowlist; ap-egress resolves DNS itself and refuses private and IP-literal targets
+- File-backed credential store that re-reads a file when it changes
+- Kubernetes pod with per-UID iptables (Option A) and separate volumes ([pod.yaml](deploy/k8s/pod.yaml))
+- 39-row fail-closed matrix, run by the manual-dispatch CI workflow ([matrix](tests/matrix/matrix.py))
 
-- ECS/Fargate deployment
-- Secrets Manager credential store
-- Phase 2 TLS interception
-- Runtime-proof `hello` (today `hello` takes only an identity name)
-- Connection cap in ap-egress
-- Pruning of expiry records (records are never removed)
+## Todos
+
+- ECS / Fargate deployment (Option C): deferred to a later phase
+- Secrets Manager store (S2): deferred with ECS
+- Phase 2 TLS interception (CONNECT with CA): no current CLI needs it
+- Runtime-proof for `hello`: only the target is documented; same-UID processes can still read the proof
+- Connection cap for ap-egress: every connection spawns a task
+- Pruning of expiry records: pruning would let a re-registered key reset its 12 h cap
+- 12 h absolute TTL has no config key: it is a fixed default
+- Matrix positive rows run against a feature-enabled test binary, not the release binary
+- Live run of the K8s pod on a cluster is not in CI: the validator checks the manifest only
 
 ## Kubernetes deployment (Option A)
 

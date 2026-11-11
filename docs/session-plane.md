@@ -31,20 +31,28 @@ in a later phase.
 | `PUT /v1/sessions` (resync) | full list as in `POST /v1/sessions` | `200 {registered, dropped, expired: [{session, generation}]}`; sessions not in the list are revoked; `expired` lists the listed keys skipped because their absolute expiry has passed | `401`, `400` (whole request rejected, nothing applied), `503 broker_unavailable` (nothing applied) |
 
 The `expired` field is additive. The proxy writes it only when the list is not empty, so a resync
-response with nothing expired has the older shape exactly. An older client denies unknown fields
-and fails to decode a resync response that names an expired key. Upgrade every client before any
-proxy can return `expired`. The proxy can return it once one of the resynced keys is past its
-absolute expiry.
+response with nothing expired has the older shape exactly. An older client denies unknown fields,
+so it fails to decode a resync response that names an expired key. The rollout order below covers
+this case.
 
 ### `POST /v1/sessions` error codes
 
 | Status and code | Meaning | Registered? | Client action |
 |---|---|---|---|
-| `403 session_expired` | The session key `(identity, session, generation)` was recorded before, and its absolute TTL (`sessions.absolute_ttl_secs`, 12 h by default) has passed. The stored expiry survives a proxy restart, so a restart does not reset it. | No. The surrogate stays unknown. | Do not retry this key. A new generation is a new key with its own absolute TTL, so the authority decides whether to start one. |
+| `403 session_expired` | The session key `(identity, session, generation)` was recorded before, and its absolute TTL has passed. The absolute TTL is a fixed 12 h default in this release (`DEFAULT_ABSOLUTE_TTL_SECS` in `ap-broker`); there is no config key for it yet. The stored expiry survives a proxy restart, so a restart does not reset it. | No. The surrogate stays unknown. | Do not retry this key. A new generation is a new key with its own absolute TTL, so the authority decides whether to start one. |
 | `503 broker_unavailable` | The proxy could not write the session expiry store, so it could not record the key's absolute expiry. The proxy fails closed: nothing is recorded and no session is accepted. | No. Nothing changes. | Retry later, after the store is writable again. The same request is safe to resend. |
 
 A `503` whose body says `unavailable` (no `broker_` prefix) is a different condition: the registry
 lock is poisoned. It is not a store failure, and it is not the code above.
+
+## Rollout order (Phase 1)
+
+1. Upgrade the proxy first. With nothing expired, its responses keep the older shape, so clients
+   that do not know `expired` keep working.
+2. Upgrade every client that decodes resync responses (the openab-pty runtime and any other
+   authority).
+3. Only after step 2, enable expiry-driven resync. Until then, a resync that names an expired key
+   can break an older client.
 
 ## Validation
 

@@ -1,29 +1,29 @@
 # Runtime split (Option A): design note
 
-Status: design only. No code ran to produce this note.
+Status: design, amended before implementation. Code that follows this note is in the same series.
 
 ## Summary
 
 The Kubernetes pod splits the agent from the process that talks to the session plane. The agent
-runs as UID 1000 and has no path to `session.sock`. A new runtime container (UID 1002) holds the
-hello proof, is the only client of `session.sock`, and serves a narrow API to the agent over a
-second Unix socket. `hello` requires a proof that only the runtime can produce. The proxy listener
-(`127.0.0.1:18080`) and the agent's base URL do not change.
+runs as UID 1000 and has no path to `session.sock`. A runtime container (UID 1002, binary
+`ap-runtime-shim`) holds the hello proof, is the only client of `session.sock`, and serves a narrow
+API to the agent over a second Unix socket. `hello` requires a proof that only the runtime can
+produce. The proxy listener (`127.0.0.1:18080`) and the agent's base URL do not change.
 
 ## Containers and UIDs
 
-| Container | Kind | UID | Capabilities | Mounts (new or changed in bold) |
+| Container | Kind | UID:GID | Capabilities | Mounts |
 |---|---|---|---|---|
-| `volume-prep` | init, new | 0 | `CHOWN` only | `agent-runtime`, `session-plane` (sets owner, group and mode, then exits) |
-| `netinit` | init, unchanged rules | 0 | `NET_ADMIN` only | `netinit-run` |
+| `volume-prep` | init, new, first | 0:0 | `CHOWN` only | `session-plane` and `agent-runtime` (sets owner, group and mode of both volume roots, then exits) |
+| `netinit` | init, rules changed | 0:0 | `NET_ADMIN` only | `netinit-run` |
 | `expiry-store-bootstrap` | init, unchanged | 1001 | none | `expiry-store` |
-| `agent` | app | 1000 | none | `agent-runtime` (at `/run/auth-proxy-agent`); caller key, home, work, tmp. **No `session-plane`.** |
-| `proxy` | app | 1001 | none | `session-plane` (at `/run/auth-proxy-session`); admin socket, identity config, proxy state, tokens, expiry store, kiro secret |
-| `runtime` | app, new | 1002 | none | **`session-plane`** (at `/run/auth-proxy-session`), **`agent-runtime`** (at `/run/auth-proxy-agent`), **`runtime-key`** (read-only, at `/var/run/auth-proxy-runtime`). Nothing else. |
-| `egress` | app | **1003** (was 1002) | none | identity config |
+| `agent` | app | 1000:1000 | none | `agent-runtime` at `/run/auth-proxy-agent`; caller key, home, work, tmp. No `session-plane`. |
+| `proxy` | app | 1001:1001 | none | `session-plane` at `/run/auth-proxy-session`; admin socket, identity config, proxy state, tokens, expiry store, kiro secret |
+| `runtime` | app, new | 1002:1002 | none | `session-plane` at `/run/auth-proxy-session`, `agent-runtime` at `/run/auth-proxy-agent`, `runtime-key` read-only at `/var/run/auth-proxy-runtime`. Nothing else. |
+| `egress` | app | 1003:1003 (was 1002) | none | identity config |
 
-The egress container moves from UID 1002 to 1003 because the runtime takes 1002. Its behavior
-does not change.
+The runtime takes UID 1002, so the egress container moves to 1003. Its behavior does not change.
+Every app container sets `runAsGroup`, so no container runs with GID 0 by accident.
 
 ## Socket paths and ownership
 
@@ -31,74 +31,73 @@ does not change.
 |---|---|---|---|---|---|
 | `/run/auth-proxy-session/session.sock` | proxy | runtime | `1001:1002` | `0660` | proxy, runtime |
 | `/run/auth-proxy-agent/runtime.sock` | runtime | agent | `1002:1000` | `0660` | runtime, agent |
-| `/run/auth-proxy/admin.sock` (unchanged) | proxy | operator tooling | proxy only | `0600` | proxy |
+| `/run/auth-proxy-admin/admin.sock` (unchanged) | proxy | operator tooling | `1001` | `0600` | proxy |
 
-The parent directories are created by `volume-prep`: `/run/auth-proxy-session` is `1001:1002`
-with mode `2750`, and `/run/auth-proxy-agent` is `1002:1000` with mode `2750`. The setgid bit makes
-each new socket inherit the group of its directory. A process cannot chown a socket to a group it
-does not belong to, so the proxy and the runtime get the group through the directory.
+The two socket directories are the roots of the `session-plane` and `agent-runtime` volumes.
+`volume-prep` sets each root to owner and group as above, mode `2750`. The setgid bit makes each
+new socket inherit the group of its directory, so the proxy and the runtime both produce sockets
+with the group the table shows. Only the group 1002 and UID 1002 can connect to `session.sock`.
+UID 1000 has neither the group nor a mount that shows the path.
 
-Deviation from the plan: the plan asks for `session.sock` owned by UID 1002. The proxy creates
-and binds the socket, and a non-root process cannot give a file to another user (that needs
-`CAP_CHOWN`). The owner is therefore UID 1001, and the group is 1002. Only UID 1002 and the proxy's
-group can connect. UID 1000 has neither the group nor a mount that shows the path.
+The proxy creates `session.sock` as UID 1001 (a non-root process cannot give a file to another
+user), so the owner is 1001, not 1002. The group is what matters for the connect check.
 
-The `bind_session_socket` helper changes its mode from `0666` to `0660`.
+`bind_session_socket` changes its mode from `0666` to `0660`.
 
 ## Agent-runtime socket operations
 
-Transport: HTTP/1.1 with JSON bodies over `/run/auth-proxy-agent/runtime.sock`. The runtime
-identifies the caller by its identity only, the one configured for the runtime. The agent sends no
-identity and no token. Any operation not listed below returns `404 unknown_operation`, including
-`/v1/hello`, `/v1/hello/challenge`, and every proxy session-plane path. A listed path with the
-wrong method returns `405 method_not_allowed`. Bodies are capped at 1 MiB (`413 body_too_large`).
+Transport: HTTP/1.1 with JSON bodies over `/run/auth-proxy-agent/runtime.sock`. The agent sends no
+identity and no token. The runtime serves one identity, set by its `--identity` argument. Any path
+or method not listed below returns `404 unknown_operation`, including `/v1/hello`,
+`/v1/hello/challenge` and every session-plane path of the proxy. A listed path with the wrong method
+returns `405 method_not_allowed`. Bodies are capped at 1 MiB (`413 body_too_large`).
 
 | Operation | Request | Success | Failure codes |
 |---|---|---|---|
-| register | `POST /v1/session` with `{"session": str, "generation": u64, "credentials": [str]}` | `201 {"surrogate": "<64 lowercase hex>", "lease_secs": u64}` | `400 invalid_body`, `400 invalid_field` (adds `"field"`), `403 credential_not_granted`, `403 session_expired`, `409 session_conflict`, `429 max_sessions`, `503 no_authority`, `503 broker_unavailable` |
-| revoke | `DELETE /v1/session/{session}/{generation}` | `204`. Also `204` when the runtime does not track the key. | `400 invalid_field`, `503 no_authority`, `503 broker_unavailable` |
-| status | `GET /v1/status` | `200 {"identity": str, "authority": "live" \| "none", "sessions": [{"session", "generation"}]}` | none beyond `404` and `405` |
+| register | `POST /v1/session`, body `{"session", "generation", "credentials"}` | `201 {"surrogate": "aps_<64 lowercase hex>"}` | `400 invalid_body`; `400 invalid_field` (adds `"field"`); `403 credential_not_granted`; `403 session_expired`; `409 conflict`; `409 revoke_pending`; `429 too_many_sessions`; `503 broker_unavailable` |
+| revoke | `DELETE /v1/session/{session}/{generation}` | `204`. Also `204` when the runtime does not track the key. | `400 invalid_field`; `503 broker_unavailable` |
+| status | `GET /v1/status` | `200 {"identity", "authority": "live", "sessions": [{"session", "generation"}]}` | none beyond `404` and `405` |
 
-Behavior that the failure codes depend on:
+Rules the codes depend on:
 
-- **register** generates 32 random bytes with the OS RNG and returns them as the surrogate. The
-  runtime keeps only `sha256(surrogate)`. It sends that hash to the proxy with its own authority
-  token (`POST /v1/sessions`). The caller's identity is the runtime's identity. The agent cannot
-  choose another identity.
-- **register** checks `session` and `generation` with the same rules as the proxy
-  (`validate_session`, u64) before it contacts the proxy. A bad value returns `400 invalid_field`
-  and names the field.
+- **register** generates the surrogate with `ap_client::surrogate::new_surrogate()`, so its form is
+  `aps_` plus 64 hex, the form the proxy's agent path already checks. The runtime sends only the
+  digest to the proxy. The identity is always the runtime's own.
+- The proxy's refusal codes pass through unchanged (`conflict`, `too_many_sessions`,
+  `session_expired`, `credential_not_granted`). `revoke_pending` is new: an earlier revoke of the
+  same key is still unconfirmed by the proxy.
+- The runtime does not return a lease. It renews the lease itself, so the agent never needs it.
+- The runtime binds `runtime.sock` only after `hello` succeeds. A failed `hello` exits the process.
+  So the socket never answers before authority exists, and there is no `no_authority` code.
+- `status.authority` is `"live"` while the socket serves.
 - **revoke** contacts the proxy only for keys the runtime registered. An unknown key returns `204`
-  and changes nothing, so the agent cannot revoke sessions that the runtime did not create.
-- The proxy's `400` maps to `invalid_field`. Its `403`, `409` and `429` pass through under the
-  same code names. Its `503` maps to `broker_unavailable`. A connection failure also maps to
-  `broker_unavailable`.
-- `no_authority` means the runtime has not completed `hello`. The runtime keeps no session state
-  until then.
+  and changes nothing, so the agent cannot end sessions the runtime did not create.
+- `session` and `generation` are checked with the proxy's rules (`validate_session`, u64) before
+  any proxy call. A bad value returns `400 invalid_field` and names the field.
+- A proxy `503` or a connection failure maps to `503 broker_unavailable`.
 
 ## Hello proof
 
 ### Key material
 
-- The runtime holds an Ed25519 private seed: 32 bytes, base64 text, in the Secret
-  `auth-proxy-runtime-key`, key `runtime_ed25519.seed`. It is mounted read-only at
-  `/var/run/auth-proxy-runtime/runtime_ed25519.seed` in the runtime container only. Mode `0444`,
-  the same as `kiro-secret`. The file is not readable by any other container because the other
-  containers do not mount it. The validator enforces that mount rule.
-- The proxy holds only the public key: `runtime_pubkey` (base64, 32 bytes) on each
-  `[[identity]]` in the identity config. It is not a secret.
-- Why Ed25519 and not HMAC: an HMAC proxy must hold the same secret as the runtime. The plan
-  allows the proof Secret in the runtime only, so the proxy can verify without a shared secret.
-  This adds one dependency, `ed25519-dalek`, to `ap-broker`.
+- The runtime holds an Ed25519 seed: 32 bytes, standard base64 text, in the Secret
+  `auth-proxy-runtime-key`, key `runtime_ed25519.seed`. The runtime container mounts it read-only
+  at `/var/run/auth-proxy-runtime/runtime_ed25519.seed`, mode `0444`. No other container mounts the
+  Secret, and the validator enforces that.
+- The proxy holds only the public key: `runtime_pubkey` (standard base64, 32 bytes) on each
+  `[[identity]]`. It is not a secret. A malformed key makes the proxy refuse to start.
+- Ed25519 rather than HMAC: an HMAC proxy would hold the same secret as the runtime, and the
+  proof Secret is meant to exist in the runtime alone.
 
 ### Challenge and hello
 
 1. `GET /v1/hello/challenge` returns `200 {"nonce": "<64 lowercase hex>", "ttl_secs": 30}`. The
-   proxy draws 32 bytes from the OS RNG. Nonces live in memory only. At most 64 are outstanding,
-   and the oldest is evicted first. Each nonce is one-shot.
-2. `POST /v1/hello` with body `{"identity": str, "nonce": str, "proof": str}`, where `proof` is
-   the standard base64 of a 64-byte Ed25519 signature. The body uses `deny_unknown_fields`.
-   Success returns `201 {"authority_token", "lease_secs"}`, the same as today.
+   proxy draws 32 bytes from the OS RNG. Nonces live in memory only, at most 64 are outstanding,
+   and the oldest is evicted first. Each nonce works once. This call writes one audit line with op
+   `hello_challenge` and no nonce value.
+2. `POST /v1/hello` with body `{"identity", "nonce", "proof"}`. `nonce` and `proof` are optional on
+   the wire, and `deny_unknown_fields` applies. `proof` is the standard base64 of a 64-byte Ed25519
+   signature. Success returns `201 {"authority_token", "lease_secs"}`, as today.
 
 The signed message is the bytes:
 
@@ -106,106 +105,95 @@ The signed message is the bytes:
 "auth-proxy hello v1\n" || u32_be(len(identity)) || identity || "\n" || nonce
 ```
 
-`nonce` is the 64-character hex string as sent. The length prefix keeps the message unambiguous
-for any identity string.
+`nonce` is the 64-character hex string as sent. The length prefix keeps the message unambiguous for
+any identity string.
 
-### Verification rule
+### Verification order
 
-The proxy runs these checks in this order. The first failure returns and nothing else runs.
+The first failing step returns, and nothing after it runs.
 
-1. The body parses, with the shape above (`400 invalid_body` otherwise).
-2. `identity` is in the config (`400 identity_unknown`). Unchanged.
-3. The identity has a `runtime_pubkey` (`403 runtime_key_missing` otherwise). This fails closed.
-4. `proof` is present (`401 proof_missing` otherwise). Nothing is consumed yet.
-5. The nonce exists, has not expired and has not been used. It is removed from the table on
-   lookup, whether or not the next check passes (`401 nonce_invalid` otherwise).
-6. `proof` decodes to 64 bytes and `verify_strict` accepts it over the signed message with the
-   identity's public key (`401 proof_invalid` otherwise). Ed25519 verification compares in
-   constant time.
-7. The lease check and the authority token are unchanged. A live lease returns `409
-   authority_active`. A store failure returns `503 broker_unavailable`.
-
-Hello requests are audited with the result code and the identity. The audit line never contains
-the proof, the nonce, or the token.
-
-The runtime signs the same message with the seed it loaded at startup. The shim exits non-zero on
-any hello failure and logs the code. The restart policy then retries it.
-
-## Failure code summary
-
-| Layer | Code | When |
+| # | Check | Failure (status, code) |
 |---|---|---|
-| hello | `400 invalid_body` | body does not match the shape, or the nonce is not 64 lowercase hex |
+| 1 | Body parses. Wrong types, unknown fields, or a present `nonce` that is not 64 lowercase hex. | `400 invalid_body` |
+| 2 | `identity` is in the config. | `400 identity_unknown` |
+| 3 | The identity has a `runtime_pubkey`. This fails closed. | `403 runtime_key_missing` |
+| 4 | `proof` is present. A body with only `{identity}` stops here. This is the lease-lapse attacker case. | `401 proof_missing` |
+| 5 | `nonce` is present and the nonce table has it, unexpired and unused. The entry is removed on lookup. A missing `nonce` with a present `proof` lands here. | `401 nonce_invalid` |
+| 6 | `proof` decodes to 64 bytes and `verify_strict` accepts it over the signed message. | `401 proof_invalid` |
+| 7 | The lease check, unchanged. A live lease returns `409 authority_active` with `retry_after`. A store failure returns `503 broker_unavailable`. | as before |
+
+A refusal before step 5 leaves the nonce unused, so the next attempt with the right proof succeeds.
+Hello writes one audit line with the identity and the result code. The line never holds the proof,
+the nonce or the token.
+
+The runtime signs with the seed it loaded at startup. The shim exits non-zero when hello fails, and
+the restart policy retries it.
+
+## Failure codes
+
+| Layer | Status and code | When |
+|---|---|---|
+| hello | `400 invalid_body` | body shape, or nonce not 64 lowercase hex |
 | hello | `400 identity_unknown` | identity not in the config |
 | hello | `403 runtime_key_missing` | identity has no `runtime_pubkey` |
-| hello | `401 proof_missing` | no `proof` field. This is the lease-lapse attacker case without the proof. |
-| hello | `401 nonce_invalid` | nonce unknown, expired, or already used |
-| hello | `401 proof_invalid` | wrong signature, or a proof that is not 64 bytes after base64 decode |
-| hello | `409 authority_active` | proof is valid and the lease is still live |
-| hello | `503 broker_unavailable` | store or lock failure (unchanged) |
-| agent-runtime | `404 unknown_operation`, `405 method_not_allowed` | path or method not in the operation table |
+| hello | `401 proof_missing` | no `proof` field |
+| hello | `401 nonce_invalid` | nonce unknown, expired or already used |
+| hello | `401 proof_invalid` | wrong signature, or proof not 64 bytes after decode |
+| hello | `409 authority_active` | proof valid, lease still live |
+| hello | `503 broker_unavailable` | store or lock failure |
+| agent-runtime | `404 unknown_operation`, `405 method_not_allowed` | path or method not in the table |
 | agent-runtime | `400 invalid_body`, `400 invalid_field`, `413 body_too_large` | request shape or size |
-| agent-runtime | `403 credential_not_granted`, `403 session_expired`, `409 session_conflict`, `429 max_sessions` | proxy result passed through |
-| agent-runtime | `503 no_authority` | runtime has not completed hello |
-| agent-runtime | `503 broker_unavailable` | proxy unreachable or returned 503 |
+| agent-runtime | `403 credential_not_granted`, `403 session_expired`, `409 conflict`, `409 revoke_pending`, `429 too_many_sessions` | proxy result, passed through |
+| agent-runtime | `503 broker_unavailable` | proxy unreachable or failing |
 
 ## Netinit rules per UID
 
-The init container still runs as root with `NET_ADMIN` only. It flushes `OUTPUT` and installs these
+The init container still runs as root with `NET_ADMIN` only. It flushes `OUTPUT` and installs the
 rules for `iptables` and `ip6tables`:
 
 | UID | Rules |
 |---|---|
-| 1000 (agent) | Unchanged. Accept ESTABLISHED. Allow loopback TCP to `PROXY_PORT` and `EGRESS_PORT`. Reject other loopback TCP listed in `OTHER_LO_PORTS`. Reject all other loopback. Reject all non-loopback output. |
-| 1001 (proxy) | No rule (unchanged). |
+| 1000 (agent) | Unchanged: accept ESTABLISHED, allow loopback to `PROXY_PORT` and `EGRESS_PORT`, reject other listed loopback ports, reject other loopback, reject all non-loopback output. |
+| 1001 (proxy) | None (unchanged). |
 | 1002 (runtime) | Accept ESTABLISHED. Reject all other output. The runtime needs no network: `session.sock` and `runtime.sock` are Unix sockets, which netfilter does not see. |
-| 1003 (egress) | No rule (unchanged). |
+| 1003 (egress) | None (unchanged). |
 
-Deviation from the plan: the plan lists the proxy listener as allowed for UID 1002. The runtime
-has no reason to reach it, since the session plane is a Unix socket. Adding that rule would widen
-the runtime's network reach for no use. The owner can override this.
+The runtime gets no rule for the proxy listener. Its session plane is a Unix socket, so a rule
+would only widen its network reach. `netinit.sh` takes `RUNTIME_UID` (default 1002), rejects a
+value equal to `AGENT_UID`, and rejects non-numeric values as before.
 
-`netinit.sh` gets a `RUNTIME_UID` variable (default 1002). It rejects a run where `RUNTIME_UID` equals
-`AGENT_UID`, and it rejects any non-numeric value, as it already does.
+## Verification
 
-## Verification plan
+Unit tests (`ap-core`, `ap-broker`, `ap-proxy`): the signed-message vector; each row of the order
+table, including the lease-lapse case (`{identity}` alone is `proof_missing`); a replayed or expired
+nonce; identity without `runtime_pubkey`; a refusal that leaves the nonce unused.
 
-Unit tests (`ap-broker`, `ap-core`):
+Shim tests (`ap-runtime-shim`): register returns an `aps_` surrogate that the proxy accepts; revoke
+of an unknown key returns `204` with no proxy call; `POST /v1/hello` and `GET /v1/hello/challenge`
+on the agent socket return `404 unknown_operation`; an oversized body returns `413`.
 
-- hello without `proof` returns `proof_missing`.
-- hello with a signature from another key returns `proof_invalid`.
-- hello with the right key and nonce returns `201`.
-- The lease-lapse attacker (UID 1000, no seed) cannot produce a valid proof: `proof_missing`.
-- Replayed nonce returns `nonce_invalid`. Expired nonce returns `nonce_invalid`.
-- Identity without `runtime_pubkey` returns `runtime_key_missing`.
-- Signed-message construction matches a fixed vector.
+Manifest checks (`validate_manifests.py`): the proof Secret is mounted only into `runtime`;
+`session-plane` is not mounted into `agent`; the runtime UID differs from the agent UID; each app
+container sets `runAsGroup`.
 
-Shim tests (`ap-runtime-shim`): register returns a surrogate whose hash the proxy accepts; an
-unknown revoke returns `204` without a proxy call; `/v1/hello` on the agent socket returns
-`404 unknown_operation`; oversized bodies return `413`.
-
-Pod checks: the validator checks that `runtime-key` is mounted only into `runtime`, that
-`session-plane` is not mounted into `agent`, and that the runtime UID differs from the agent UID.
-In the cluster run, check A has three parts. (i) `connect` to `session.sock` as UID 1000 fails.
-Because the agent container has no mount that shows the path, the expected error is "no such
-file" and not "permission denied". The permission bits are a second layer, and a unit test
-checks them against a socket in a setgid directory. (ii) `hello` on `runtime.sock` returns
-`404 unknown_operation`. (iii) A hello attempt from UID 1000 is refused with `proof_missing` or
-`404`, and it never reaches the proxy.
+Pod checks (run after the code): check A has three parts. (i) As UID 1000, `connect` to
+`session.sock` fails. The real manifest does not mount the path into the agent, so the expected
+error is "no such file". A test-only overlay mounts the volume at a probe path and expects
+"permission denied", which shows the mode bits work alone. (ii) As UID 1000, `hello` and the
+challenge on `runtime.sock` return `404 unknown_operation`. (iii) As UID 1000, a lease-lapse attempt
+is refused and never reaches the proxy.
 
 ## Compatibility
 
-- The hello body changes: `{"identity"}` alone is refused. `ap-client`, the matrix harness
-  (`tests/matrix/harness.py`) and any authority built on those must send the nonce and proof.
-  The openab-pty runtime is not in this repo. Its change is in a separate plan and is not part of
-  this run.
-- The proxy rolls out first and the runtime shim second. A pod with the old proxy keeps the old
-  hello path and does not have the proof, so the two must ship together.
-- The 12 h absolute TTL, resync `expired`, and the expiry store are unchanged.
+- The hello body changes. `{identity}` alone is refused. `ap-client`, the matrix harness
+  (`tests/matrix/harness.py`) and any other authority must send the nonce and proof. The
+  openab-pty runtime is outside this repo. Its change has its own plan.
+- Proxy and runtime shim ship together. A proxy without the gate accepts any hello. A shim without
+  the proof is refused by a gated proxy.
+- The 12 h absolute TTL, resync `expired` and the expiry store are unchanged.
 
 ## Not in this note
 
-- The openab-pty runtime split (it serves `runtime.sock` itself).
-- ECS. The proof check and the hello change are Kubernetes-only, as the session plane is.
-- Rate limits on `GET /v1/hello/challenge`. The nonce table is bounded, but a rate limit is
-  deferred.
+- The openab-pty runtime split. Its runtime serves `runtime.sock` itself.
+- ECS. The proof and the agent-runtime socket are Kubernetes-only, as the session plane is.
+- Rate limits on the challenge route. The nonce table is bounded, and a rate limit is deferred.

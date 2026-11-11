@@ -54,7 +54,7 @@ Implemented and tested in Phase 1:
 - ap-egress CONNECT allowlist; ap-egress resolves DNS itself and refuses private and IP-literal targets
 - File-backed credential store that re-reads a file when it changes
 - Kubernetes pod with per-UID iptables (Option A) and separate volumes ([pod.yaml](deploy/k8s/pod.yaml))
-- 39-row fail-closed matrix, run by the manual-dispatch CI workflow ([matrix](tests/matrix/matrix.py))
+- 41-row fail-closed matrix, run by the manual-dispatch CI workflow ([matrix](tests/matrix/matrix.py))
 
 ## Todos
 

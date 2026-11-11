@@ -54,7 +54,9 @@ pub fn bind_unix_socket(path: &Path, mode: u32) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Bind the session-plane socket. The agent container reaches it, so the mode is 0666.
+/// Bind the session-plane socket. Mode 0660, so only the owner and the group can connect. The
+/// group is the runtime's (UID 1002): the socket directory is setgid, and the runtime container is
+/// the only client. The agent UID is in neither.
 pub fn bind_session_socket(path: &Path) -> io::Result<UnixListener> {
-    bind_unix_socket(path, 0o666)
+    bind_unix_socket(path, 0o660)
 }

@@ -42,6 +42,28 @@ pub const CREDENTIAL: &str = "test-credential-0001";
 pub const CAP: u64 = 1024;
 pub const IDENTITY: &str = "pty-team-a";
 pub const ROUTE: &str = "upstream";
+/// The runtime seed for tests. The proxy config holds only its public key.
+pub const TEST_SEED: [u8; 32] = [7u8; 32];
+
+/// The public key of [`TEST_SEED`], standard base64, as the config's `runtime_pubkey` holds it.
+pub fn test_pubkey_b64() -> String {
+    let key = ed25519_dalek::SigningKey::from_bytes(&TEST_SEED);
+    base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        key.verifying_key().as_bytes(),
+    )
+}
+
+/// A hello proof for `identity` and `nonce`, signed with [`TEST_SEED`], as standard base64.
+pub fn sign_hello(identity: &str, nonce: &str) -> String {
+    use ed25519_dalek::Signer;
+    let key = ed25519_dalek::SigningKey::from_bytes(&TEST_SEED);
+    let msg = ap_core::session_wire::hello_message(identity, nonce);
+    base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        key.sign(&msg).to_bytes(),
+    )
+}
 
 /// `n` random bytes as lowercase hex.
 pub fn random_hex(n: usize) -> String {
@@ -162,7 +184,16 @@ pub fn buffer_sink() -> (AuditSink, Arc<Mutex<Vec<u8>>>) {
 }
 
 /// The policy text. One identity, one credential, one route, one grant for POST and GET on `/`.
+/// The identity carries [`test_pubkey_b64`] as its runtime key.
 pub fn policy_text(caller_sha: &str, port: u16) -> String {
+    policy_with_key(caller_sha, port, Some(&test_pubkey_b64()))
+}
+
+/// The policy text with `key` as the identity's `runtime_pubkey`, or none when `key` is `None`.
+pub fn policy_with_key(caller_sha: &str, port: u16, key: Option<&str>) -> String {
+    let key_line = key
+        .map(|k| format!("runtime_pubkey = \"{k}\"\n"))
+        .unwrap_or_default();
     format!(
         r#"version = 1
 
@@ -174,7 +205,7 @@ max_body_bytes = {CAP}
 
 [[identity]]
 name = "{IDENTITY}"
-caller_key_sha256 = "{caller_sha}"
+{key_line}caller_key_sha256 = "{caller_sha}"
 
 [[route]]
 name = "{ROUTE}"
@@ -229,14 +260,24 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    /// A fixture whose identity has [`test_pubkey_b64`] as its runtime key.
     pub fn new(tag: &str, up: &Upstream) -> Fixture {
+        Self::build(tag, up, Some(test_pubkey_b64()))
+    }
+
+    /// A fixture whose identity has no runtime key, so hello for it is refused.
+    pub fn without_runtime_key(tag: &str, up: &Upstream) -> Fixture {
+        Self::build(tag, up, None)
+    }
+
+    fn build(tag: &str, up: &Upstream, key: Option<String>) -> Fixture {
         let scratch = Scratch::new(tag);
         let root = scratch.path().to_path_buf();
         let caller = caller_key();
         let policy_path = root.join("policy.toml");
         std::fs::write(
             &policy_path,
-            policy_text(&sha256_hex(&caller), up.addr.port()),
+            policy_with_key(&sha256_hex(&caller), up.addr.port(), key.as_deref()),
         )
         .expect("write policy");
 

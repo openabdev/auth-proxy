@@ -53,7 +53,7 @@ async fn a_regular_file_at_the_socket_path_is_never_removed() {
 }
 
 #[tokio::test]
-async fn session_socket_is_0666_and_admin_socket_is_0600() {
+async fn session_socket_is_0660_and_admin_socket_is_0600() {
     let scratch = Scratch::new("modes");
     let session = scratch.path().join("session.sock");
     let admin = scratch.path().join("admin.sock");
@@ -61,6 +61,6 @@ async fn session_socket_is_0666_and_admin_socket_is_0600() {
     let _a = bind_unix_socket(&admin, 0o600).expect("admin bind");
     let mode =
         |p: &std::path::Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
-    assert_eq!(mode(&session), 0o666);
+    assert_eq!(mode(&session), 0o660);
     assert_eq!(mode(&admin), 0o600);
 }

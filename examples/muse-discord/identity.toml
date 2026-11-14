@@ -1,0 +1,77 @@
+# Example identity file: Muse as a caller, Discord as the upstream.
+#
+# This file follows the schema in crates/ap-core/src/config.rs and the layout of
+# deploy/k8s/identity-configmap.yaml. Copy it into your deployment, replace the marked values,
+# and keep the raw caller key and the bot token out of the file: the config holds only the
+# sha256 of the caller key, and the credential is a store reference.
+#
+# Status of the write path: the POST/PATCH/DELETE grants at the bottom are commented out on
+# purpose. Phase 1 policy has only allow/deny, so enabling them today would let the caller
+# write immediately. Enable them only together with the require_approval action proposed in
+# issue #5, so writes park until the owner approves them. See README.md in this directory.
+
+version = 1
+
+[listen]
+proxy = "127.0.0.1:18080"
+
+[[identity]]
+name = "muse"
+# Placeholder only -- no real or example digest is committed here. REPLACE
+# with the sha256 of your own generated caller key (see README.md,
+# "Generating keys"); the raw key (apk_...) is held by the caller only.
+caller_key_sha256 = "<CALLER_KEY_SHA256_HEX>"
+# runtime_pubkey = "..."  # base64 Ed25519 public key of the registrar that opens sessions for
+# this identity. For Muse the registrar is a component on the owner's device (issue #6). Hello
+# is refused until this is set.
+
+[[route]]
+name = "discord"
+host = "discord.com"
+# port, error_shape, surrogate_header and credential_header keep their defaults:
+# 443, generic, "authorization" and "authorization".
+# Known gap: the forwarder always sets the credential header as "Bearer <secret>"
+# (crates/ap-proxy/src/forward.rs), but Discord bot tokens must be sent as "Bot <token>".
+# A live Discord pilot needs a per-route credential scheme; see README.md, "Known gap".
+
+[[credential]]
+id = "discord-bot"
+# Store reference for the bot token, in the same syntax as the kiro example: the file-backed
+# store resolves k8s:<name>:<key> to the token material on the proxy host. The token itself
+# never appears in this file and is never sent to the caller.
+source = "k8s:auth-proxy-discord:bot_token"
+routes = ["discord"]
+
+# Reads: allowed. Path entries ending in "/" are prefixes (crates/ap-core/src/config.rs);
+# "/api/v10/channels/" covers channel reads and message history.
+[[grant]]
+identity = "muse"
+credential = "discord-bot"
+route = "discord"
+methods = ["GET"]
+paths = ["/api/v10/channels/", "/api/v10/guilds/"]
+
+# Writes: DO NOT enable before require_approval (issue #5) exists, unless you accept that
+# matching requests execute immediately. Path granularity note: config validation
+# (crates/ap-core/src/config.rs, valid_path) rejects any non-root grant path that does
+# not end in "/", so grants must use the prefix form below -- an exact create-message
+# path without the trailing slash would make the proxy refuse to load this config.
+# The prefix form also matches sub-paths below messages/ (e.g. message edits and
+# deletes under that channel), so scope and review it accordingly: one prefix grant
+# per channel the bot may post to. Replies use the same endpoint with a
+# message_reference in the JSON body; the policy layer cannot see the body, which
+# is exactly what the approval step reviews.
+#
+# [[grant]]
+# identity = "muse"
+# credential = "discord-bot"
+# route = "discord"
+# methods = ["POST"]
+# paths = ["/api/v10/channels/1111111111111111111/messages/"]  # REPLACE with the channel id; prefix form, trailing "/" required
+#
+# [[grant]]
+# identity = "muse"
+# credential = "discord-bot"
+# route = "discord"
+# methods = ["PATCH", "DELETE"]
+# paths = ["/api/v10/channels/1111111111111111111/messages/"]  # prefix: edits/deletes of own messages

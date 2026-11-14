@@ -1,11 +1,18 @@
-# Reference client: Muse as a caller, Discord as the upstream
+# Proposal + mock: Muse as a caller, Discord as the upstream
 
-This example implements the caller side of issue #6: a Muse custom-connector
-helper that reaches Discord only through auth-proxy, so every outbound call is
-policy-checked, audit-logged, and — once `require_approval` from issue #5
-exists — held for the owner's approval before it executes.
+**Scope: this is a proposal plus a mock, not a runnable end-to-end
+Muse -> Discord client today.** It sketches the caller side of issue #6 —
+a Muse custom-connector helper that would reach Discord only through
+auth-proxy, so every outbound call is policy-checked, audit-logged, and —
+once `require_approval` from issue #5 exists — held for the owner's
+approval before it executes.
 
-It is a reference, not a deployment. Nothing here touches the proxy core.
+It cannot reach Discord end-to-end as submitted, for reasons outside this
+directory: `runtime_pubkey` is unset in `identity.toml` (the session plane
+refuses hello until it is set), the forwarder always sends `Bearer` while
+Discord bot tokens need `Bot` (see "Known gap" below), and the example
+listener is loopback-only while the remote Muse transport is still open
+in #6. Nothing here touches the proxy core.
 
 ## Pieces
 
@@ -32,10 +39,10 @@ flowchart LR
 
 | File | What it is |
 |---|---|
-| `identity.toml` | Example proxy config: `muse` identity, `discord` route, credential reference, grants. |
-| `caller.py` | Reference caller (Python, stdlib only). Drop-in shape for a connector helper. |
-| `mock_proxy.py` | Stand-in proxy implementing the caller-facing contract, including the proposed approval flow. No real Discord call ever happens. |
-| `test_caller.py` | End-to-end tests of the caller against the mock: allow, park → approved, park → denied, park → expired, bad surrogate. |
+| `identity.toml` | Example proxy config (with placeholder digests only): `muse` identity, `discord` route, credential reference, grants. |
+| `caller.py` | Proposal caller (Python, stdlib only). Shape for a connector helper once #5/#6 settle. |
+| `mock_proxy.py` | **Contract sketch for #5, not the real proxy.** Stand-in implementing the sketched caller-facing contract, including the proposed approval flow. It omits canonicalization, policy evaluation, the registry, audit and forwarding. No real Discord call ever happens. |
+| `test_caller.py` | Tests of the caller against the mock only: allow, park → approved, park → denied, park → expired, bad surrogate. Green here does not verify the real proxy. |
 
 ## Wire protocol (as implemented by the proxy today)
 
@@ -53,13 +60,18 @@ From `crates/ap-client` and `crates/ap-proxy/src/pipeline.rs`:
   header, sets exactly one credential header with the real secret, and
   forwards upstream. The caller never sees the real credential.
 
-Approval flow (proposed in #5, implemented here as the reference contract):
-a write whose grant requires approval is answered `202` with a `request_id`
-instead of being forwarded. The outcome is caller-scoped —
+Approval flow (proposed in #5, sketched here — NOT an agreed contract):
+a write whose grant requires approval would be answered `202` with a
+`request_id` **and the proxy-owned marker header
+`X-Auth-Proxy-Approval: parked`** instead of being forwarded. The marker is
+what distinguishes a parked request from a legitimate upstream `202`:
+`caller.py` treats a bare `202` without that header as an ordinary upstream
+response and returns it as-is. The outcome is caller-scoped —
 `GET {base}/ap/<caller-key>/requests/<request-id>` — and reports `parked`,
 `executed` (with the upstream response), `denied`, or `expired`. `caller.py`
-polls it; against a Phase 1 proxy nothing returns `202` and that path never
-triggers.
+polls it. This shape (marker, result schema, poll authorization, expiry /
+revocation) is still open in #5; once #5 settles it, the caller and the mock
+must be re-derived from that spec rather than freezing this sketch.
 
 ## Generating keys
 
@@ -82,8 +94,11 @@ EOF
   approval. Uncomment the write grants only together with the
   `require_approval` action from #5 — or knowingly, accepting immediate
   execution.
-- Write grants are per channel: the create-message endpoint is one exact
-  path per channel id. Replies use the same endpoint with a
+- Write grants are per channel in prefix form: config validation rejects
+  non-root grant paths that do not end in `/`, so the grant is
+  `/api/v10/channels/<id>/messages/` — not the exact create-message path.
+  That prefix also matches sub-paths such as message edits under the same
+  channel, so scope it knowingly. Replies use the same endpoint with a
   `message_reference` in the JSON body. Policy cannot see the body; the
   approval step is what reviews it. That split is intentional.
 
@@ -95,11 +110,12 @@ must be sent as `Bot <token>`, so a live Discord upstream cannot authenticate
 against Phase 1 as shipped — for reads and writes alike. Storing `Bot <token>`
 as the secret does not help; the prefix is prepended unconditionally.
 
-Minimal change that unblocks this example (not in this PR, it touches the
-proxy core): a per-route credential scheme, e.g. `credential_scheme = "Bot"`,
-defaulting to `"Bearer"`, validated against a small allowlist. Everything
-else in this directory is ready to run against a proxy with that change and,
-for writes, with #5.
+Minimal change that would unblock the read path (not in this PR, it touches
+the proxy core): a per-route credential scheme, e.g.
+`credential_scheme = "Bot"`, defaulting to `"Bearer"`, validated against a
+small allowlist. Even with that change, this example would still need a set
+`runtime_pubkey`, a reachable (non-loopback-only) caller transport from #6,
+and — for writes — the settled #5 contract before it could run end-to-end.
 
 ## Sessions for a Muse caller
 
@@ -122,16 +138,20 @@ assumes the registrar split from the session plane design:
 ## Try it
 
 ```sh
-python3 test_caller.py        # full contract: allow / approve / deny / expire / refusal
-python3 mock_proxy.py &       # or run the mock yourself and drive caller.py by hand
+python3 test_caller.py        # mock-only contract: allow / approve / deny / expire / refusal
+                              # (generates ephemeral keys and passes them to the mock)
+python3 mock_proxy.py &       # or run the mock yourself: it prints fresh ephemeral
+                              # MOCK_CALLER_KEY / MOCK_SURROGATE values on startup
 AP_BASE=http://127.0.0.1:<port> \
-AP_CALLER_KEY=apk_c6267244721d31df7f7ab84ca4f5d16ad4d3ef9d6d53b06662cd7dac6704c26c \
-AP_SURROGATE=aps_ac5e3eca49b3e957da4c8709180f7f62a4336de3e14e68faf46df0735a016b03 \
+AP_CALLER_KEY=<apk_... printed by the mock, or your own generated key> \
+AP_SURROGATE=<aps_... printed by the mock, or your own generated surrogate> \
 python3 caller.py get-messages 2222222222222222222 5
 ```
 
-(The key material above is the worked example from this directory; the mock
-accepts exactly it.)
+(No reusable key material is committed in this directory. Keys are
+generated ephemerally — by `test_caller.py` via `secrets.token_hex(32)`, or
+by the mock at startup — and `identity.toml` carries only a placeholder
+digest.)
 
 ## Security notes
 

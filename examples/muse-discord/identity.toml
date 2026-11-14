@@ -17,9 +17,10 @@ proxy = "127.0.0.1:18080"
 
 [[identity]]
 name = "muse"
-# sha256 of the example caller key in README.md ("Generating keys"). REPLACE with the sha256 of
-# your own generated caller key; the raw key (apk_...) is held by the caller only.
-caller_key_sha256 = "653dd71c569fa41e649d86496f07a65cb092ba3c68e8b02ebb8f48a648f401e0"
+# Placeholder only -- no real or example digest is committed here. REPLACE
+# with the sha256 of your own generated caller key (see README.md,
+# "Generating keys"); the raw key (apk_...) is held by the caller only.
+caller_key_sha256 = "<CALLER_KEY_SHA256_HEX>"
 # runtime_pubkey = "..."  # base64 Ed25519 public key of the registrar that opens sessions for
 # this identity. For Muse the registrar is a component on the owner's device (issue #6). Hello
 # is refused until this is set.
@@ -51,17 +52,22 @@ methods = ["GET"]
 paths = ["/api/v10/channels/", "/api/v10/guilds/"]
 
 # Writes: DO NOT enable before require_approval (issue #5) exists, unless you accept that
-# matching requests execute immediately. Path granularity note: the create-message endpoint
-# is one exact path per channel, so one grant per channel the bot may post to. Replies use
-# the same endpoint with a message_reference in the JSON body; the policy layer cannot see
-# the body, which is exactly what the approval step reviews.
+# matching requests execute immediately. Path granularity note: config validation
+# (crates/ap-core/src/config.rs, valid_path) rejects any non-root grant path that does
+# not end in "/", so grants must use the prefix form below -- an exact create-message
+# path without the trailing slash would make the proxy refuse to load this config.
+# The prefix form also matches sub-paths below messages/ (e.g. message edits and
+# deletes under that channel), so scope and review it accordingly: one prefix grant
+# per channel the bot may post to. Replies use the same endpoint with a
+# message_reference in the JSON body; the policy layer cannot see the body, which
+# is exactly what the approval step reviews.
 #
 # [[grant]]
 # identity = "muse"
 # credential = "discord-bot"
 # route = "discord"
 # methods = ["POST"]
-# paths = ["/api/v10/channels/1111111111111111111/messages"]  # REPLACE with the channel id
+# paths = ["/api/v10/channels/1111111111111111111/messages/"]  # REPLACE with the channel id; prefix form, trailing "/" required
 #
 # [[grant]]
 # identity = "muse"

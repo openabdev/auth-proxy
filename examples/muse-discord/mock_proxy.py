@@ -1,21 +1,37 @@
 #!/usr/bin/env python3
-"""Mock auth-proxy for trying the reference caller without a deployment.
+"""Mock auth-proxy -- CONTRACT SKETCH for issue #5, NOT the real proxy.
 
-Implements just enough of the real proxy's caller-facing contract to exercise
-caller.py end to end:
+This mock is a contract sketch for the approval flow proposed in #5/#6.
+It is NOT a stand-in that verifies the real proxy: it deliberately omits
+canonicalization, policy evaluation, the session registry, audit and
+upstream forwarding (see "Simplifications" below). Tests that pass against
+this mock therefore say little about the real proxy in crates/ -- they only
+exercise caller.py against this sketched contract. Once #5 settles the
+approval contract, this mock should be re-derived from that spec, and a
+separate test should run the caller against the real proxy.
+
+Implements just enough of the caller-facing shape to exercise caller.py:
 
   * /ap/<caller-key>/<route><path> addressing and caller-key checking
     (sha256 compared, like crates/ap-proxy/src/pipeline.rs),
   * the surrogate in "Authorization: Bearer aps_..." form,
   * an allow-listed read answered with canned upstream data,
-  * the approval flow proposed in issues #5/#6: a write is parked with
-    "202 + request_id", and GET /ap/<caller-key>/requests/<request-id>
-    reports parked / executed / denied / expired.
+  * the proposed approval flow: a write is parked with
+    "202 + X-Auth-Proxy-Approval: parked + request_id", and
+    GET /ap/<caller-key>/requests/<request-id> reports
+    parked / executed / denied / expired. A bare 202 without the marker
+    header is NOT a parked request (caller.py returns it as upstream data).
 
 Simplifications, deliberately: one identity, one route, one registered
-surrogate, no canonicalization, no audit, and parked requests live in memory.
-The "upstream" is fabricated; no Discord call ever happens, and the mock
-"executes" a parked write by inventing the upstream response.
+surrogate, no canonicalization, no policy evaluation, no registry, no
+audit, and parked requests live in memory. The "upstream" is fabricated;
+no Discord call ever happens, and the mock "executes" a parked write by
+inventing the upstream response.
+
+No reusable credential material is committed in this file. The caller key
+and surrogate are ephemeral: test_caller.py generates them with
+secrets.token_hex(32) and passes them in via the environment; a manual run
+generates fresh ones at startup and prints them.
 
 Test-only admin endpoints (NOT part of the proposed contract; they stand in
 for the owner's approval plane):
@@ -24,23 +40,26 @@ for the owner's approval plane):
   POST /_mock/deny/<request-id>        deny it
 
 Environment:
-  MOCK_TTL   seconds a parked request awaits a decision (default 60)
-  MOCK_PORT  port to bind, 0 = ephemeral (default 0); the bound port is
-             printed as "MOCK_PORT=<port>" on stdout.
+  MOCK_TTL         seconds a parked request awaits a decision (default 60)
+  MOCK_PORT        port to bind, 0 = ephemeral (default 0); the bound port is
+                   printed as "MOCK_PORT=<port>" on stdout, followed by the
+                   ephemeral MOCK_CALLER_KEY / MOCK_SURROGATE in use.
+  MOCK_CALLER_KEY  apk_... caller key to accept (default: generated)
+  MOCK_SURROGATE   aps_... surrogate to accept  (default: generated)
 """
 
 import hashlib
 import json
 import os
 import re
+import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# The example key material from README.md. Only digests are kept for the
-# caller key, like the real config; the surrogate is registered by digest too.
-EXAMPLE_CALLER_KEY = "apk_c6267244721d31df7f7ab84ca4f5d16ad4d3ef9d6d53b06662cd7dac6704c26c"
-EXAMPLE_SURROGATE = "aps_ac5e3eca49b3e957da4c8709180f7f62a4336de3e14e68faf46df0735a016b03"
+# Ephemeral key material only -- nothing reusable is committed here.
+EXAMPLE_CALLER_KEY = os.environ.get("MOCK_CALLER_KEY") or ("apk_" + secrets.token_hex(32))
+EXAMPLE_SURROGATE = os.environ.get("MOCK_SURROGATE") or ("aps_" + secrets.token_hex(32))
 CALLER_SHA256 = hashlib.sha256(EXAMPLE_CALLER_KEY.encode()).hexdigest()
 SURROGATE_SHA256 = hashlib.sha256(EXAMPLE_SURROGATE.encode()).hexdigest()
 SURROGATE_FORM = re.compile(r"^Bearer (aps_[0-9a-f]{64})$")
@@ -52,11 +71,13 @@ _parked: dict[str, dict] = {}
 _counter = [0]
 
 
-def _json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
+def _json(handler: BaseHTTPRequestHandler, status: int, payload, extra_headers: dict | None = None) -> None:
     body = json.dumps(payload).encode()
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
+    for key, value in (extra_headers or {}).items():
+        handler.send_header(key, value)
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -114,7 +135,11 @@ class Handler(BaseHTTPRequestHandler):
                 "expires_at": time.monotonic() + TTL,
                 "result": None,
             }
-        return _json(self, 202, {"request_id": request_id, "status": "parked"})
+        # Proposed #5 marker: parked responses carry the proxy-owned header
+        # in addition to the 202 status, so a bare upstream 202 is not
+        # mistaken for a parked request.
+        return _json(self, 202, {"request_id": request_id, "status": "parked"},
+                     extra_headers={"X-Auth-Proxy-Approval": "parked"})
 
     def do_GET(self):  # noqa: N802
         parts = self.path.split("/", 4)
@@ -181,6 +206,8 @@ def main() -> None:
     port = int(os.environ.get("MOCK_PORT", "0"))
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"MOCK_PORT={server.server_address[1]}", flush=True)
+    print(f"MOCK_CALLER_KEY={EXAMPLE_CALLER_KEY}", flush=True)
+    print(f"MOCK_SURROGATE={EXAMPLE_SURROGATE}", flush=True)
     server.serve_forever()
 
 

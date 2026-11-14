@@ -1,28 +1,40 @@
 #!/usr/bin/env python3
-"""End-to-end tests: caller.py against mock_proxy.py.
+"""Tests: caller.py against mock_proxy.py ONLY (contract sketch for #5).
 
-Covers the four outcome paths of the caller contract:
+These tests exercise the mock, which is a contract sketch for the proposed
+#5 approval flow -- they do NOT run the caller against the real proxy and
+therefore do not verify canonicalization, policy evaluation, the session
+registry, audit or upstream forwarding in crates/. Green here means the
+caller follows the sketched contract, not that the real proxy behaves
+the same way.
+
+Covers the outcome paths of the sketched caller contract:
 
   1. allow-listed read executes immediately (200),
-  2. a write parks (202), the owner approves, the caller sees the executed
-     upstream response,
+  2. a write parks (marked 202), the owner approves, the caller sees the
+     executed upstream response,
   3. a write parks, the owner denies, the caller exits 3,
   4. a write parks, nobody decides, the request expires, the caller exits 4,
-  5. a bad surrogate is refused by the proxy (exit 2).
+  5. a bad surrogate is refused by the mock (exit 2).
+
+No reusable credential material is committed: the caller key and surrogate
+below are generated ephemerally per run with secrets.token_hex(32) and
+passed to the mock at startup via its environment.
 
 Run: python3 test_caller.py   (stdlib only, binds loopback ports only)
 """
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CALLER_KEY = "apk_c6267244721d31df7f7ab84ca4f5d16ad4d3ef9d6d53b06662cd7dac6704c26c"
-SURROGATE = "aps_ac5e3eca49b3e957da4c8709180f7f62a4336de3e14e68faf46df0735a016b03"
+CALLER_KEY = "apk_" + secrets.token_hex(32)
+SURROGATE = "aps_" + secrets.token_hex(32)
 CHANNEL = "2222222222222222222"
 
 failures = []
@@ -35,7 +47,8 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 def start_mock(ttl: str) -> tuple[subprocess.Popen, str]:
-    env = dict(os.environ, MOCK_TTL=ttl, MOCK_PORT="0")
+    env = dict(os.environ, MOCK_TTL=ttl, MOCK_PORT="0",
+               MOCK_CALLER_KEY=CALLER_KEY, MOCK_SURROGATE=SURROGATE)
     proc = subprocess.Popen(
         [sys.executable, os.path.join(HERE, "mock_proxy.py")],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, text=True,

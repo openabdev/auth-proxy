@@ -70,15 +70,32 @@ paths = ["/api/v10/channels/", "/api/v10/guilds/"]
 # whole-channel prefix below. Its blast radius is the entire channel: for
 # the granted methods it covers posting, editing, deleting, threads, pins,
 # reactions and every other operation under /api/v10/channels/<id>/.
-# Two of those deserve explicit notice:
+# Several of those deserve explicit notice:
 #   * The proxy cannot see message authorship. DELETE under this prefix
 #     removes ANY user's message when the bot holds Discord's Manage
 #     Messages permission; only Discord's own rules limit PATCH to the
-#     bot's own messages. Until matching is tightened, the real limit is
-#     the bot's Discord-side permissions -- grant it no Manage Messages.
+#     bot's own messages.
+#   * POST /api/v10/channels/<id>/messages/bulk-delete deletes 2 to 100
+#     messages in one call. It requires Manage Messages, so the
+#     no-Manage-Messages advice below covers it -- but it is named here
+#     because one approved-looking POST can erase a whole conversation.
+#   * POST /api/v10/channels/<id>/webhooks creates a webhook and returns
+#     its token. Anyone holding that token can post to the channel
+#     directly through Discord, with no proxy involvement at all, so
+#     policy, audit, surrogate revocation and the future #5 approval
+#     step no longer apply. This undoes the property the proxy exists
+#     to provide. It requires Manage Webhooks.
+#   * POST /api/v10/channels/<id>/invites creates invite links to the
+#     server. It requires Create Instant Invite.
+#   * DELETE/PATCH on the channel itself are NOT covered: the channel
+#     path /api/v10/channels/<id> has no trailing slash, so it does not
+#     start with this prefix.
 #   * Replies use the same create endpoint with a message_reference in
 #     the JSON body; the policy layer cannot see the body, which is
 #     exactly what the approval step (#5) would review.
+# Until matching is tightened, the real limit is the bot's Discord-side
+# permissions -- grant it no Manage Messages, no Manage Webhooks, and
+# no Create Instant Invite.
 #
 # Recommendation: leave writes disabled. Narrow write grants need
 # exact-path or segment-boundary matching in ap-core -- a separate core

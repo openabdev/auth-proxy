@@ -52,26 +52,42 @@ methods = ["GET"]
 paths = ["/api/v10/channels/", "/api/v10/guilds/"]
 
 # Writes: DO NOT enable before require_approval (issue #5) exists, unless you accept that
-# matching requests execute immediately. Path granularity note: config validation
-# (crates/ap-core/src/config.rs, valid_path) rejects any non-root grant path that does
-# not end in "/", so grants must use the prefix form below -- an exact create-message
-# path without the trailing slash would make the proxy refuse to load this config.
-# The prefix form also matches sub-paths below messages/ (e.g. message edits and
-# deletes under that channel), so scope and review it accordingly: one prefix grant
-# per channel the bot may post to. Replies use the same endpoint with a
-# message_reference in the JSON body; the policy layer cannot see the body, which
-# is exactly what the approval step reviews.
+# matching requests execute immediately.
+#
+# A narrow create-message grant is NOT expressible in Phase 1 -- do not try
+# the obvious shape. Config validation (crates/ap-core/src/config.rs,
+# valid_path) rejects any non-root grant path that does not end in "/", so
+# the exact create-message path cannot be granted at all; and the prefix
+# form "/api/v10/channels/<id>/messages/" can never match it either,
+# because Policy::evaluate is a raw starts_with (crates/ap-core/src/
+# policy.rs) and the create-message path "/api/v10/channels/<id>/messages"
+# has no trailing slash. That prefix would silently authorize only
+# sub-paths -- creating a thread from a message, crossposting -- i.e. it
+# allows everything EXCEPT the one write this example documents.
+# test_policy.py pins this down mechanically.
+#
+# The only Phase 1 grant that authorizes create-message today is the
+# whole-channel prefix below. Its blast radius is the entire channel: for
+# the granted methods it covers posting, editing, deleting, threads, pins,
+# reactions and every other operation under /api/v10/channels/<id>/.
+# Two of those deserve explicit notice:
+#   * The proxy cannot see message authorship. DELETE under this prefix
+#     removes ANY user's message when the bot holds Discord's Manage
+#     Messages permission; only Discord's own rules limit PATCH to the
+#     bot's own messages. Until matching is tightened, the real limit is
+#     the bot's Discord-side permissions -- grant it no Manage Messages.
+#   * Replies use the same create endpoint with a message_reference in
+#     the JSON body; the policy layer cannot see the body, which is
+#     exactly what the approval step (#5) would review.
+#
+# Recommendation: leave writes disabled. Narrow write grants need
+# exact-path or segment-boundary matching in ap-core -- a separate core
+# follow-up, like the per-route credential scheme, and not something this
+# example can fix from the config side.
 #
 # [[grant]]
 # identity = "muse"
 # credential = "discord-bot"
 # route = "discord"
-# methods = ["POST"]
-# paths = ["/api/v10/channels/1111111111111111111/messages/"]  # REPLACE with the channel id; prefix form, trailing "/" required
-#
-# [[grant]]
-# identity = "muse"
-# credential = "discord-bot"
-# route = "discord"
-# methods = ["PATCH", "DELETE"]
-# paths = ["/api/v10/channels/1111111111111111111/messages/"]  # prefix: edits/deletes of own messages
+# methods = ["POST", "PATCH", "DELETE"]
+# paths = ["/api/v10/channels/1111111111111111111/"]  # REPLACE with the channel id; whole-channel prefix -- see blast radius above

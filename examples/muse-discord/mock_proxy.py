@@ -18,9 +18,13 @@ Implements just enough of the caller-facing shape to exercise caller.py:
   * an allow-listed read answered with canned upstream data,
   * the proposed approval flow: a write is parked with
     "202 + X-Auth-Proxy-Approval: parked + request_id", and
-    GET /ap/<caller-key>/requests/<request-id> reports
-    parked / executed / denied / expired. A bare 202 without the marker
-    header is NOT a parked request (caller.py returns it as upstream data).
+    GET /ap/<caller-key>/_approval/<request-id> reports
+    parked / executed / denied / expired. The poll segment is "_approval":
+    "_" is rejected by valid_slug for route names, so it cannot collide
+    with a configured route. A bare 202 without the marker
+    header is NOT a parked request (caller.py returns it as upstream data);
+    the fabricated upstream answers POST /api/v10/async-accepted with a
+    bare 202 so tests can exercise that path.
 
 Simplifications, deliberately: one identity, one route, one registered
 surrogate, no canonicalization, no policy evaluation, no registry, no
@@ -38,6 +42,9 @@ for the owner's approval plane):
 
   POST /_mock/approve/<request-id>     approve and "execute" the parked write
   POST /_mock/deny/<request-id>        deny it
+  GET  /_mock/parked                   ids of currently parked requests, so
+                                       tests can discover ids instead of
+                                       sleeping and guessing them
 
 Environment:
   MOCK_TTL         seconds a parked request awaits a decision (default 60)
@@ -121,6 +128,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_caller(caller_key):
             return
         upstream_path = "/" + rest.split("?")[0]
+        if route == "discord" and upstream_path == "/api/v10/async-accepted":
+            # Fabricated upstream endpoint that legitimately answers a bare
+            # 202 (no approval marker): the caller must return it as data.
+            return _json(self, 202, {"status": "accepted", "via": "mock-upstream"})
         match = CHANNEL_MESSAGES.match(upstream_path) if route == "discord" else None
         if not match:
             return _json(self, 404, {"code": "route_unknown"})
@@ -142,13 +153,15 @@ class Handler(BaseHTTPRequestHandler):
                      extra_headers={"X-Auth-Proxy-Approval": "parked"})
 
     def do_GET(self):  # noqa: N802
+        if self.path.startswith("/_mock/"):
+            return self._admin_get(self.path)
         parts = self.path.split("/", 4)
         if len(parts) < 4 or parts[1] != "ap":
             return _json(self, 404, {"code": "route_unknown"})
         caller_key, route = parts[2], parts[3]
         if not self._check_caller(caller_key):
             return
-        if route == "requests":
+        if route == "_approval":
             request_id = parts[4] if len(parts) > 4 else ""
             return self._outcome(request_id)
         if route != "discord" or len(parts) < 5:
@@ -164,6 +177,13 @@ class Handler(BaseHTTPRequestHandler):
         return _json(self, 404, {"code": "route_unknown"})
 
     # -- approval outcome + test-only admin ------------------------------
+    def _admin_get(self, path: str) -> None:
+        if path.strip("/") == "_mock/parked":
+            with _lock:
+                ids = [rid for rid, e in _parked.items() if e["status"] == "parked"]
+            return _json(self, 200, {"parked": ids})
+        return _json(self, 404, {"code": "admin_unknown"})
+
     def _outcome(self, request_id: str) -> None:
         with _lock:
             entry = _parked.get(request_id)

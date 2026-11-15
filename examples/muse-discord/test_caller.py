@@ -15,7 +15,13 @@ Covers the outcome paths of the sketched caller contract:
      executed upstream response,
   3. a write parks, the owner denies, the caller exits 3,
   4. a write parks, nobody decides, the request expires, the caller exits 4,
-  5. a bad surrogate is refused by the mock (exit 2).
+  5. a bad surrogate is refused by the mock (exit 2),
+  6. a bare upstream 202 without the approval marker is returned as
+     ordinary data, not mistaken for a parked request.
+
+Parked request ids are discovered by polling the mock's test-only
+/_mock/parked endpoint -- never by sleeping a fixed time and guessing
+an id.
 
 No reusable credential material is committed: the caller key and surrogate
 below are generated ephemerally per run with secrets.token_hex(32) and
@@ -78,6 +84,22 @@ def admin(base: str, action: str, request_id: str) -> dict:
         return json.loads(resp.read())
 
 
+def wait_parked(base: str, known: set[str], timeout: float = 10.0) -> str | None:
+    """Poll the mock until a new request is parked; return its id."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base}/_mock/parked", timeout=5) as resp:
+                ids = json.loads(resp.read()).get("parked", [])
+        except Exception:
+            ids = []
+        fresh = [rid for rid in ids if rid not in known]
+        if fresh:
+            return fresh[0]
+        time.sleep(0.1)
+    return None
+
+
 def main() -> int:
     mock_a, base_a = start_mock("60")
     mock_b, base_b = start_mock("1.5")
@@ -88,9 +110,13 @@ def main() -> int:
               f"rc={res.returncode} out={res.stdout!r} err={res.stderr!r}")
 
         # 2. park -> approve -> executed
+        seen: set[str] = set()
         proc = run_caller(base_a, ["send", CHANNEL, "hello via approval", "--reply-to", "1570000000000000000"], wait=False)
-        time.sleep(1.0)
-        admin(base_a, "approve", "req_0001")
+        rid = wait_parked(base_a, seen)
+        check("write parks for approval", rid is not None)
+        if rid is not None:
+            seen.add(rid)
+            admin(base_a, "approve", rid)
         out, err = proc.communicate(timeout=30)
         body = json.loads(out) if out.strip() else {}
         check("approved write executes", proc.returncode == 0
@@ -100,8 +126,11 @@ def main() -> int:
 
         # 3. park -> deny
         proc = run_caller(base_a, ["send", CHANNEL, "never send this"], wait=False)
-        time.sleep(1.0)
-        admin(base_a, "deny", "req_0002")
+        rid = wait_parked(base_a, seen)
+        check("second write parks for approval", rid is not None)
+        if rid is not None:
+            seen.add(rid)
+            admin(base_a, "deny", rid)
         proc.communicate(timeout=30)
         check("denied write exits 3", proc.returncode == 3, f"rc={proc.returncode}")
 
@@ -113,6 +142,11 @@ def main() -> int:
         res = run_caller(base_a, ["get-messages", CHANNEL], surrogate="aps_" + "0" * 64)
         check("bad surrogate refused (exit 2)", res.returncode == 2 and "surrogate_unknown" in res.stderr,
               f"rc={res.returncode} err={res.stderr!r}")
+
+        # 6. bare upstream 202 (no approval marker) is ordinary data
+        res = run_caller(base_a, ["request", "POST", "/api/v10/async-accepted"])
+        check("bare upstream 202 returned as data", res.returncode == 0 and "accepted" in res.stdout,
+              f"rc={res.returncode} out={res.stdout!r} err={res.stderr!r}")
     finally:
         mock_a.terminate()
         mock_b.terminate()

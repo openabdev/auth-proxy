@@ -109,12 +109,26 @@ EOF
   crossposting. The only Phase 1 grant that authorizes `caller.py send`
   is the whole-channel prefix `/api/v10/channels/<id>/`, whose blast
   radius is every operation under that channel for the granted methods.
+  Three `POST` endpoints under that prefix are larger than posting and
+  are named explicitly: `POST /api/v10/channels/<id>/messages/bulk-delete`
+  deletes 2 to 100 messages in one call (requires Manage Messages, so
+  the permission advice below covers it); `POST /api/v10/channels/<id>/webhooks`
+  creates a webhook and returns its token — anyone holding that token
+  can post to the channel directly through Discord, with no proxy
+  involvement, so policy, audit, surrogate revocation and the future
+  #5 approval step no longer apply, which undoes the property the proxy
+  exists to provide (requires Manage Webhooks); and
+  `POST /api/v10/channels/<id>/invites` creates invite links to the
+  server (requires Create Instant Invite). `DELETE`/`PATCH` on the
+  channel itself are not covered, because `/api/v10/channels/<id>` has
+  no trailing slash and so does not start with the prefix.
   The proxy also cannot see message authorship: `DELETE` under that
   prefix removes any user's message if the bot holds Discord's Manage
   Messages permission, so until matching is tightened (exact-path or
   segment-boundary matching in ap-core — a separate core follow-up), the
   real limit is the bot's Discord-side permissions: grant it no Manage
-  Messages. `test_policy.py` pins all of this down mechanically. Replies
+  Messages, no Manage Webhooks, and no Create Instant Invite.
+  `test_policy.py` pins all of this down mechanically. Replies
   use the same create endpoint with a `message_reference` in the JSON
   body; policy cannot see the body — the approval step is what would
   review it.

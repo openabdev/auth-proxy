@@ -42,7 +42,8 @@ flowchart LR
 | `identity.toml` | Example proxy config (with placeholder digests only): `muse` identity, `discord` route, credential reference, grants. |
 | `caller.py` | Proposal caller (Python, stdlib only). Shape for a connector helper once #5/#6 settle. |
 | `mock_proxy.py` | **Contract sketch for #5, not the real proxy.** Stand-in implementing the sketched caller-facing contract, including the proposed approval flow. It omits canonicalization, policy evaluation, the registry, audit and forwarding. No real Discord call ever happens. |
-| `test_caller.py` | Tests of the caller against the mock only: allow, park → approved, park → denied, park → expired, bad surrogate. Green here does not verify the real proxy. |
+| `test_caller.py` | Tests of the caller against the mock only: allow, park → approved, park → denied, park → expired, bad surrogate, bare upstream 202. Green here does not verify the real proxy. |
+| `test_policy.py` | Mechanical check of the shipped `identity.toml` against a Python mirror of ap-core's `valid_path` + `Policy::evaluate`. Pins down why a narrow create-message grant is not expressible in Phase 1. |
 
 ## Wire protocol (as implemented by the proxy today)
 
@@ -67,9 +68,13 @@ a write whose grant requires approval would be answered `202` with a
 what distinguishes a parked request from a legitimate upstream `202`:
 `caller.py` treats a bare `202` without that header as an ordinary upstream
 response and returns it as-is. The outcome is caller-scoped —
-`GET {base}/ap/<caller-key>/requests/<request-id>` — and reports `parked`,
+`GET {base}/ap/<caller-key>/_approval/<request-id>` — and reports `parked`,
 `executed` (with the upstream response), `denied`, or `expired`. `caller.py`
-polls it. This shape (marker, result schema, poll authorization, expiry /
+polls it. The poll segment is `_approval`, deliberately not a route-style
+name: `parse_ap_path` treats the segment after the caller key as a route
+name, and route names must satisfy `valid_slug` (lowercase, digits, `-`),
+so a segment containing `_` can never collide with a configured route.
+This shape (marker, result schema, poll authorization, expiry /
 revocation) is still open in #5; once #5 settles it, the caller and the mock
 must be re-derived from that spec rather than freezing this sketch.
 
@@ -94,13 +99,25 @@ EOF
   approval. Uncomment the write grants only together with the
   `require_approval` action from #5 — or knowingly, accepting immediate
   execution.
-- Write grants are per channel in prefix form: config validation rejects
-  non-root grant paths that do not end in `/`, so the grant is
-  `/api/v10/channels/<id>/messages/` — not the exact create-message path.
-  That prefix also matches sub-paths such as message edits under the same
-  channel, so scope it knowingly. Replies use the same endpoint with a
-  `message_reference` in the JSON body. Policy cannot see the body; the
-  approval step is what reviews it. That split is intentional.
+- **A narrow create-message grant is not expressible in Phase 1.**
+  `valid_path` rejects any non-root grant path that does not end in `/`,
+  so the exact create-message path cannot be granted; and because
+  `Policy::evaluate` is a raw `starts_with`, the prefix
+  `/api/v10/channels/<id>/messages/` can never match the create-message
+  path `/api/v10/channels/<id>/messages` (no trailing slash) — it would
+  silently authorize only sub-paths such as thread creation and
+  crossposting. The only Phase 1 grant that authorizes `caller.py send`
+  is the whole-channel prefix `/api/v10/channels/<id>/`, whose blast
+  radius is every operation under that channel for the granted methods.
+  The proxy also cannot see message authorship: `DELETE` under that
+  prefix removes any user's message if the bot holds Discord's Manage
+  Messages permission, so until matching is tightened (exact-path or
+  segment-boundary matching in ap-core — a separate core follow-up), the
+  real limit is the bot's Discord-side permissions: grant it no Manage
+  Messages. `test_policy.py` pins all of this down mechanically. Replies
+  use the same create endpoint with a `message_reference` in the JSON
+  body; policy cannot see the body — the approval step is what would
+  review it.
 
 ## Known gap: credential scheme (`Bot` vs `Bearer`)
 
@@ -138,8 +155,11 @@ assumes the registrar split from the session plane design:
 ## Try it
 
 ```sh
-python3 test_caller.py        # mock-only contract: allow / approve / deny / expire / refusal
+python3 test_caller.py        # mock-only contract: allow / approve / deny / expire / refusal / bare 202
                               # (generates ephemeral keys and passes them to the mock)
+python3 test_policy.py        # identity.toml vs ap-core matching rules (mirror; no network)
+                              # Both test scripts are manual: nothing runs them in CI,
+                              # and green here does not verify the real proxy.
 python3 mock_proxy.py &       # or run the mock yourself: it prints fresh ephemeral
                               # MOCK_CALLER_KEY / MOCK_SURROGATE values on startup
 AP_BASE=http://127.0.0.1:<port> \

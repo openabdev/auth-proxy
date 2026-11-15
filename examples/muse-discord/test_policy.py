@@ -20,7 +20,10 @@ What it pins down:
      create-message request, whose path has no trailing slash -- while
      it WOULD authorize sub-paths such as threads and crossposts,
   4. the whole-channel prefix is the only Phase 1 grant shape that
-     authorizes create-message (with the blast radius that implies).
+     authorizes create-message -- and it also authorizes the
+     bulk-delete, webhooks and invites endpoints under the channel
+     (the blast radius that implies), while NOT authorizing
+     DELETE/PATCH on the channel path itself (no trailing slash).
 
 Run: python3 test_policy.py   (stdlib only, no network)
 """
@@ -101,6 +104,24 @@ def main() -> int:
     broad = [{"methods": ["POST"], "paths": [f"/api/v10/channels/{CHANNEL}/"]}]
     check("whole-channel prefix authorizes create-message",
           evaluate(broad, "POST", f"/api/v10/channels/{CHANNEL}/messages"))
+    # ...and its blast radius (round-3 F1): the same POST grant also
+    # authorizes destructive and proxy-escaping endpoints under the
+    # channel. bulk-delete needs Discord's Manage Messages permission
+    # and webhooks need Manage Webhooks, so the README/identity.toml
+    # advice is to grant the bot neither (nor Create Instant Invite).
+    check("whole-channel prefix also authorizes bulk-delete",
+          evaluate(broad, "POST", f"/api/v10/channels/{CHANNEL}/messages/bulk-delete"))
+    check("whole-channel prefix also authorizes webhook creation (mints a proxy-bypassing token)",
+          evaluate(broad, "POST", f"/api/v10/channels/{CHANNEL}/webhooks"))
+    check("whole-channel prefix also authorizes invite creation",
+          evaluate(broad, "POST", f"/api/v10/channels/{CHANNEL}/invites"))
+    # ...but not the channel itself: /api/v10/channels/<id> has no
+    # trailing slash, so it does not start with the prefix.
+    broad_rw = [{"methods": ["POST", "PATCH", "DELETE"], "paths": [f"/api/v10/channels/{CHANNEL}/"]}]
+    check("whole-channel prefix does NOT authorize DELETE on the channel itself",
+          not evaluate(broad_rw, "DELETE", f"/api/v10/channels/{CHANNEL}"))
+    check("whole-channel prefix does NOT authorize PATCH on the channel itself",
+          not evaluate(broad_rw, "PATCH", f"/api/v10/channels/{CHANNEL}"))
 
     print(f"\n{'ALL PASS' if not failures else 'FAILURES: ' + ', '.join(failures)}")
     return 1 if failures else 0

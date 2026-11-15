@@ -22,8 +22,11 @@ Approval flow (PROPOSED in issues #5 and #6, NOT yet implemented by the proxy
 and NOT yet agreed): a request whose grant says require_approval would be
 answered "202 Accepted" ONLY when it also carries the proxy-owned marker
 header "X-Auth-Proxy-Approval: parked", together with a request id. The
-caller then polls {AP_BASE}/ap/<caller-key>/requests/<request-id> until the
-parked request is executed, denied, or expired. A bare 202 without that
+caller then polls {AP_BASE}/ap/<caller-key>/_approval/<request-id> until
+the parked request is executed, denied, or expired. The poll segment is
+"_approval", not a route-style name: route names must satisfy valid_slug
+(crates/ap-core/src/config.rs -- lowercase, digits and "-" only), so a
+segment containing "_" can never collide with a configured route. A bare 202 without that
 header is treated as an ordinary upstream 202 response, not as a parked
 request -- upstream APIs may legitimately return 202 themselves. Once #5
 settles the marker, response schema, poll authorization and expiry /
@@ -52,6 +55,9 @@ import urllib.request
 
 KEY_RE = re.compile(r"^apk_[0-9a-f]{64}$")
 SURROGATE_RE = re.compile(r"^aps_[0-9a-f]{64}$")
+# A request id is interpolated into the poll URL, so it is restricted to a
+# fixed pattern: no slashes, dots or other path syntax.
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SNOWFLAKE_RE = re.compile(r"^\d+$")
 APPROVAL_HEADER = "x-auth-proxy-approval"
 APPROVAL_MARKER = "parked"
@@ -62,14 +68,15 @@ def die(message: str, code: int = 64) -> "SystemExit":
     raise SystemExit(code)
 
 
-def _parse_poll_value(name: str, default: str) -> float:
+def _parse_poll_value(name: str, default: str, positive: bool = False) -> float:
     raw = os.environ.get(name, default)
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        die(f"{name} must be a finite non-negative number, got {raw!r}")
-    if not math.isfinite(value) or value < 0:
-        die(f"{name} must be a finite non-negative number, got {raw!r}")
+        die(f"{name} must be a finite number, got {raw!r}")
+    if not math.isfinite(value) or value < 0 or (positive and value == 0):
+        kind = "positive" if positive else "non-negative"
+        die(f"{name} must be a finite {kind} number, got {raw!r}")
     return value
 
 
@@ -111,7 +118,8 @@ class Caller:
         self.surrogate = os.environ.get("AP_SURROGATE", "")
         self.route = os.environ.get("AP_ROUTE", "discord")
         self.poll_timeout = _parse_poll_value("AP_POLL_TIMEOUT", "300")
-        self.poll_interval = _parse_poll_value("AP_POLL_INTERVAL", "2")
+        # The interval must be positive: 0 would turn polling into a busy loop.
+        self.poll_interval = _parse_poll_value("AP_POLL_INTERVAL", "2", positive=True)
         if not KEY_RE.match(self.caller_key):
             die("AP_CALLER_KEY must be apk_ followed by 64 lowercase hex characters")
         if not SURROGATE_RE.match(self.surrogate):
@@ -151,11 +159,13 @@ class Caller:
             request_id = json.loads(text)["request_id"]
         except (ValueError, KeyError, TypeError):
             die(f"proxy answered a marked 202 without a request_id: {text}", 2)
+        if not isinstance(request_id, str) or not REQUEST_ID_RE.match(request_id):
+            die(f"proxy answered a marked 202 with a malformed request_id: {request_id!r}", 2)
         print(f"caller: parked for approval as {request_id}", file=sys.stderr)
         return self._await_outcome(request_id)
 
     def _await_outcome(self, request_id: str) -> tuple[int, str]:
-        poll_url = f"{self.base}/ap/{self.caller_key}/requests/{request_id}"
+        poll_url = f"{self.base}/ap/{self.caller_key}/_approval/{request_id}"
         deadline = time.monotonic() + self.poll_timeout
         while True:
             status, _headers, text = self._send("GET", poll_url, None)
@@ -165,10 +175,23 @@ class Caller:
                 outcome = json.loads(text)
             except ValueError:
                 die(f"unparsable outcome for {request_id}: {text}", 2)
+            if not isinstance(outcome, dict):
+                die(f"malformed outcome for {request_id}: not an object: {text}", 2)
             state = outcome.get("status")
             if state == "executed":
-                result = outcome.get("result") or {}
-                return int(result.get("status", 200)), json.dumps(result.get("body", ""))
+                # Fail closed: an executed outcome is only trusted when its
+                # result is an object with an integer status. Anything else
+                # is a proxy/contract error (exit 2), never a silent success.
+                result = outcome.get("result")
+                if not isinstance(result, dict):
+                    die(f"malformed executed outcome for {request_id}: result is not an object", 2)
+                result_status = result.get("status")
+                if not isinstance(result_status, int) or isinstance(result_status, bool):
+                    die(f"malformed executed outcome for {request_id}: result.status is not an integer", 2)
+                result_body = result.get("body", "")
+                if not isinstance(result_body, str):
+                    result_body = json.dumps(result_body)
+                return result_status, result_body
             if state == "denied":
                 print(f"caller: {request_id} was denied by the owner", file=sys.stderr)
                 raise SystemExit(3)

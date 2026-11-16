@@ -16,7 +16,8 @@
 #     (the base URLs carry the caller key) once into the agent HOME.
 #
 # Make the secret and the two hashes with deploy/k8s/interim-keygen.sh. Not applied by
-# this repository's CI and not yet run on a cluster: the first deployment is the test.
+# this repository's CI. Run once on a k3s test node against a stub upstream
+# (docs/verification/phase1-interim-k3s.md); the first real deployment is still to come.
 # The kiro-cps route host in policy.example.toml is still a placeholder.
 #
 # Pod Security Admission: the NET_ADMIN init container needs the namespace at

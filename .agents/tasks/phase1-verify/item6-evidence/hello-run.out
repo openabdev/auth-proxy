@@ -1,0 +1,207 @@
+[19:19:54.929Z driver] pod before:
+ap-agent   3/3   Running   0     26s   10.42.0.31   mini   <none>   <none>
+[19:19:55.041Z driver] no socket-mode override anywhere in the applied pod:
+0
+(count above must be 0)
+[19:19:55.156Z driver] proxy container env + args
+["--policy","/etc/auth-proxy/policy.toml"] env=
+[19:19:55.267Z driver] session socket as seen by the agent (numeric ids)
+uid=1000(ubuntu) gid=2000 groups=2000,4(adm),20(dialout),24(cdrom),25(floppy),27(sudo),29(audio),30(dip),44(video),46(plugdev)
+total 0
+srw-rw---- 1 1001 2000 0 Nov 16 19:19 session.sock
+ls: cannot access '/run/auth-proxy-admin': No such file or directory
+command terminated with exit code 2
+[19:19:55.429Z driver] ap-egress container: socket paths mounted?
+1002
+ls: cannot access '/run/auth-proxy': No such file or directory
+ls: cannot access '/run/auth-proxy-admin': No such file or directory
+command terminated with exit code 2
+[19:19:55.593Z driver] container ps (before kill)
+PID PPID UID CMDLINE
+1 0 1000 /usr/local/bin/hr-authority authority 
+11 1 1000 /usr/local/bin/hr-authority orphan 
+25 0 1000 /usr/local/bin/hr-authority ps 
+[19:21:08.876Z driver] orphan.log tail before kill
+19:21:06.876Z epoch=1794856866.876 pid=11 ORPHAN_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:07.878Z epoch=1794856867.878 pid=11 ORPHAN_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:08.882Z epoch=1794856868.882 pid=11 ORPHAN_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+[19:21:09.057Z driver] agent log before kill
+19:19:31.670Z epoch=1794856771.670 pid=1 AUTH_START Uid:	1000	1000	1000	1000 ppid=0
+19:19:31.671Z epoch=1794856771.671 pid=1 HELLO_WON authority token obtained (hello_retry returned)
+19:19:31.672Z epoch=1794856771.672 pid=1 REGISTERED session=sess-1794856771 gen=1 (surrogate in /tmp, test value)
+19:20:01.674Z epoch=1794856801.674 pid=1 RENEW Renewed
+19:20:31.676Z epoch=1794856831.676 pid=1 RENEW Renewed
+19:21:01.678Z epoch=1794856861.678 pid=1 RENEW Renewed
+[19:21:09.427Z driver] old surrogate file: /tmp/surrogate.sess-1794856771  container id: 467f2e8faa00
+[19:21:09.429Z driver] KILL agent container now (crictl stop --timeout 0 = SIGKILL to PID 1)
+[19:21:09.583Z driver] KILLED (crictl returned)
+[19:21:11.032Z driver] agent restartCount=1 state={"running":{"startedAt":"2026-11-16T19:21:09Z"}}
+ap-agent   3/3   Running   1 (2s ago)   102s   10.42.0.31   mini   <none>   <none>
+[19:21:11.141Z driver] container ps (after restart)
+PID PPID UID CMDLINE
+1 0 1000 /usr/local/bin/hr-authority authority 
+11 0 1000 /usr/local/bin/hr-authority ps 
+[19:21:11.313Z driver] orphan.log: lines after the kill? (tail)
+19:21:07.878Z epoch=1794856867.878 pid=11 ORPHAN_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:08.882Z epoch=1794856868.882 pid=11 ORPHAN_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+[19:21:11.483Z driver] start rival probe (uid 1000, exec'd, 50 s, hello every 5 s)
+[19:22:40.883Z driver] new PID 1 HELLO_WON observed by driver
+[19:22:40.888Z driver] probe output
+19:21:11.647Z epoch=1794856871.647 pid=27 PROBE_START Uid:	1000	1000	1000	1000 ppid=0
+19:21:11.647Z epoch=1794856871.647 pid=27 PROBE_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:16.650Z epoch=1794856876.650 pid=27 PROBE_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:21.651Z epoch=1794856881.651 pid=27 PROBE_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:26.653Z epoch=1794856886.653 pid=27 PROBE_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:31.656Z epoch=1794856891.656 pid=27 PROBE_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:36.658Z epoch=1794856896.658 pid=27 PROBE_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:41.661Z epoch=1794856901.661 pid=27 PROBE_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:46.663Z epoch=1794856906.663 pid=27 PROBE_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:51.666Z epoch=1794856911.666 pid=27 PROBE_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:21:56.668Z epoch=1794856916.668 pid=27 PROBE_HELLO status=Some(409) code=Some("authority_active") active=true err=session plane answered 409 authority_active: another authority's lease is live
+19:22:01.670Z epoch=1794856921.670 pid=27 PROBE_END never won
+[19:22:40.893Z driver] GET old surrogate through proxy listener (after lapse)
+19:22:41.047Z epoch=1794856961.047 pid=42 GET file=/tmp/surrogate.sess-1794856771 HTTP/1.1 400 Bad Request | body={"__type":"AccessDeniedException","message":"auth-proxy: Host must be exactly one listener authority (host_rejected)"}
+[19:22:41.055Z driver] agent log (new container)
+19:21:09.898Z epoch=1794856869.898 pid=1 AUTH_START Uid:	1000	1000	1000	1000 ppid=0
+19:22:39.919Z epoch=1794856959.919 pid=1 HELLO_WON authority token obtained (hello_retry returned)
+19:22:39.920Z epoch=1794856959.920 pid=1 REGISTERED session=sess-1794856959 gen=1 (surrogate in /tmp, test value)
+19:22:39.921Z epoch=1794856959.921 pid=1 SPAWNED_ORPHAN child pid=37
+[19:22:41.166Z driver] agent log (previous container)
+19:19:31.670Z epoch=1794856771.670 pid=1 AUTH_START Uid:	1000	1000	1000	1000 ppid=0
+19:19:31.671Z epoch=1794856771.671 pid=1 HELLO_WON authority token obtained (hello_retry returned)
+19:19:31.672Z epoch=1794856771.672 pid=1 REGISTERED session=sess-1794856771 gen=1 (surrogate in /tmp, test value)
+19:19:31.672Z epoch=1794856771.672 pid=1 SPAWNED_ORPHAN child pid=11
+19:20:01.674Z epoch=1794856801.674 pid=1 RENEW Renewed
+19:20:31.676Z epoch=1794856831.676 pid=1 RENEW Renewed
+19:21:01.678Z epoch=1794856861.678 pid=1 RENEW Renewed
+[19:22:41.280Z driver] proxy log (full)
+auth-proxy: ready, agent listener on 127.0.0.1:18080
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"ok","session":"-","status":201,"t":1794856771671}
+{"count":null,"generation":1,"hash8":"84103eb0","plane":"register","result":"ok","session":"sess-1794856771","status":201,"t":1794856771671}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856771673}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856772676}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856773678}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856774680}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856775682}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856776684}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856777687}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856778689}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856779692}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856780694}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856781696}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856782698}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856783701}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856784703}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856785706}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856786708}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856787710}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856788712}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856789714}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856790716}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856791718}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856792720}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856793723}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856794725}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856795727}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856796729}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856797731}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856798733}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856799735}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856800737}
+{"count":1,"generation":null,"hash8":"-","plane":"renew","result":"ok","session":"-","status":200,"t":1794856801673}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856801739}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856802741}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856803744}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856804746}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856805748}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856806750}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856807753}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856808755}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856809757}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856810759}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856811761}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856812763}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856813765}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856814767}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856815769}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856816771}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856817773}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856818777}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856819779}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856820781}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856821782}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856822784}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856823786}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856824786}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856825788}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856826790}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856827792}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856828794}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856829796}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856830798}
+{"count":1,"generation":null,"hash8":"-","plane":"renew","result":"ok","session":"-","status":200,"t":1794856831675}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856831800}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856832802}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856833804}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856834807}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856835809}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856836811}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856837813}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856838815}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856839817}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856840820}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856841822}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856842824}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856843827}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856844829}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856845831}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856846833}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856847835}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856848837}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856849839}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856850841}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856851843}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856852845}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856853848}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856854850}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856855852}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856856854}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856857856}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856858858}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856859861}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856860863}
+{"count":1,"generation":null,"hash8":"-","plane":"renew","result":"ok","session":"-","status":200,"t":1794856861678}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856861865}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856862867}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856863869}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856864871}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856865873}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856866875}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856867877}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856868882}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856869898}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856870900}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856871647}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856872902}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856876649}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856876904}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856881651}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856884906}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856886653}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856891656}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856896658}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856899908}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856901660}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856906663}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856911665}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856914910}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856916668}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856929912}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856944914}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"ok","session":"-","status":201,"t":1794856959918}
+{"count":null,"generation":1,"hash8":"3ca567c5","plane":"register","result":"ok","session":"sess-1794856959","status":201,"t":1794856959919}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856959924}
+{"count":null,"generation":null,"hash8":"-","plane":"hello","result":"authority_active","session":"-","status":409,"t":1794856960927}
+{"aws_target":"-","bytes_sent":null,"code":"host_rejected","decision":"deny","duration_ms":0,"generation":null,"identity":"-","method":"GET","path":"-","route":"-","session":"-","status":400,"t":1794856961047}
+[19:22:41.399Z driver] restart counts
+agent=1 ap-egress=0 proxy=0 

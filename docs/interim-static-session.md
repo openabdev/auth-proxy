@@ -59,7 +59,8 @@ Without the flag the proxy behaves exactly as before.
 5. Delete `./keys`.
 
 `deploy/k8s/pod-interim-static.yaml` differs from `deploy/k8s/pod.yaml` only in the items its
-header lists. It has not been applied to a cluster yet.
+header lists. It was applied once on a k3s test node with a stub upstream and a dummy credential
+(`docs/verification/phase1-interim-k3s.md`); no real model call has been made through it.
 
 ## Open items before the first deployment can run
 

@@ -15,6 +15,9 @@ Items 1 and 2 are done. The real-pod `hello` race (item 3) is still a **release 
    proxy up, confirm no agent-UID orphan survives and the fresh PID 1 wins `hello` after the 90 s
    lock. (The automated version is `crates/ap-proxy/tests/hello_race.rs`.) The interim static
    session does not call `hello`, but this gate is still required before release.
+   Measured [M] on a real k3s pod with a stand-in runtime, on `deploy/k8s/pod.yaml` with the shared group 2000 and
+   no socket-mode override: the 90 s lock held, only the fresh PID 1 won, no orphan survived
+   (`docs/verification/phase1-interim-k3s.md`). Re-run it with the real runtime before release.
 4. **PSA.** The `NET_ADMIN` init container needs Pod Security Admission `privileged` in the
    target namespace.
 5. **`kiro-cps` route host (open).** `deploy/k8s/policy.example.toml` carries a placeholder.

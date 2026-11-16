@@ -1,0 +1,177 @@
+
+### pod
+ap-agent   3/3   Running   0     38s   10.42.0.29   mini   <none>   <none>
+netinit exit=0 kiro-settings exit=0 
+
+### proxy start log
+auth-proxy: INTERIM static session enabled (Q1-A): one surrogate for the life of this process, 1 credential(s), NO per-session revocation (ends only when this process ends); see docs/interim-static-session.md
+auth-proxy: ready, agent listener on 127.0.0.1:18080
+
+### netinit log
+== iptables iptables v1.8.9 (nf_tables)
+-P OUTPUT ACCEPT
+-A OUTPUT -m owner --uid-owner 1000 -m conntrack --ctstate ESTABLISHED -j ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 18080 -m owner --uid-owner 1000 -j ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 3128 -m owner --uid-owner 1000 -j ACCEPT
+-A OUTPUT ! -o lo -m owner --uid-owner 1000 -j REJECT --reject-with icmp-port-unreachable
+== ip6tables
+-P OUTPUT ACCEPT
+-A OUTPUT -m owner --uid-owner 1000 -m conntrack --ctstate ESTABLISHED -j ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 18080 -m owner --uid-owner 1000 -j ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 3128 -m owner --uid-owner 1000 -j ACCEPT
+-A OUTPUT ! -o lo -m owner --uid-owner 1000 -j REJECT --reject-with icmp6-port-unreachable
+
+### kiro-settings init log
+
+### settings file in agent HOME (caller key masked)
+./.local/share/kiro-cli/run-receipts/.reaper.lock
+./.local/share/kiro-cli/telemetry-export-drops.lock
+./.local/share/kiro-cli/data.sqlite3
+./.kiro/settings/cli.json
+./.kiro/settings/cli.json.lock
+-- ./.kiro/settings
+cat: ./.kiro/settings: Is a directory
+
+-- ./.kiro/settings/cli.json
+{
+  "api.krs.service": {
+    "endpoint": "http://127.0.0.1:18080/ap/apk_<masked>/kiro-krs",
+    "region": "us-east-1"
+  },
+  "api.cps.service": {
+    "endpoint": "http://127.0.0.1:18080/ap/apk_<masked>/kiro-cps",
+    "region": "us-east-1"
+  }
+}
+
+### agent identity and env (surrogate masked)
+uid=1000(ubuntu) gid=1000(ubuntu) groups=1000(ubuntu),4(adm),20(dialout),24(cdrom),25(floppy),27(sudo),29(audio),30(dip),44(video),46(plugdev)
+HTTPS_PROXY=http://127.0.0.1:3128
+KIRO_API_KEY=aps_<masked>
+NO_PROXY=127.0.0.1,localhost
+KIRO_DISABLE_TELEMETRY=1
+
+### agent mounts: session socket path present?
+ls: cannot access '/run/auth-proxy': No such file or directory
+ls: cannot access '/run/auth-proxy-admin': No such file or directory
+
+######## T1 surrogate-only agent reaches the stub through the proxy
+
+### POST krs with surrogate, caller key in path
+status=400
+
+### POST cps with surrogate
+{"__type": "ValidationException", "message": "stub upstream"} status=400
+
+### negative: wrong surrogate
+{"__type":"AccessDeniedException","message":"auth-proxy: surrogate malformed (surrogate_malformed)"} status=403
+
+### negative: no surrogate
+{"__type":"AccessDeniedException","message":"auth-proxy: no surrogate presented (surrogate_missing)"} status=403
+
+### negative: wrong caller key
+{"__type":"AccessDeniedException","message":"auth-proxy: caller key not recognised (caller_rejected)"} status=403
+
+### stub log (what the upstream saw, summarised)
+1 x host=control-plane.placeholder.example:8443 POST / target=AmazonCodeWhispererService.GetProfile authorization_class=REAL
+1 x host=runtime.us-east-1.kiro.dev:8443 POST / target=AmazonCodeWhispererStreamingService.GenerateAssistantResponse authorization_class=REAL
+total requests at stub: 2
+last raw line header names:
+{"t": 1794856710.902, "host": "control-plane.placeholder.example:8443", "method": "POST", "path": "/", "xamz_target": "AmazonCodeWhispererService.GetProfile", "authorization_class": "REAL", "header_names": ["accept", "authorization", "content-length", "content-type", "host", "user-agent", "x-amz-target"], "body_len": 2}
+
+######## T2 real credential never in the agent container
+uid=1000 pid1-cmd=sleep infinity 
+proc environ+cmdline hits: 0
+procs scanned: 4
+filesystem files containing it (home tmp work etc run var opt usr/local root): 0
+secret volume mounted? ls: cannot access '/run/secrets': No such file or directory
+
+### mounts in agent container that mention secrets
+0
+
+### negative control: the same scan against the PROXY container's own secret file finds it? (proxy has no shell: skip) ; scan finds the value when planted in /tmp
+control hits: 1
+
+######## T3 direct egress and DNS refused for the agent UID
+
+$ curl -sS --noproxy '*' -m 8 -o /dev/null -w '%{http_code}' https://example.com
+curl: (6) Could not resolve host: example.com
+000command terminated with exit code 6
+exit=6 elapsed=0.16s
+
+$ curl -sS --noproxy '*' -m 8 --resolve example.com:443:93.184.216.34 -o /dev/null -w '%{http_code}' https://example.com
+curl: (7) Failed to connect to example.com port 443 after 0 ms: Couldn't connect to server
+000command terminated with exit code 7
+exit=7 elapsed=0.17s
+
+$ curl -sS --noproxy '*' -m 8 -k -o /dev/null -w '%{http_code}' https://10.43.51.98:8443/
+curl: (7) Failed to connect to 10.43.51.98 port 8443 after 0 ms: Couldn't connect to server
+000command terminated with exit code 7
+exit=7 elapsed=0.17s
+
+$ getent hosts github.com
+command terminated with exit code 2
+exit=2 elapsed=0.16s
+
+$ dig +time=2 +tries=1 @10.43.0.10 github.com
+;; global options: +cmd
+;; no servers could be reached
+command terminated with exit code 9
+exit=9 elapsed=0.19s
+
+$ nc -zv -w 3 1.1.1.1 443
+nc: connect to 1.1.1.1 port 443 (tcp) failed: Connection refused
+command terminated with exit code 1
+exit=1 elapsed=0.16s
+
+$ nc -zvu -w 3 10.43.0.10 53
+command terminated with exit code 1
+exit=1 elapsed=0.16s
+
+$ python3 -c "import socket;socket.create_connection(('8.8.8.8',53),3)"
+    sock.connect(sa)
+ConnectionRefusedError: [Errno 111] Connection refused
+command terminated with exit code 1
+exit=1 elapsed=0.24s
+
+### via ap-egress (allowlisted) vs not
+github.com via egress: 200
+example.com via egress: 000
+
+### agent UID cannot reach the proxy's other things: admin socket
+ls: cannot access '/run/auth-proxy-admin': No such file or directory
+command terminated with exit code 2
+
+######## T4 Q1-A interim session via kiro-cli (settings written by the init container)
+
+### kiro-cli version
+kiro-cli 2.37.0
+
+### kiro-cli settings read back (keys masked)
+{
+  "endpoint": "http://127.0.0.1:18080/ap/apk_<masked>/kiro-krs",
+  "region": "us-east-1"
+} (global)
+{
+  "endpoint": "http://127.0.0.1:18080/ap/apk_<masked>/kiro-cps",
+  "region": "us-east-1"
+} (global)
+
+### kiro-cli chat --no-interactive (stub upstream, timeout 90s)
+Error: Internal error (code -32603): Encountered an error in the response stream: stub upstream
+exit=0
+
+### stub log after kiro-cli (summarised)
+42 x host=control-plane.placeholder.example:8443 POST / target=AmazonCodeWhispererService.GetProfile authorization_class=REAL
+4 x host=control-plane.placeholder.example:8443 POST / target=KiroControlPlaneBearerService.ListAvailableModels authorization_class=REAL
+2 x host=runtime.us-east-1.kiro.dev:8443 POST / target=AmazonCodeWhispererStreamingService.GenerateAssistantResponse authorization_class=REAL
+total requests at stub: 48
+
+### proxy audit lines (summarised) and a leak scan
+1 x route=- target=- decision=deny code=caller_rejected session=- status=403
+42 x route=kiro-cps target=AmazonCodeWhispererService.GetProfile decision=allow code=ok session=interim-static status=400
+4 x route=kiro-cps target=KiroControlPlaneBearerService.ListAvailableModels decision=allow code=ok session=interim-static status=400
+1 x route=kiro-krs target=- decision=deny code=surrogate_malformed session=- status=403
+1 x route=kiro-krs target=- decision=deny code=surrogate_missing session=- status=403
+2 x route=kiro-krs target=AmazonCodeWhispererStreamingService.GenerateAssistantResponse decision=allow code=ok session=interim-static status=400
+audit lines containing apk_/aps_/real-dummy: 0

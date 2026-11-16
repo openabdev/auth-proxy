@@ -1,0 +1,27 @@
+### timeline from the proxy's own audit (ms, proxy clock)
+request audit: {'route': '-', 'decision': 'deny', 'code': 'host_rejected', 'session': '-', 'status': 400}
+request audit: {'route': 'kiro-krs', 'decision': 'deny', 'code': 'surrogate_revoked', 'session': '-', 'status': 403}
+request audit: {'route': 'kiro-krs', 'decision': 'deny', 'code': 'upstream_unavailable', 'session': 'sess-1794856959', 'status': 502}
+hello 201 times: [1794856771671, 1794856959918]
+renew times: [1794856801673, 1794856831675, 1794856861678]
+last renew before the new winner: 1794856861678
+lease 90s lapses at: 1794856951678
+409s after last renew: 54, last 409 at 1794856985980 (= last+124.3s)
+first 409 after last renew... early hellos won before lapse:  []
+winner 201 at 1794856959918 = last renew + 98.2s
+other plane event: register ok 201 1794856771671
+other plane event: register ok 201 1794856959919
+### old surrogate through the proxy after the lapse (as UID 1000 in agent)
+HTTP/1.1 403 Forbidden
+x-auth-proxy-error: surrogate_revoked
+content-type: application/x-amz-json-1.0
+x-amzn-errortype: AccessDeniedException
+content-length: 96
+date: Mon, 16 Nov 2026 19:23:06 GMT
+
+{"__type":"AccessDeniedException","message":"auth-proxy: surrogate revoked (surrogate_revoked)"}### new session's surrogate works? (live, goes to the stub: a 400 from the stub means admitted)
+new surrogate status=502
+hello 409 between last renew and the winner: 27 ; first at +0.2s, last at +83.2s after last renew
+hello 201 in that window: 0
+max gap between consecutive 409s (ms): 15002
+agent=1 ap-egress=0 proxy=0 

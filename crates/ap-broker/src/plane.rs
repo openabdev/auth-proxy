@@ -190,6 +190,19 @@ impl SessionPlane {
         g.registry.lookup(now, hash)
     }
 
+    /// Operator action (admin socket): revoke every registered session now and
+    /// return how many there were. The authority lock is left alone, so a live
+    /// authority that sees its sessions come back as `unknown` can still
+    /// re-register them; stopping the authority is what ends them for good.
+    pub fn revoke_all(&self) -> usize {
+        let now = self.clock.now();
+        let mut g = self.inner.lock().unwrap();
+        Self::tick(&mut g, now);
+        let n = g.registry.len();
+        g.registry.revoke_all();
+        n
+    }
+
     pub fn session_count(&self) -> usize {
         let now = self.clock.now();
         let mut g = self.inner.lock().unwrap();

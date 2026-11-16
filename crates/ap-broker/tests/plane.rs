@@ -787,3 +787,21 @@ fn authority_lease_is_configurable_for_tests_only_down_to_3_s() {
     clock.advance_secs(1);
     assert!(p.hello().is_ok());
 }
+
+#[test]
+fn revoke_all_drops_every_session_and_keeps_the_authority() {
+    let (_, p) = plane();
+    let tok = p.hello().unwrap().authority_token;
+    p.register(&tok, &policy(), &req("a", 1, 1, &["kiro"]))
+        .unwrap();
+    p.register(&tok, &policy(), &req("b", 1, 2, &["kiro"]))
+        .unwrap();
+    assert_eq!(p.revoke_all(), 2);
+    assert_eq!(p.session_count(), 0);
+    assert_eq!(p.lookup(&hash(1)), Err(Code::SurrogateRevoked));
+    assert!(p.authority_live(), "revoke_all must not free the lock");
+    assert_eq!(p.revoke_all(), 0);
+    // The live authority can register again.
+    p.register(&tok, &policy(), &req("a", 1, 1, &["kiro"]))
+        .unwrap();
+}

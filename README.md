@@ -1,5 +1,7 @@
 # auth-proxy
 
+![auth-proxy architecture: the agent holds only a surrogate; auth-proxy swaps in the real credential; ap-egress handles allowlisted CONNECT egress; the runtime registers surrogate hashes over the session plane.](docs/images/architecture.svg)
+
 ## How it works
 
 An agent never holds a real credential. It sends requests to a loopback proxy with a caller key

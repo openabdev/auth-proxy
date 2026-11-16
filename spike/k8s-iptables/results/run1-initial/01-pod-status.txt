@@ -1,0 +1,3 @@
+agent ready=true restarts=0
+ap-egress ready=true restarts=0
+proxy ready=true restarts=0

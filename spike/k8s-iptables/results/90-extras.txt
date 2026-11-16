@@ -1,0 +1,26 @@
+== ESTABLISHED negative control (pod netns, rule 1 removed, then restored)
+-- with rule 1:
+received b'reply-from-agent-uid\n'
+-- rule 1 removed:
+failed: TimeoutError timed out
+-- rule 1 restored:
+received b'reply-from-agent-uid\n'
+-P OUTPUT ACCEPT
+-A OUTPUT -m owner --uid-owner 1000 -m conntrack --ctstate ESTABLISHED -j ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 18080 -m owner --uid-owner 1000 -j ACCEPT
+
+== cluster DNS latency as the ap-egress UID (no iptables rule applies to UID 1002)
+command terminated with exit code 2
+pypi.org try1 getent+exec 6.17s
+pypi.org try2 getent+exec 2.18s
+files.pythonhosted.org try1 getent+exec 2.30s
+files.pythonhosted.org try2 getent+exec 0.19s
+index.crates.io try1 getent+exec 2.19s
+index.crates.io try2 getent+exec 0.17s
+registry.npmjs.org try1 getent+exec 0.24s
+registry.npmjs.org try2 getent+exec 0.17s
+github.com try1 getent+exec 0.30s
+github.com try2 getent+exec 0.17s
+pypi.org getaddrinfo 0.01s
+files.pythonhosted.org getaddrinfo 0.00s
+registry.npmjs.org getaddrinfo 0.00s

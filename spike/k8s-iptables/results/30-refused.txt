@@ -1,0 +1,18 @@
+uid=1000 HTTPS_PROXY=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost
+curl-example.com	rc=56	0.01s	curl: (56) CONNECT tunnel failed, response 403
+curl-api.github.com	rc=56	0.01s	curl: (56) CONNECT tunnel failed, response 403
+curl-kiro-route-host	rc=56	0.01s	curl: (56) CONNECT tunnel failed, response 403
+curl-github-port-80	rc=56	0.01s	curl: (56) CONNECT tunnel failed, response 403
+curl-github-ssh-22	rc=56	0.01s	curl: (56) CONNECT tunnel failed, response 403
+curl-ip-literal	rc=56	0.01s	curl: (56) CONNECT tunnel failed, response 403
+curl-ip-literal-1.1.1.1	rc=56	0.01s	curl: (56) CONNECT tunnel failed, response 403
+curl-loopback-target	rc=56	0.01s	curl: (56) CONNECT tunnel failed, response 403
+curl-localhost-target	rc=56	0.01s	curl: (56) CONNECT tunnel failed, response 403
+curl-plain-http-via-proxy	rc=0	0.01s	405
+git-clone-gitlab	rc=128	0.01s	fatal: unable to access 'https://gitlab.com/gitlab-org/gitlab-foss.git/': CONNECT tunnel failed, response 403
+-- raw CONNECT status lines
+CONNECT github.com:443	HTTP/1.1 200 Connection Established
+CONNECT example.com:443	HTTP/1.1 403 Forbidden
+CONNECT github.com:22	HTTP/1.1 403 Forbidden
+CONNECT <github.com-v4>:443	HTTP/1.1 403 Forbidden
+CONNECT 127.0.0.1:18080	HTTP/1.1 403 Forbidden

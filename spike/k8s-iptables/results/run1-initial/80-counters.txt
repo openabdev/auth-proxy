@@ -1,0 +1,4 @@
+== iptables -L OUTPUT -v -n -x (pod netns)
+nsenter: failed to parse pid: ''
+== ip6tables
+nsenter: failed to parse pid: ''

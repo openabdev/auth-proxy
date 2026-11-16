@@ -1,0 +1,15 @@
+2026-11-16T17:53:21Z
+uid=1000 HTTPS_PROXY=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost
+{"uid": 1000, "target": "tcp:127.0.0.1:18080", "result": "ok", "ms": 0}
+{"uid": 1000, "target": "tcp:127.0.0.1:3128", "result": "ok", "ms": 0}
+{"uid": 1000, "target": "tcp:127.0.0.1:18190", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "tcp:127.0.0.1:19999", "result": "ok", "ms": 0}
+{"uid": 1000, "target": "udp53:resolv", "result": "EPERM", "ms": 0}
+{"uid": 1000, "target": "tcp53:resolv", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "name:github.com", "result": "gaierror:-3:Temporary failure in name resolution", "ms": 2}
+{"uid": 1000, "target": "tcp:1.1.1.1:443", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "tcp:<github.com-v4>:443", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "tcp:10.42.0.1:22", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "tcp6:fd00:a9::1:80", "result": "ECONNREFUSED", "ms": 1039}
+{"uid": 1000, "target": "tcp6:2606:4700:4700::1111:443", "result": "ENETUNREACH", "ms": 0}
+{"uid": 1000, "target": "tcp:127.0.0.1:1", "result": "ECONNREFUSED", "ms": 0}

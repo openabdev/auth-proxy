@@ -1,0 +1,14 @@
+== iptables iptables v1.8.9 (nf_tables)
+-P OUTPUT ACCEPT
+-A OUTPUT -m owner --uid-owner 1000 -m conntrack --ctstate ESTABLISHED -j ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 18080 -m owner --uid-owner 1000 -j ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 3128 -m owner --uid-owner 1000 -j ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 18190 -m owner --uid-owner 1000 -j REJECT --reject-with tcp-reset
+-A OUTPUT ! -o lo -m owner --uid-owner 1000 -j REJECT --reject-with icmp-port-unreachable
+== ip6tables
+-P OUTPUT ACCEPT
+-A OUTPUT -m owner --uid-owner 1000 -m conntrack --ctstate ESTABLISHED -j ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 18080 -m owner --uid-owner 1000 -j ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 3128 -m owner --uid-owner 1000 -j ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 18190 -m owner --uid-owner 1000 -j REJECT --reject-with tcp-reset
+-A OUTPUT ! -o lo -m owner --uid-owner 1000 -j REJECT --reject-with icmp6-port-unreachable

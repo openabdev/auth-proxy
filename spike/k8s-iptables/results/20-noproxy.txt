@@ -1,0 +1,12 @@
+uid=1000 HTTPS_PROXY=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost
+http-proxy-env-with-NO_PROXY	rc=0	0.01s	404
+http-proxy-env-without-NO_PROXY	rc=0	0.01s	405
+-- auth-proxy body with NO_PROXY (agent -> loopback P):
+HTTP/1.1 403 Forbidden
+x-auth-proxy-error: surrogate_missing
+content-type: application/x-amz-json-1.0
+x-amzn-errortype: AccessDeniedException
+content-length: 101
+date: Mon, 16 Nov 2026 17:55:49 GMT
+
+{"__type":"AccessDeniedException","message":"auth-proxy: no surrogate presented (surrogate_missing)"}

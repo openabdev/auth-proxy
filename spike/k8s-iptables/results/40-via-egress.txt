@@ -1,0 +1,11 @@
+uid=1000 HTTPS_PROXY=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost
+curl-github	rc=0	0.35s	200
+curl-npm-registry	rc=0	2.25s	200
+curl-pypi	rc=0	3.64s	200
+curl-pythonhosted	rc=0	3.39s	404
+curl-crates-index	rc=0	0.59s	200
+curl-crates-static	rc=0	0.70s	404
+git-clone	rc=0	0.55s	Cloning into 'Hello-World'...
+npm-install	rc=0	1.08s	added 1 package in 612ms
+pip-download	rc=0	8.52s	Successfully downloaded six
+cargo-fetch	rc=0	1.25s	  Downloaded itoa v1.0.19

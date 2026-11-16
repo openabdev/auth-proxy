@@ -1,0 +1,15 @@
+uid=1000 HTTPS_PROXY=http://127.0.0.1:3128 NO_PROXY=127.0.0.1,localhost
+curl-noproxy-name	rc=6	0.01s	curl: (6) Could not resolve host: github.com
+curl-noproxy-name-2	rc=6	0.01s	curl: (6) Could not resolve host: github.com
+curl-noproxy-ip	rc=7	0.01s	curl: (7) Failed to connect to github.com port 443 after 0 ms: Couldn't connect to server
+wget-noproxy	rc=4	0.03s	
+git-clone-noproxy	rc=128	0.02s	fatal: unable to access 'https://github.com/octocat/Hello-World.git/': Could not resolve host: github.com
+python-urllib-noproxy	rc=1	0.08s	urllib.error.URLError: <urlopen error [Errno -3] Temporary failure in name resolution>
+pip-noproxy-retries0	rc=1	0.37s	ERROR: No matching distribution found for six
+pip-noproxy-default-retries	rc=1	7.89s	ERROR: No matching distribution found for six
+npm-noproxy	rc=1	70.66s	npm ERR!     /tmp/<mktemp>/_logs/2026-11-16T17_56_21_652Z-debug-0.log
+cargo-noproxy	rc=101	10.88s	  [6] Couldn't resolve host name (Could not resolve host: index.crates.io)
+getent-name	rc=2	0.00s	
+nc-direct-ip	rc=1	0.00s	nc: connect to <github.com-v4> port 443 (tcp) failed: Connection refused
+nc-direct-1.1.1.1	rc=1	0.00s	nc: connect to 1.1.1.1 port 443 (tcp) failed: Connection refused
+dig-udp	rc=9	0.02s	;; no servers could be reached

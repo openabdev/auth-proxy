@@ -1,0 +1,26 @@
+# Test-only runtime images for the Phase 1 K8s combined iptables verification.
+# One base with the two binaries plus the tools the agent-side tests need, and three targets
+# (proxy, egress, agent) that only differ by ENTRYPOINT, so deploy/k8s/pod.yaml can be applied with
+# nothing but image names substituted. Not a release artifact: release images are static musl
+# builds (docs/operations.md). The binaries come from `cargo build --release -p ap-proxy -p
+# ap-egress` on the x86_64 test node (glibc, Ubuntu 24.04), copied into ./bin.
+#   docker build --platform linux/amd64 --target proxy  -f Containerfile.runtime -t ap-verify/proxy:dev  .
+#   docker build --platform linux/amd64 --target egress -f Containerfile.runtime -t ap-verify/egress:dev .
+#   docker build --platform linux/amd64 --target agent  -f Containerfile.runtime -t ap-verify/agent:dev  .
+FROM docker.io/library/ubuntu:24.04 AS base
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates curl wget git python3 python3-pip nodejs npm cargo procps iproute2 dnsutils netcat-openbsd \
+ && rm -rf /var/lib/apt/lists/*
+COPY bin/ /usr/local/bin/
+COPY probe.py /opt/ap/
+RUN chmod 755 /usr/local/bin/* /opt/ap/*
+
+FROM base AS proxy
+ENTRYPOINT ["/usr/local/bin/auth-proxy"]
+
+FROM base AS egress
+ENTRYPOINT ["/usr/local/bin/ap-egress"]
+
+FROM base AS agent
+CMD ["sleep", "infinity"]

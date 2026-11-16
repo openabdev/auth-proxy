@@ -1,0 +1,14 @@
+== proxy UID (1001)
+uid=1001 HTTPS_PROXY=unset NO_PROXY=unset
+{"uid": 1001, "target": "name:github.com", "result": "ok:<github.com-v4>", "ms": 4137}
+{"uid": 1001, "target": "udp53:resolv", "result": "ok:answer", "ms": 1}
+{"uid": 1001, "target": "tcp:1.1.1.1:443", "result": "ok", "ms": 4}
+{"uid": 1001, "target": "tcp:<github.com-v4>:443", "result": "ok", "ms": 8}
+{"uid": 1001, "target": "tcp6:2606:4700:4700::1111:443", "result": "ENETUNREACH", "ms": 0}
+== ap-egress UID (1002)
+uid=1002 HTTPS_PROXY=unset NO_PROXY=unset
+{"uid": 1002, "target": "name:github.com", "result": "ok:<github.com-v4>", "ms": 2}
+{"uid": 1002, "target": "udp53:resolv", "result": "ok:answer", "ms": 0}
+{"uid": 1002, "target": "tcp:1.1.1.1:443", "result": "ok", "ms": 6}
+{"uid": 1002, "target": "tcp:<github.com-v4>:443", "result": "ok", "ms": 8}
+{"uid": 1002, "target": "tcp6:2606:4700:4700::1111:443", "result": "ENETUNREACH", "ms": 0}

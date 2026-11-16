@@ -1,0 +1,16 @@
+== iptables -L OUTPUT -v -n -x (pod netns)
+Chain OUTPUT (policy ACCEPT 0 packets, 0 bytes)
+    pkts      bytes target     prot opt in     out     source               destination         
+     502    58030 ACCEPT     0    --  *      *       0.0.0.0/0            0.0.0.0/0            owner UID match 1000 ctstate ESTABLISHED
+       7      420 ACCEPT     6    --  *      lo      0.0.0.0/0            0.0.0.0/0            tcp dpt:18080 owner UID match 1000
+      61     3660 ACCEPT     6    --  *      lo      0.0.0.0/0            0.0.0.0/0            tcp dpt:3128 owner UID match 1000
+       2      120 REJECT     6    --  *      lo      0.0.0.0/0            0.0.0.0/0            tcp dpt:18190 owner UID match 1000 reject-with tcp-reset
+     100     8370 REJECT     0    --  *      !lo     0.0.0.0/0            0.0.0.0/0            owner UID match 1000 reject-with icmp-port-unreachable
+== ip6tables
+Chain OUTPUT (policy ACCEPT 0 packets, 0 bytes)
+    pkts      bytes target     prot opt in     out     source               destination         
+       0        0 ACCEPT     0    --  *      *       ::/0                 ::/0                 owner UID match 1000 ctstate ESTABLISHED
+       0        0 ACCEPT     6    --  *      lo      ::/0                 ::/0                 tcp dpt:18080 owner UID match 1000
+       0        0 ACCEPT     6    --  *      lo      ::/0                 ::/0                 tcp dpt:3128 owner UID match 1000
+       0        0 REJECT     6    --  *      lo      ::/0                 ::/0                 tcp dpt:18190 owner UID match 1000 reject-with tcp-reset
+       4      320 REJECT     0    --  *      !lo     ::/0                 ::/0                 owner UID match 1000 reject-with icmp6-port-unreachable

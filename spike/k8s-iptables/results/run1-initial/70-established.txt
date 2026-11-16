@@ -1,0 +1,2 @@
+inbound to agent-UID listener (node -> pod), answered under the OUTPUT rules:
+b'reply-from-agent-uid\n'

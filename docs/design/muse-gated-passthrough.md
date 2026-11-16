@@ -324,7 +324,7 @@ a locally generated status plus `X-AP-Decision`, and Discord is not expected to 
 | `Upgrade` | 501 | `denied` | `upgrade_not_supported` | nothing |
 | Held body over cap, or declared allowed body over cap | 413 | `denied` | `body_too_large` | nothing |
 | `hold_secs` elapsed with no decision | 410 | `expired` | `expired` | nothing |
-| Gate cannot decide, or fails before the first upstream request byte: policy unavailable, hold table full, per-identity cap, cooldown, superseded, shutting down, dropped on reload, body-read timeout, upstream connect failure | 503 | `unavailable` | `policy_unavailable`, `table_full`, `identity_cap`, `cooldown`, `superseded`, `shutdown`, `dropped_on_reload`, `body_read_timeout`, `connect_failed`, `audit_unavailable` (proposed, section 3.9) | nothing |
+| Gate cannot decide, or fails before the first upstream request byte: policy unavailable, hold table full, per-identity cap, cooldown, superseded, shutting down, dropped on reload, body-read timeout, upstream connect failure | 503 | `unavailable` | `policy_unavailable`, `table_full`, `identity_cap`, `cooldown`, `superseded`, `shutdown`, `dropped_on_reload`, `body_read_timeout`, `connect_failed`, `audit_unavailable` (section 3.9) | nothing |
 | Allowed or approved and forwarded | Discord's own | whatever Discord sends | n/a | the request |
 | Failure after the first upstream request byte (reset, stalled or undeclared oversized allowed body, upstream error) | none: the client connection is closed | none | n/a | possibly the request |
 
@@ -480,10 +480,10 @@ passthrough mode adds fields and transitions, and keeps that property:
 - The `forward_started` record is written before the upstream request is sent, so the record precedes
   the action [I issue #5 comment 1, point 1]. Phase 1's audit sink is stdout and a failed write does not
   refuse a request [I phase1.md section 4, "Audit write failure"]; the PoC keeps that behaviour for allowed reads.
-  **Proposed stage 2 requirement, for owner confirmation, not a settled decision:** on held (write) routes a
+  **Stage 2 requirement (settled, owner decision):** on held (write) routes a
   failed `forward_started` audit write refuses the request (503 `unavailable`, code `audit_unavailable`,
   nothing sent upstream), so no write executes without a record. This reverses the earlier cut of the
-  fallible-sink requirement for writes only; open question 13 asks.
+  fallible-sink requirement for writes only.
 
 ## 4. Trust model changes (open points b and c)
 
@@ -816,7 +816,7 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
 27. **Refusal table:** a table-driven test produces every row of section 3.5 and asserts status,
     `X-AP-Decision` and `code` for each.
 28. **Framing and allowed-body boundary:** stage 1 items 12 and 13 repeated in the stage 2 build.
-29. **Audit failure on writes (if confirmed, question 13):** with the audit sink failing, a held request is
+29. **Audit failure on writes:** with the audit sink failing, a held request is
     refused 503 `unavailable` and the mock upstream records nothing; an allowed read still passes.
 
 ## 8. Open questions for the owner
@@ -856,8 +856,8 @@ Open questions 1 to 4 are stage 1 blockers.
 12. **Does Muse send request bodies compressed or with a non-JSON content type?** Attachments and multipart
     are out of scope for the pilot (review comments); they are refused by the held-body cap. Whether Muse
     compresses bodies is still measured in stage 1.
-13. **Audit failure on writes.** Proposed stage 2 requirement (section 3.9): a failed `forward_started`
-    audit write on a held route refuses the request. Does the owner confirm?
+13. **Audit failure on writes.** Answered by the owner: a failed `forward_started` audit write on a held
+    route refuses the request (503 `unavailable`, nothing sent); reads keep Phase 1 behaviour (section 3.9).
 
 ## 9. Evidence and method
 

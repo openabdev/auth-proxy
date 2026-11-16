@@ -42,7 +42,7 @@ flowchart LR
 | `identity.toml` | Example proxy config (with placeholder digests only): `muse` identity, `discord` route, credential reference, grants. |
 | `caller.py` | Proposal caller (Python, stdlib only). Shape for a connector helper once #5/#6 settle. |
 | `mock_proxy.py` | **Contract sketch for #5, not the real proxy.** Stand-in implementing the sketched caller-facing contract, including the proposed approval flow. It omits canonicalization, policy evaluation, the registry, audit and forwarding. No real Discord call ever happens. |
-| `test_caller.py` | Tests of the caller against the mock only: allow, park → approved, park → denied, park → expired, bad surrogate, bare upstream 202. Green here does not verify the real proxy. |
+| `test_caller.py` | Tests of the caller against the mock only: allow, park → approved, park → denied, park → expired, bad surrogate, bare upstream 202, redirect not followed. Green here does not verify the real proxy. |
 | `test_policy.py` | Mechanical check of the shipped `identity.toml` against a Python mirror of ap-core's `valid_path` + `Policy::evaluate`. Pins down why a narrow create-message grant is not expressible in Phase 1. |
 
 ## Wire protocol (as implemented by the proxy today)
@@ -169,7 +169,7 @@ assumes the registrar split from the session plane design:
 ## Try it
 
 ```sh
-python3 test_caller.py        # mock-only contract: allow / approve / deny / expire / refusal / bare 202
+python3 test_caller.py        # mock-only contract: allow / approve / deny / expire / refusal / bare 202 / redirect not followed
                               # (generates ephemeral keys and passes them to the mock)
 python3 test_policy.py        # identity.toml vs ap-core matching rules (mirror; no network)
                               # Both test scripts are manual: nothing runs them in CI,
@@ -199,3 +199,10 @@ digest.)
   surrogate, or a missing runtime key is a refusal, never a fallback to a
   direct upstream call. `caller.py` has no direct-to-Discord code path at
   all.
+- The surrogate must not leave the proxy boundary in the caller either:
+  `caller.py` uses an explicit opener with redirect following disabled
+  and ambient `http_proxy`/`https_proxy` ignored (`ProxyHandler({})`), so
+  an upstream 3xx is treated as an error (exit 2) instead of resending the
+  `Authorization` header to the `Location` host. This mirrors the proxy's
+  own `reqwest::redirect::Policy::none()`. `test_caller.py` pins it with a
+  mock 302 to an external counting server and asserts no second request.

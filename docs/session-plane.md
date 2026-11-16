@@ -71,3 +71,9 @@ keys without expiry, so only the session absolute TTL applies as an upper bound.
 Every call writes an audit line with the session id, generation, a short hash prefix and the
 result. The surrogate and the authority token never appear. No log line contains the
 `/ap/<caller-key>` prefix; see `docs/operations.md`.
+
+## Status
+
+Q1-B is the accepted design and new work on this protocol is frozen after the over-design
+council. The first Kubernetes deployment can run without it, on the interim static session
+(`docs/interim-static-session.md`), which has no per-session revocation.

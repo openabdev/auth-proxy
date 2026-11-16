@@ -56,7 +56,8 @@ A policy that becomes invalid after startup does not stop the process: requests 
 
 After a proxy restart sessions are unknown until the authority's next renew (at most 30 s)
 resyncs them. In that window requests get `surrogate_unknown` (403). Plan for up to 30 s of
-refusals after each proxy restart. The authority token hash is persisted in `--state-dir`
+refusals after each proxy restart. (The interim static session has no such gap: it is fixed at
+start.) The authority token hash is persisted in `--state-dir`
 (`proxy-state` volume), so the authority does not need a new `hello`.
 
 ## Authority container restart
@@ -76,12 +77,37 @@ Release binaries are static musl builds. The musl release job is documented, not
 repository yet: `cargo build --release --target x86_64-unknown-linux-musl -p ap-proxy -p
 ap-egress` on a Linux host with the musl target and linker installed.
 
+## Interim static session (Q1-A)
+
+The first end-to-end deployment can run on one session registered for the pod's lifetime
+(`--interim-static-surrogate-sha256`). **It has no per-session revocation, and the owner accepted
+that for the interim period.** The surrogate stops working only when the proxy process stops.
+`/admin/revoke-all` and the session plane do not end it. See `docs/interim-static-session.md`.
+Q1-B stays the accepted design; new work on it is frozen.
+
+## Admin socket
+
+`/admin/status` and `/admin/revoke-all` stay for Phase 1. The council split on removing them; they
+are kept because tests depend on them (`session_plane.rs` counts sessions through `status` and
+tests `revoke-all`; the fixture and the matrix harness start the proxy with an admin socket).
+Nothing in the pre-release checklist needs them. The socket lives in a volume only the proxy
+container mounts and is never merged into the agent-mounted session socket. Pod deletion is still
+the way to revoke everything, and readiness can probe the agent listener.
+
+## Frozen
+
+- The `Broker` trait and `ap-client` stay at the Unix socket client. No networked-broker work.
+- Q1-B session machinery: no new work.
+- `aws_targets`: dormant, no shipped policy uses it.
+- `ap-egress` stays a separate container and UID, never folded into the proxy.
+
 ## Open items
 
-- **One registered session per pod (Q1-A fallback)** for runtimes that do not speak the
-  session plane: the design recommends it, gives no config shape, and Phase 1 does not build
-  it. Open.
-- The combined iptables rule set is [I] until `tests/k8s-egress/run.sh` has run on a cluster.
+- **The `kiro-cps` route host** in `deploy/k8s/policy.example.toml` is a placeholder. See
+  `docs/pre-release-checklist.md`.
+- Release gates still open: the real-pod `hello` race (checklist item 3) and the PSA decision
+  (item 4). The combined iptables rule set is no longer open: it is [M] in one pod
+  (`docs/verification/phase1-k8s-iptables.md`).
 
 ## Deferred, not rejected
 

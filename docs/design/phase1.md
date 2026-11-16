@@ -1,7 +1,11 @@
 # auth-proxy Phase 1 design
 
 - **Status:** Q1, Q2 and Q3 are decided (Q1-B, Q2-A for Kubernetes only, Q3-A with egress
-  Q3-E2). Each question section records who decided it and the conditions attached. The ECS
+  Q3-E2). **After the over-design council the owner decided: Q1-B stays the accepted design and
+  new work on it is frozen; only a minimal Q1-A static configuration is built, as a labelled
+  interim path with no per-session revocation, which the owner accepted** (see the Q1 decision
+  and `docs/interim-static-session.md`). Each question section records who decided it and the
+  conditions attached. The ECS
   (Option C) parts are **deferred to a later phase, not rejected**; sections that describe them
   are marked. Everything else in this document follows from decisions already made or is proposed
   for review with the doc.
@@ -141,6 +145,14 @@ are binding for Phase 1:
 3. The documentation states that audit attribution between sessions of the same UID is best
    effort, because a same-UID neighbour can read and spend another session's surrogate.
 
+**Owner decision after the over-design council (2026-11-16): Q1-B stays the formal accepted
+design, and new work on it is frozen.** Only the minimal Q1-A static configuration is built: one
+session registered for the pod's lifetime, as a clearly labelled **interim path** for the first
+end-to-end Kubernetes deployment (`docs/interim-static-session.md`). **The interim deployment has
+no per-session revocation, and the owner accepted that.** The real-pod `hello` race test (pre-release
+checklist item 3) remains a release gate. `ap-egress` stays a separate container and UID and is
+never folded into the credential-holding proxy.
+
 The question covers four things: who mints, lifetime, delivery to the agent, and revocation when
 the session ends, plus whether the key rides in the base-URL path.
 
@@ -158,6 +170,12 @@ and stored in Secrets Manager for the bot.
 - **Revocation:** pod deletion, or an operator command on the proxy's admin socket. There is no
   per-session revocation.
 - **Key in the path:** yes, and it can be, because the key is the same for every session.
+- **Built, as the interim path.** The implementation differs from the sketch above: the operator
+  generates the surrogate and the caller key (`deploy/k8s/interim-keygen.sh`), the proxy gets only
+  `sha256(surrogate)` through `--interim-static-surrogate-sha256`, and the proxy never mints or
+  stores either. The static session has no lease and no TTL, and revoke-all on the admin socket
+  does not end it, so in the built interim path only deleting the pod or restarting the proxy
+  does. See `docs/interim-static-session.md`.
 
 ### Q1-B. Per-identity caller key in the path, per-session surrogate registered by the session authority (recommended)
 
@@ -246,7 +264,9 @@ settings or HOME, and it keeps the openab-pty rule that the runtime never talks 
 runtime talks only to the proxy's session plane, sends hashes, and holds no real credential. It
 reuses patterns both platforms already ship (openab-pty's hash-only tools key, openab's
 mint/revoke registrar). Ship Q1-A's handoff as the fallback mode for images whose runtime does not
-yet speak the session plane: the proxy then registers one session for the pod itself.
+yet speak the session plane: the proxy then registers one session for the pod itself. The owner
+decision above builds this fallback, as the interim path, with the registration done by a proxy flag
+instead of a runtime call.
 
 Caller key in the path: **yes, per identity.** It is what separates identities at a shared proxy
 (matrix X1 [M exp2]) and what stops overlay peers that reach the loopback listener [I src:
@@ -400,6 +420,10 @@ Not part of Phase 1 (Q2 decision). Kept as the starting design for the ECS rollo
 
 ### Q2 recommendation: Q2-A with S1 (Kubernetes) and S2 (ECS)
 
+**Frozen after the over-design council:** the `Broker` trait and `ap-client` stay at the Unix
+socket client only. No networked-broker work is done in Phase 1; moving the broker behind a
+network call remains a new implementation of the trait, as the reversibility row says.
+
 Decided as Q2-A with S1 for Phase 1; the S2 and ECS half of this recommendation is deferred.
 
 Q2-A keeps the properties that decided the bake-off (one holder of the credential, explicit
@@ -424,7 +448,9 @@ Follow-ups attached to the decision:
   time (DNS rebinding).
 - The platform sets `NO_PROXY=127.0.0.1,localhost` next to `HTTPS_PROXY`.
 - A test confirms that kiro-cli sends `X-Amz-Target` before any grant relies on `aws_targets`.
-- The combined Option A rule set is measured in one pod before release.
+  Done [M]: `docs/verification/phase1-xamz-target.md`.
+- The combined Option A rule set is measured in one pod before release. Done [M]:
+  `docs/verification/phase1-k8s-iptables.md` (PASS).
 
 Remaining risk, accepted: the agent can still send data to allowlisted hosts such as github.com,
 and tools that ignore the proxy variables fail slowly.
@@ -444,6 +470,14 @@ requests with path `/` [M k3s 1a]. The operation (`GetProfile`, `ListAvailableMo
 "anything on this route". Phase 1 adds an `aws_targets` matcher, an exact list of operation names
 compared against the single `X-Amz-Target` value (zero or two headers means deny), and the first
 Phase 1 test confirms the header with kiro-cli.
+
+**`aws_targets` is dormant.** The parser, validation and tests stay, but no shipped policy may
+use it (a test fails if a policy under `deploy/` does). kiro-cli 3.3.0 was measured to send
+exactly one `X-Amz-Target` per call, and the model call is
+`AmazonCodeWhispererStreamingService.GenerateAssistantResponse` [M,
+`docs/verification/phase1-xamz-target.md`], so the "one header" assumption holds. The matcher
+stays unused until a real grant needs it, and is removed if a later kiro-cli capture disproves
+the assumption.
 
 Policy format options are Q3-A to Q3-C; the egress options for non-credential traffic are
 Q3-E1 to Q3-E3.
@@ -498,7 +532,7 @@ credential = "kiro"
 route = "kiro-krs"
 methods = ["POST"]
 paths = ["/"]                            # exact "/" or prefixes ending in "/"
-aws_targets = ["AmazonCodeWhispererStreamingService.GenerateAssistantResponse"]
+# aws_targets = [...]                    # dormant: no shipped policy uses it (see "What path rules cannot express")
 
 [egress]                                 # read by ap-egress only (see below)
 allow = ["github.com:443", "registry.npmjs.org:443", "pypi.org:443",
@@ -513,7 +547,8 @@ credential and one of its routes; methods are upper-case tokens; paths start wit
 no dot segment, `%` or `//`; at most 256 grants; egress entries are `host:port`, with a canonical
 host and a port from 1 to 65535, and no host that is also a credential route host (otherwise a
 CONNECT tunnel could carry another credential the agent found straight to a credential host; an
-explicit `allow_route_hosts = true` turns the check off).
+the check has no opt-out. An earlier draft had `egress.allow_route_hosts`; it was removed after the
+over-design council as a security fix, and a policy that sets it is rejected).
 
 ### Getting git, npm, pip and cargo out under the Option A deny
 
@@ -582,7 +617,8 @@ The session-plane and admin endpoints are Unix sockets, so they need no port rul
 proxy binds no other loopback port, so the third line has nothing to list unless a later feature
 adds one; config validation refuses any proxy listener on loopback other than `P`. The
 `ESTABLISHED` and per-port parts were measured in separate pods [M k3s F1, F2]; the combined set
-is [I] until the Phase 1 k8s test runs it in one pod.
+is now [M]: it was run in one pod on a real k3s node with the real `auth-proxy` and `ap-egress`
+binaries and passed (`docs/verification/phase1-k8s-iptables.md`).
 
 ### Q3 trade-offs
 
@@ -606,6 +642,12 @@ One validated file per identity is the smallest change from the spike's measured
 is the same artifact on both platforms. Q3-E2 keeps the credential process free of non-credential
 traffic, needs no privilege beyond the init container that Option A already has, and leaves DNS
 closed for the agent.
+
+**`ap-egress` stays a separate container and UID. It must never be folded into the
+credential-holding proxy** (owner decision after the over-design council). The split is a real
+credential trust boundary: `ap-egress` has no Secret mount, no `ap-broker` dependency (checked in
+CI with `cargo tree`) and no credential in memory, and it is the process that resolves names and
+dials the network on the agent's behalf.
 
 ---
 
@@ -692,8 +734,8 @@ Each item says what Phase 1 does with it.
    both telemetry modes [M k3s 4]. Phase 1 offers two documented choices: an `[egress]` entry
    through `ap-egress` (Q3-E2), or pre-seeding the model in the image. Whether kiro-cli picks up a
    pre-seeded model is not verified [I].
-6. **Combined Option A rule set in one pod.** Measured only in two pods [M k3s F1, F2]. The Phase 1
-   k8s test runs the full set above.
+6. **Combined Option A rule set in one pod.** Was measured only in two pods [M k3s F1, F2]. Now
+   measured in one pod [M, `docs/verification/phase1-k8s-iptables.md`]: PASS.
 7. **Non-loopback base URLs (Option C).** Not verified for any CLI (RFC #1). Avoided with
    `ap-relay`; verifying it is still worth doing.
 8. **Slow failure on tampering.** kiro-cli retries for about 44 s after its settings are rewritten
@@ -787,6 +829,12 @@ nightly or by hand, because it needs a cluster with `NET_ADMIN`.
 
 ## 8. Out of scope and still open
 
+- **kiro-cps route host (open item).** `deploy/k8s/policy.example.toml` still carries a
+  placeholder for the `kiro-cps` route host. The verified kiro-cli capture
+  (`docs/verification/phase1-xamz-target.md`) pointed every endpoint at a local listener, so it
+  records the targets (`GetProfile`, `ListAvailableModels`) but not the real control-plane host.
+  The exact need is in `docs/pre-release-checklist.md`. The first deployment cannot run until it
+  is filled in.
 - **ECS rollout (Option C)**, deferred by the Q2 decision: the S2 Secrets Manager store and its
   cache bound, per-bot proxy services, `ap-relay`, and the IAM, Secrets Manager and
   execution-role changes. The `aws-sm` feature, the HTTPS session plane and `deploy/ecs/` wait
@@ -816,14 +864,26 @@ Shipped on branch `feat/phase1-k8s`: workspace with `ap-core`, `ap-broker`, `ap-
 `ap-client` (UDS session-plane client only), `ap-egress`; the ported fail-closed matrix;
 `deploy/k8s/` (netinit image and script, pod manifest, example policy); `docs/session-plane.md`,
 `docs/operations.md`, `docs/recipes/kiro-cli.md`, `docs/pre-release-checklist.md`;
-`tests/k8s-egress/run.sh` (written, not run); CI workflow. The design above is not rewritten.
+`tests/k8s-egress/run.sh` (written, not run; the combined rule set was measured with
+`spike/k8s-iptables/` instead, see `docs/verification/phase1-k8s-iptables.md`); CI workflow. The design above is not rewritten.
 
 Where the decision record wins over this document:
 
 - The `ap-relay` binary, the `aws-sm` feature, the HTTPS session plane and `deploy/ecs/`
   (section 6) are deferred with the ECS rollout, not built.
-- The Q1-A "one registered session per pod" fallback has no config shape and is not built
-  (open item in `docs/operations.md`).
+- The Q1-A "one registered session per pod" fallback is built **as an interim path only**
+  (after the over-design council, owner decision): one flag,
+  `--interim-static-surrogate-sha256`, a deploy example and `docs/interim-static-session.md`. It
+  has no per-session revocation, which the owner accepted. Q1-B stays the accepted design and new
+  work on it is frozen.
+- The admin socket (`revoke-all`, `status`) is kept for Phase 1: the session-plane tests read the
+  session count from `status` and one test covers `revoke-all`. It is never merged into the
+  agent-mounted session socket.
+- `egress.allow_route_hosts` was removed (security fix) and `route.connect_to` exists only in
+  `test-resolve` builds. `aws_targets` is dormant (no shipped policy uses it).
+- The `Broker` trait and `ap-client` are frozen at the Unix socket client. No networked-broker
+  work in Phase 1.
+- The `upstream_reset` audit line records `bytes_sent` (response-body bytes already relayed).
 - Credential lifetime: Phase 1 credentials are static API keys, so only the session absolute
   TTL bounds a surrogate.
 - After a proxy restart the persisted authority token stays valid and the 90 s lock counts

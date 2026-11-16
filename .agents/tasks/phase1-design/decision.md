@@ -81,3 +81,43 @@ Rationale: same reasoning on single-file cross-checks, Q3-B drift, Q3-C operator
 ```
 
 Merged rationale: one TOML policy file per identity, validated as a whole, swapped atomically, failing closed with `policy_unavailable`, stored in a proxy-only ConfigMap (Kubernetes) or Secrets Manager with S2 rules (ECS). Non-credential egress uses Q3-E2: a separate CONNECT-only `ap-egress` in its own container and UID, no Secret mount, no ap-broker dependency (CI-checked with cargo tree), resolving DNS itself and connecting to the exact validated address, refusing IP literals and private/loopback/link-local targets; agent UID keeps DNS blocked. GitHub goes through octobroker as an auth-proxy route behind TLS; git push via ap-egress to github.com:443; openab-pty#47's allowlist becomes the `[egress]` section. Follow-ups from both members: set `NO_PROXY=127.0.0.1,localhost`, confirm kiro-cli sends `X-Amz-Target` before any grant uses `aws_targets`, and measure the combined iptables rule set in one pod before release.
+
+## Over-design council (2026-11-16) and the owner's decision on Q1
+
+After the Phase 1 verification (`.agents/tasks/phase1-verify/`), two council members (sol and
+opus5) reviewed the built system for over-design. Both set escalate on one question: whether the
+first end-to-end Kubernetes deployment may run on the Q1-A fallback (one session registered for
+the pod's lifetime, no per-session revocation) while Q1-B stays built, and whether `ap-egress` may
+ever be folded into the credential-holding proxy.
+
+### Owner decision (pahud, binding)
+
+Option 1 of the escalation:
+
+- **Q1-B stays the formal accepted design. New work on it is frozen.**
+- Build **only** the minimal Q1-A static configuration (one session registered for the pod's
+  lifetime) as a **clearly labelled interim path** for the first end-to-end Kubernetes deployment.
+- **The owner accepts that the interim deployment has no per-session revocation.** The
+  documentation says so in plain words (`docs/interim-static-session.md`, `docs/design/phase1.md`).
+- The real-pod `hello` race test remains a **release gate** (`docs/pre-release-checklist.md`, item 3).
+- **`ap-egress` stays a separate container and UID. It is never folded into the credential-holding
+  proxy.**
+
+### Council verdicts applied (council-level, low risk, reversible)
+
+| Item | Verdict | What was done |
+|---|---|---|
+| `aws_targets` | Freeze: keep parser, validation and tests dormant; forbid it in shipped policies | Test `shipped_policies_parse_and_use_no_aws_targets` fails if any policy under `deploy/` uses it. kiro-cli 3.3.0 was measured to send exactly one `X-Amz-Target` per call (model call `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`, `docs/verification/phase1-xamz-target.md`), so the assumption holds, but no grant uses it yet. |
+| `egress.allow_route_hosts` | Remove (security fix; only sol flagged it) | The field existed in `ap-core` `EgressCfg` and switched off the rule "an egress host is never a credential route host". Removed with no replacement; a policy that sets it is an unknown-field error. Tests: such a policy is rejected, and an egress entry that is a credential route host is rejected. |
+| `route.connect_to` | Remove from production syntax or restrict to test builds | Restricted to the `test-resolve` cargo feature. No shipped build has it, and a policy that sets it is rejected (unit test plus `scripts/check-no-test-resolve.sh` on the release binary). Tests and the matrix use a `test-resolve` build. |
+| Admin socket, revoke-all, status | Councils split (sol: remove; opus5: keep); lean was simplify | **Kept**, because tests depend on it: `crates/ap-proxy/tests/session_plane.rs` reads the session count from `GET /admin/status` in many tests and has `admin_socket_status_and_revoke_all`; `policy.rs` and the shared fixture start the proxy with `--admin-socket`; the matrix harness waits for the admin socket. The pre-release checklist does not depend on it. It is never merged into the agent-mounted session socket. Revisit when those tests get another way to count sessions. |
+| Broker trait, `ap-client` | Freeze at the UDS client only | No code change. No networked-broker work in Phase 1. |
+| `upstream_reset` audit gap (verification item 2) | Owner chose option A | `AuditRec` has a `bytes_sent` field (response-body bytes already relayed; `null` on other lines), counted in `agent.rs`. `#[ignore]` removed from `the_upstream_reset_audit_line_records_the_bytes_sent`. The audit stays free of secrets and of the `/ap/<caller-key>` prefix; matrix X5 passes. |
+| Combined iptables rule set | Measured in one pod (verification item 1, PASS) | Design doc tag changed from [I] to [M]; evidence `docs/verification/phase1-k8s-iptables.md`. |
+| `kiro-cps` route host placeholder | Not resolvable from the item 4 capture | Listed as an open item with what is needed (`docs/pre-release-checklist.md`). |
+
+### Q1 summary row, as amended
+
+| Question | Final status |
+|---|---|
+| Q1 session/caller identity | Q1-B accepted and frozen. Q1-A static session built as an **interim** path, with no per-session revocation, accepted by the owner. |

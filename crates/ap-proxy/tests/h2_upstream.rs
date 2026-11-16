@@ -234,7 +234,8 @@ fn fixture_with_h2() -> (Fixture, H2Up, ap_client::Surrogate) {
 /// whether the read ended by EOF (`true`) or by the deadline (`false`).
 fn raw_until_eof(port: u16, req: &str, limit: Duration) -> (Vec<u8>, bool) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    s.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     s.write_all(req.as_bytes()).unwrap();
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
@@ -304,9 +305,15 @@ fn a_request_is_relayed_to_an_http2_upstream() {
     // The credential is swapped; the surrogate and the caller key never reach
     // the upstream; pass_headers survive.
     let real = fx.secret_value("c-up");
-    assert_eq!(q.header("authorization"), Some(format!("Bearer {real}").as_str()));
+    assert_eq!(
+        q.header("authorization"),
+        Some(format!("Bearer {real}").as_str())
+    );
     let dump = format!("{q:?}");
-    assert!(!dump.contains(s.expose()) && !dump.contains(&fx.caller_key), "{dump}");
+    assert!(
+        !dump.contains(s.expose()) && !dump.contains(&fx.caller_key),
+        "{dump}"
+    );
     assert_eq!(q.header("tokentype"), Some("pass-me"));
     assert_eq!(q.header(":authority"), None); // pseudo-headers are not in the map
 }
@@ -374,7 +381,9 @@ fn an_upstream_reset_mid_stream_is_audited_and_closes_the_client_stream() {
         .map(|v| v.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!all.contains("apk_") && !all.contains("aps_") && !all.contains(&fx.secret_value("c-up")));
+    assert!(
+        !all.contains("apk_") && !all.contains("aps_") && !all.contains(&fx.secret_value("c-up"))
+    );
 
     // The proxy survived and serves the next request on the same upstream.
     assert!(fx.proxy_alive());
@@ -401,12 +410,10 @@ fn an_upstream_reset_before_the_response_is_a_502_upstream_unavailable() {
     assert!(!stderr.contains("panicked"), "{stderr}");
 }
 
-/// The design (section 4, "Upstream error mid-stream") says the audit line
-/// records `upstream_reset` and the bytes sent. `AuditRec` has no such field.
-/// Kept as an ignored test so the gap is on record without turning the suite
-/// red: run with `--ignored` to see it fail.
+/// Design section 4, "Upstream error mid-stream": the audit line records
+/// `upstream_reset` and the bytes sent. The count is the response-body bytes the
+/// client had already been sent (here the mock sends `partial-` and resets).
 #[test]
-#[ignore = "design claim not implemented: the upstream_reset audit line has no bytes-sent field"]
 fn the_upstream_reset_audit_line_records_the_bytes_sent() {
     let (fx, _up, s) = fixture_with_h2();
     let _ = raw_until_eof(
@@ -419,13 +426,19 @@ fn the_upstream_reset_audit_line_records_the_bytes_sent() {
         .iter()
         .find(|v| v["code"] == "upstream_reset")
         .expect("an upstream_reset line");
-    let obj = r.as_object().unwrap();
-    let field = ["bytes_sent", "bytes", "bytes_out", "response_bytes"]
+    assert_eq!(
+        r["bytes_sent"].as_u64().expect("bytes_sent is a number"),
+        "partial-".len() as u64,
+        "{r}"
+    );
+    // The count is the only new field: no key, prefix or credential in the line.
+    let text = r.to_string();
+    assert!(!text.contains("/ap/") && !text.contains("apk_") && !text.contains("aps_"));
+    assert!(!text.contains(&fx.secret_value("c-up")));
+    // Lines that are not mid-stream failures carry no count.
+    let allow = lines
         .iter()
-        .find_map(|k| obj.get(*k));
-    let n = field
-        .unwrap_or_else(|| panic!("no bytes field in the upstream_reset line: {r}"))
-        .as_u64()
-        .expect("a number");
-    assert_eq!(n, "partial-".len() as u64);
+        .find(|v| v["code"] == "ok")
+        .expect("allow line");
+    assert!(allow["bytes_sent"].is_null(), "{allow}");
 }

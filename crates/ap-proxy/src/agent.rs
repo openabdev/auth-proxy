@@ -431,15 +431,22 @@ async fn handle(app: Arc<App>, req: Request) -> Response {
     let (app2, ctx2, rp2, method2) = (app.clone(), ctx.clone(), rp.clone(), method.clone());
     let code = status.as_u16();
     let mut logged = false;
+    // Response-body bytes handed to the client so far; the reset line records it.
+    let mut sent: u64 = 0;
     let stream = up.bytes_stream().map(move |chunk| {
-        if chunk.is_err() && !logged {
-            logged = true;
-            app2.audit.request(&AuditRec::failed(
-                &ctx2.input(&method2, t0),
-                &rp2,
-                "upstream_reset",
-                code,
-            ));
+        match &chunk {
+            Ok(b) => sent += b.len() as u64,
+            Err(_) if !logged => {
+                logged = true;
+                app2.audit.request(&AuditRec::failed(
+                    &ctx2.input(&method2, t0),
+                    &rp2,
+                    "upstream_reset",
+                    code,
+                    sent,
+                ));
+            }
+            Err(_) => {}
         }
         chunk
     });

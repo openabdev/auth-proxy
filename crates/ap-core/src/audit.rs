@@ -24,6 +24,9 @@ pub struct AuditRec {
     code: &'static str,
     status: u16,
     duration_ms: u64,
+    /// Response-body bytes already relayed to the client when an admitted
+    /// request failed mid-stream (`upstream_reset`). `null` on every other line.
+    bytes_sent: Option<u64>,
 }
 
 /// What the caller knows when it writes the line. All text is optional: a
@@ -53,13 +56,18 @@ impl AuditRec {
 
     /// An admitted request that failed after admission (upstream failure,
     /// reset mid-stream). `code` is a fixed label such as `upstream_reset`.
+    /// `bytes_sent` is the number of response-body bytes the client had already
+    /// been sent when the failure hit; a count, never content.
     pub fn failed(
         input: &AuditInput<'_>,
         path: &RoutePath,
         code: &'static str,
         status: u16,
+        bytes_sent: u64,
     ) -> AuditRec {
-        AuditRec::build(input, path, "error", code, status)
+        let mut rec = AuditRec::build(input, path, "error", code, status);
+        rec.bytes_sent = Some(bytes_sent);
+        rec
     }
 
     fn build(
@@ -82,6 +90,7 @@ impl AuditRec {
             code,
             status,
             duration_ms: input.duration_ms,
+            bytes_sent: None,
         }
     }
 
@@ -134,16 +143,36 @@ mod tests {
             "code",
             "status",
             "duration_ms",
+            "bytes_sent",
             "t",
         ] {
             assert!(v.get(k).is_some(), "missing {k}");
         }
         assert_eq!(
             v.as_object().unwrap().len(),
-            12,
+            13,
             "no field beyond the documented ones"
         );
         assert_eq!(v["path"], "/v1/messages");
+        assert!(v["bytes_sent"].is_null(), "only failed lines carry a count");
+    }
+
+    #[test]
+    fn failed_line_carries_the_byte_count_and_nothing_else_new() {
+        let rec = AuditRec::failed(
+            &full_input(),
+            &RoutePath::new("/v1/messages"),
+            "upstream_reset",
+            200,
+            4096,
+        );
+        let v: serde_json::Value = serde_json::from_str(&rec.to_line(1)).unwrap();
+        assert_eq!(v["code"], "upstream_reset");
+        assert_eq!(v["decision"], "error");
+        assert_eq!(v["bytes_sent"], 4096);
+        assert_eq!(v.as_object().unwrap().len(), 13);
+        let line = v.to_string();
+        assert!(!line.contains("/ap/") && !line.contains("aps_") && !line.contains("apk_"));
     }
 
     #[test]
@@ -166,7 +195,7 @@ mod tests {
             for rec in [
                 AuditRec::allowed(&input, &RoutePath::new(path), 200),
                 AuditRec::refused(&input, &RoutePath::new(path), Code::PolicyDenied),
-                AuditRec::failed(&input, &RoutePath::new(path), "upstream_reset", 502),
+                AuditRec::failed(&input, &RoutePath::new(path), "upstream_reset", 502, 0),
             ] {
                 let line = rec.to_line(0);
                 assert!(

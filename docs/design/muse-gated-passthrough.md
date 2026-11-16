@@ -95,7 +95,7 @@ reuses Phase 1 steps 1 to 3 and 6 and skips steps 4, 5 and 7 [I phase1.md sectio
 3. Read the caller key from the header (section 3.2), find the identity by constant-time hash compare.
 4. Evaluate policy for identity, route, method and route-relative path. Result is `allow`, `hold` or deny.
 5. `allow`: forward now. `hold`: section 3.4. Deny: terminal error (section 3.5).
-6. One audit record per request, extended with the hold transitions (section 3.9).
+6. Audit: one record per allowed request, hold transitions for a held one (section 3.9).
 
 The upstream host comes only from the route configuration, never from the request. The route is chosen
 by a name in the URL path that policy maps to a fixed host. An unknown route name fails closed (423 `denied`, code
@@ -146,10 +146,11 @@ Tailnet identity headers that `tailscale serve` injects are ignored: no decision
   no buffering and no computed length. The body bytes are unchanged; only framing, which is hop-by-hop,
   differs.
 - Allowed-request boundary: the first request byte handed to the upstream connection. Failures before it
-  are 503 `unavailable`; failures after it close the client connection without a synthetic decision
-  (section 3.5).
-- More than one `Authorization` header on a held route is refused (400, `X-AP-Decision: denied`, code
-  `authorization_duplicate`), because a gate cannot say which one Discord will read. [A] that Discord
+  are 503 `unavailable` (413 `body_too_large` for an undeclared body over the cap); failures after it close
+  the client connection without a synthetic decision, and the one audit record carries `code =
+  upstream_reset` or `body_failed_after_send` (section 3.5).
+- More than one `Authorization` header is refused on every passthrough route, allowed or held (400,
+  `X-AP-Decision: denied`, code `authorization_duplicate`), because a gate cannot say which one Discord will read. [A] that Discord
   reads only one.
 
 A request to a held route with no `Authorization` header is refused before it reaches the human
@@ -236,7 +237,10 @@ Sequence for a `hold` verdict:
    response is not verified; stage 2 tests it]. The drain is skipped when the request carried
    `Expect: 100-continue` and no `100 Continue` was sent, since no body will arrive and the drain would wait
    `body_read_secs` for nothing.
-2. Read the body into memory, bounded by `held_body_max_bytes` and by `body_read_secs`. Over the cap is
+2. Require `Content-Type: application/json` (parameters allowed) before reading the body. `multipart/*`,
+   any other media type or none is 400 `denied`, code `content_type`, regardless of size, so attachments
+   are refused here. [A] Muse sends JSON for message create. Then read the body into memory, bounded by
+   `held_body_max_bytes` and `body_read_secs`; the cap independently bounds held bodies. Over the cap is
    413 with `X-AP-Decision: denied`; the request is not held.
 3. Require `Content-Encoding` absent or `identity`. A compressed body cannot be shown to the approver as
    the bytes Discord will decode. [A] Muse does not compress requests; if it does, the answer is deny,
@@ -248,7 +252,9 @@ Sequence for a `hold` verdict:
    marker. It is shown to the approver and written to the audit record, and it reveals nothing about a
    credential. The *equality fingerprint* is an HMAC-SHA256 under a random per-process key over the same
    encoding with the credential values included. It lives only in the entry, in memory, is never logged,
-   shown or sent, and exists only to decide whether two requests are the same for dedupe. Neither value is
+   shown or sent, and exists only to decide whether two requests are the same for dedupe. Dedupe assumes Muse sends identical
+   headers on a retry [A]; if a per-request header (trace or request id) differs, stage 2 needs a
+   route-level fingerprint-exclusion list (excluded from the fingerprint, not from forwarding). Neither value is
    an input to approve: the approval API takes the entry id only. The entry is immutable in memory, so the
    id already names exactly the bytes that will be sent.
 5. Admission order for a new hold: (a) cooldown for the identity (503 `cooldown`); (b) dedupe: if a
@@ -262,9 +268,12 @@ Sequence for a `hold` verdict:
    credential value is a different request and gets its own entry and its own notification. Notification
    count: one per distinct pending entry, so at most `max_held_total` at any moment. An agent that changes
    the request on each retry is bounded by the per-identity cap and by the cooldown after a deny or
-   expiry, and by nothing else (a per-minute rate cap is out of scope). Then insert the entry in the
-   in-memory table (section 3.7), write the `held` audit record, fire the notification (new entries only,
-   not supersedes), and wait for the decision up to `hold_secs`.
+   expiry, and by nothing else (a per-minute rate cap is out of scope). Then write the `held` audit
+   record; if the write fails, refuse 503 `audit_unavailable` before the entry is inserted or any
+   notification fires. Then insert the entry in the in-memory table (section 3.7), fire the notification
+   (new entries only, not supersedes), and wait for the decision up to `hold_secs`. `audit_unavailable`
+   starts no cooldown: a sink failure is not the identity's doing, and the per-identity cap bounds the
+   prompts it can cause (none before the hold; one per attempt after approve).
 6. The entry is a state machine guarded by one mutex: `Pending` to exactly one of `Approved`, `Denied`,
    `Expired`, `Abandoned` (caller disconnected), `Superseded` or `Dropped` (identity removed on reload,
    section 3.9). The first transition wins. A held request cannot be approved twice, because `Approved`
@@ -284,12 +293,30 @@ Sequence for a `hold` verdict:
    returns `gone`, and the audit shows `abandoned` only. (b) `Approved` won first, then the handler future
    is dropped or the caller-connected re-check fails before the send: the approve call returns
    `approved_but_abandoned`, nothing is sent, and the audit shows `abandoned_after_approve`. The approve
-   call learns (b) by awaiting a oneshot from the handler that reports `forward_started` or is dropped,
-   bounded by a 2 s timeout, after which it returns `approved_unconfirmed`. The approve call returns
-   success only after the forward has started. The forward runs in the handler's task, not in a detached
-   task. If the drop happens during the forward, the request may already be at Discord; the audit shows
-   `forward_started` without `completed`.
+   call awaits a oneshot from the handler, bounded by a 2 s timeout (then `approved_unconfirmed`). The
+   handler passes two milestones in order: (1) the upstream connection is established and the pre-send
+   `forward_started` audit record is written (a connect failure is a terminal `connect_failed` transition
+   with no `forward_started`; an audit failure is 503 `audit_unavailable`, nothing sent); (2) the first
+   request byte is handed to the upstream connection. Only then does the oneshot resolve as success. If
+   the handler is dropped between the two, the result is `approved_but_abandoned`. The forward runs in the
+   handler's task, not in a detached task. If the drop happens after milestone 2, the request may already
+   be at Discord; the audit shows `forward_started` without `completed`.
 9. Discord's response streams back unchanged, as for an allowed request [I pipeline.rs step 9].
+
+Approve results by state when the call arrives (the state machine of step 6 plus step 8):
+
+| State | Approve result |
+|---|---|
+| `Pending`, forward reached milestone 2 | success |
+| `Superseded` | `superseded`, with the newest entry id |
+| `Approved` or `Denied` already | `already_decided` |
+| `Expired` | `expired` |
+| `Dropped` | `dropped` |
+| `Abandoned` | `gone` |
+| `Approved`, handler gone before milestone 2 | `approved_but_abandoned` |
+| `Approved`, no oneshot within 2 s | `approved_unconfirmed` |
+| `Approved`, audit write failed | `audit_unavailable` |
+| `Approved`, upstream connect failed | `connect_failed` |
 
 Cooldown. After a human deny or an `expired` verdict, new holds from that identity are refused with 503
 `unavailable` (code `cooldown`) for `cooldown_secs`. The default is 60, and 0 disables it. The slot is
@@ -320,9 +347,10 @@ a locally generated status plus `X-AP-Decision`, and Discord is not expected to 
 | More than one `Authorization` header | 400 | `denied` | `authorization_duplicate` | nothing |
 | No `Authorization` on a held route | 400 | `denied` | `credential_missing` | nothing |
 | Held body with `Content-Encoding` other than `identity` | 400 | `denied` | `content_encoding` | nothing |
+| Held route without `Content-Type: application/json`, including `multipart/*`, any size | 400 | `denied` | `content_type` | nothing |
 | `CONNECT` | 405 | `denied` | `method_not_allowed` | nothing |
 | `Upgrade` | 501 | `denied` | `upgrade_not_supported` | nothing |
-| Held body over cap, or declared allowed body over cap | 413 | `denied` | `body_too_large` | nothing |
+| Held body over cap, or allowed body over cap before the first upstream request byte (declared or not) | 413 | `denied` | `body_too_large` | nothing |
 | `hold_secs` elapsed with no decision | 410 | `expired` | `expired` | nothing |
 | Gate cannot decide, or fails before the first upstream request byte: policy unavailable, hold table full, per-identity cap, cooldown, superseded, shutting down, dropped on reload, body-read timeout, upstream connect failure | 503 | `unavailable` | `policy_unavailable`, `table_full`, `identity_cap`, `cooldown`, `superseded`, `shutdown`, `dropped_on_reload`, `body_read_timeout`, `connect_failed`, `audit_unavailable` (section 3.9) | nothing |
 | Allowed or approved and forwarded | Discord's own | whatever Discord sends | n/a | the request |
@@ -342,15 +370,14 @@ Two behaviours follow from "terminal":
   recorded refusal, not a state to poll [I issue #5 comment, "expiry is a verdict, not a state"].
 - A failure after the forward began, for example Discord resets the stream or the connection breaks after
   the request was written, closes the client connection without a synthetic decision or success, as Phase 1
-  does [I phase1.md section 4, "Upstream error mid-stream"]. The audit shows `forward_started` and no
-  `completed`. "Nothing sent" in the table applies only to the rows that say so: once a request byte has
+  does [I phase1.md section 4, "Upstream error mid-stream"]. An allowed request keeps its single audit
+  record with `code = upstream_reset`; a held one has `forward_started` and no `completed`. "Nothing sent" in the table applies only to the rows that say so: once a request byte has
   been written upstream the proxy cannot claim that Discord did not see it.
 - `caller_rejected` has its own status (401) and its own code, so an auth failure is never read as a
   human denial.
-- An allowed request body that fails after the first upstream byte (it stalls past `body_read_secs`, or an
-  undeclared body exceeds the cap after a prefix was sent) closes the client connection with no synthetic
-  decision, and the audit shows `forward_started` without `completed`. Before the first byte the same
-  failures are 503 `unavailable`.
+- An allowed body that stalls past `body_read_secs` or exceeds the cap after a prefix was sent closes the
+  client connection (audit `code = body_failed_after_send`). Before the first byte a stall is 503
+  `unavailable` and an over-cap body 413.
 
 ### 3.6 Approval plane (open point e)
 
@@ -386,7 +413,6 @@ Page controls:
   not cover `frame-ancestors`, so it is named, which stops a page framing the approve button over the
   owner's cached Basic credentials. The page has no script and no inline style, and renders the body and
   every value with HTML escaping.
-- A superseded entry's page is visibly distinct from a gone one: it shows a `superseded` banner, disables approve and deny, and links to the newest entry.
 - The page never renders or logs an `Authorization` value from a held request (the entry keeps it for
   forwarding but the view model omits it). It shows that the header is present.
 - Notification carries a link and a one-line summary only (method, route, redacted path), never a body or
@@ -413,7 +439,7 @@ these limits added. Proposed defaults, all configurable [A, values are starting 
 | `max_held_total` | 32 | 503, `unavailable`, not held |
 | `max_held_per_identity` | 4 | 503, `unavailable`, not held |
 | `cooldown_secs` (per identity, after deny or expiry) | 60 (0 disables) | 503, `unavailable`, not held (section 3.4) |
-| `request_deadline_secs` (total, from first byte to last response byte, allowed requests; a hold's wait is not counted) | 300 | close the connection |
+| `request_deadline_secs` (total, from first byte to last response byte, allowed and approved requests; an approved one counts from `forward_started`; a hold's wait is not counted) | 300 | close the connection |
 | `upstream_idle_secs` (no byte from Discord on an allowed or approved stream) | 30 | close the connection |
 | `hold_secs` | 120 (range 5 to 600) | `expired` |
 | TCP keepalive on accepted sockets | not a PoC control [A] | Accepted sockets are the front's loopback connections, so keepalive on them cannot keep the Muse leg alive. Only the front's own keepalive affects that leg; stage 1 measures it |
@@ -465,8 +491,10 @@ Phase 1 writes one line per request with no field for a key, credential or query
 passthrough mode adds fields and transitions, and keeps that property:
 
 - Transitions for a held request: `held`, then one of `approved`, `denied`, `expired`, `abandoned`,
-  `superseded` or `dropped_on_reload`, then `forward_started`, `completed`, or `abandoned_after_approve`
-  (approved, but the caller was gone before the forward started, nothing sent). Each carries the request
+  `superseded` or `dropped_on_reload`, then `forward_started`, `completed`, `abandoned_after_approve`
+  (approved, but the caller was gone before the forward started, nothing sent), `connect_failed` (no
+  `forward_started`) or `audit_unavailable`. An allowed request keeps Phase 1's single record, with
+  `code = upstream_reset` or `body_failed_after_send` after a post-first-byte failure. Each carries the request
   id, identity, route, method, the redacted route-relative path (below), the digest, and for decisions the
   approver identity.
 - `dropped_on_reload`: when a policy reload removes an identity, its `Pending` entries move to `Dropped`,
@@ -477,12 +505,13 @@ passthrough mode adds fields and transitions, and keeps that property:
   and in the notification. The audit may instead carry the matched grant pattern. No raw path is logged
   for these prefixes.
 - No header value of any kind, no query, no body.
-- The `forward_started` record is written before the upstream request is sent, so the record precedes
-  the action [I issue #5 comment 1, point 1]. Phase 1's audit sink is stdout and a failed write does not
+- The `forward_started` record is written after the upstream connection is established and before the
+  first request byte, so the record precedes the action [I issue #5 comment 1, point 1]. Phase 1's audit sink is stdout and a failed write does not
   refuse a request [I phase1.md section 4, "Audit write failure"]; the PoC keeps that behaviour for allowed reads.
   **Stage 2 requirement (settled, owner decision):** on held (write) routes a
-  failed `forward_started` audit write refuses the request (503 `unavailable`, code `audit_unavailable`,
-  nothing sent upstream), so no write executes without a record. This reverses the earlier cut of the
+  failed `held` or `forward_started` audit write refuses the request (503 `unavailable`, code
+  `audit_unavailable`, nothing sent upstream; a failed `held` write also creates no entry and no
+  notification), so no write executes without a record. This reverses the earlier cut of the
   fallible-sink requirement for writes only.
 
 ## 4. Trust model changes (open points b and c)
@@ -561,7 +590,7 @@ Deployment models]. This mode has no equivalent, because Muse is not inside our 
 | Approve races a Muse disconnect | First transition wins. If `Approved` wins and the caller is gone before the send, the approve call returns `approved_but_abandoned`, audit `abandoned_after_approve`, nothing is sent | yes, unless the send started |
 | Muse retries while the first request is still held | The older entry is superseded (503, nothing sent); one prompt for the newest | yes for the older one |
 | Policy reload removes the identity | Its holds are answered 503 `unavailable`, nothing sent | yes |
-| Discord connection fails after the request was written | Client connection closed, audit `forward_started` without `completed` | no, possibly executed |
+| Discord connection fails after the request was written | Client connection closed; audit `forward_started` without `completed` (held) or `code = upstream_reset` (allowed) | no, possibly executed |
 | `hold_secs` elapses | `expired`, 410, nothing sent | yes |
 | Approval plane down | Holds expire | yes |
 | Discord returns 429 or 5xx after approval | Returned verbatim. A Muse retry means a new approval | already executed or rejected by Discord |
@@ -651,7 +680,8 @@ Decided in the owner's review comments:
   open questions 1 to 4 are answered by measurement.
 - The only write in scope is `POST /channels/*/messages` (replies use it). Reactions, edits, deletes and
   every other write are out and stay denied.
-- Attachments and multipart uploads are out of scope; they are refused by the held-body cap.
+- Attachments and multipart uploads are out of scope; the content-type rule refuses them at any size
+  (3.5 `content_type`), and the held-body cap independently bounds held bodies.
 - One consumer (Muse), one upstream (Discord), single instance.
 - Expansion criteria: a further write pattern, consumer or upstream is added only after the pilot has run
   with the above scope, with stage 1 measurements recorded and the owner agreeing to the specific addition.
@@ -672,7 +702,9 @@ Goal: validate Muse's hook format end to end with no approval machinery. A write
 Evidence to collect from a real Muse connector run (names only, never values): which header carries the
 key, whether `Authorization` arrives (present or absent), the `Host`
 header and path prefix, HTTP version at the TLS front, whether bodies are chunked or compressed, whether
-Muse sends other headers we would forward. Stage 1 collects fixed fields only: `auth_present`, HTTP version, chunked and compressed booleans, whether
+Muse sends other headers we would forward, whether two identical connector calls carry the same
+forwarded header names, the `Content-Type` of message create, and whether the front sends `100 Continue`
+itself. Stage 1 collects fixed fields only: `auth_present`, HTTP version, chunked and compressed booleans, whether
 `Host` matches `public_authority`, and a manually observed, redacted list of candidate non-secret header
 names. There is no generic header dump and no header lengths.
 
@@ -681,13 +713,12 @@ Acceptance:
 1. A `GET` on an allowed prefix with a valid caller key reaches the mock upstream and its response comes
    back unchanged (status, headers minus hop-by-hop, body). A mock response carrying `X-AP-Decision` and
    another `X-AP-*` header keeps both.
-2. A `POST /channels/{id}/messages` is denied with the distinct status and `X-AP-Decision: denied`, and the
-   mock upstream records no request.
+2. A `POST /channels/{id}/messages` is 423 `no_grant` with `X-AP-Decision: denied`, and the mock upstream
+   records no request.
 3. Missing, duplicate and malformed caller-key headers are `caller_rejected`, status 401 with
    `X-AP-Decision: rejected` (not the 423 of a human denial), nothing upstream. An unknown route name is
-   423 `denied` (`route_unknown`) and nothing is sent. Duplicate `Authorization`, a missing `Authorization`
-   on a held route and a compressed held body are each 400 with `X-AP-Decision: denied` and the codes of
-   section 3.5; `CONNECT` is 405 and `Upgrade` 501, each with the header.
+   423 `denied` (`route_unknown`) and nothing is sent. Duplicate `Authorization` is 400
+   `authorization_duplicate` with `X-AP-Decision: denied`; `CONNECT` is 405 and `Upgrade` 501, each with the header.
 4. **Caller-key header stripped upstream:** the mock upstream's recorded headers contain neither the
    caller-key header nor any `x-ap-*` header, for allowed requests.
 5. **`Authorization` forwarded unchanged:** the mock upstream receives the identical `Authorization` value
@@ -721,8 +752,8 @@ Acceptance:
     nominations, sent directly and through the real front: the mock upstream records no request. Record
     which layer refused and whether the answer carries `X-AP-Decision`.
 13. **Allowed-body boundary:** an allowed body that stalls after a prefix, and an undeclared body that
-    exceeds the cap after the mock upstream consumed a prefix, close the client connection with audit
-    `forward_started` and no `completed`. A stall before the first upstream byte is 503 `unavailable`. An
+    exceeds the cap after the mock upstream consumed a prefix, close the client connection with one audit record, `code = body_failed_after_send`. A stall before the
+    first upstream byte is 503 `unavailable`, and an undeclared over-cap body before it is 413. An
     allowed chunked body reaches the mock chunked, with no computed `Content-Length`.
 14. Stage 1 results are inputs to the stage 2 design: open questions 1 to 4 are stage 1 blockers, and
     stage 2 does not start until they are answered.
@@ -736,8 +767,8 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
 2. **Unchanged request:** the body bytes, method, path and query, and the semantic header set the mock
    upstream records, equal what the test sent, except `Host`, hop-by-hop headers, the removed caller-key
    header and the stripped front-added headers (wire framing, header case and order may differ). The test
-   covers duplicate headers (kept as repeated values), an `Expect: 100-continue` request (no `Expect`
-   upstream, no `100 Continue` for a denied request), and injected `Forwarded`, `X-Forwarded-*`, `Via`,
+   covers duplicate headers (kept as repeated values), an `Expect: 100-continue` request on the direct path (no `Expect`
+   upstream, no `100 Continue` for a denied request; the front's behaviour is a stage 1 record), and injected `Forwarded`, `X-Forwarded-*`, `Via`,
    `CF-*` and `Tailscale-*` headers (absent upstream); `Cookie`, `Proxy-Authorization`, `X-Api-Key` and every other `AUTH_HEADERS` member except
    `Authorization` (absent upstream); and headers named by `Connection` (absent upstream).
 3. **Verbatim response:** the held connection's response equals the mock upstream's response (status,
@@ -751,7 +782,8 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
    and SIGTERM during a hold each give `X-AP-Decision: unavailable`, no upstream request. A connect
    failure before any request byte is written also gives 503 `unavailable`.
 7. **Single execution:** two concurrent approve calls for one id produce one upstream request and one
-   refused call. Approve after expiry, after deny and after caller disconnect is refused.
+   refused call. Approve after expiry, deny, caller disconnect, supersede and reload drop is refused with the matching
+   result of the section 3.4 table (`superseded` names the newest id).
 8. **Caller disconnect while held, two cases.** (a) Disconnect before any approve: the entry is `Abandoned`,
    its slot is freed, a later approve returns `gone`, the audit shows `abandoned` and not
    `abandoned_after_approve`. (b) Approve wins, then the caller disconnects before the send (injected
@@ -775,21 +807,24 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
     `max_held_per_identity` holds for one identity, that identity's next request is `unavailable` and
     another identity's is accepted.
 15. **Body rules:** a held body over `held_body_max_bytes` is 413 `denied` and not held; a compressed body
-    is 400 `denied` (`content_encoding`).
-16. **Audit:** the `forward_started` record is present before the upstream request in the mock's
-    timeline, and each hold transition appears once.
+    is 400 `denied` (`content_encoding`); a missing `Authorization` on a held route is 400
+    `credential_missing`; an in-cap `multipart/form-data` body and an over-cap one are each 400 `denied`
+    (`content_type`) with zero upstream requests.
+16. **Audit:** the `forward_started` record is present after the mock accepted the connection and before
+    its first request byte, and each hold transition appears once. With an injected pause between the two
+    milestones of section 3.4 step 8, approve does not return success before the first byte is sent.
 17. **Upstream failure boundary:** a refused connect or a failed TLS handshake (classified by the client's
-    connect-error kind) gives 503 `unavailable` and nothing sent. A mock that accepts and then resets,
-    before or after reading the request, closes the caller connection with no synthetic decision, and the
-    audit has `forward_started` and no `completed`.
+    connect-error kind) gives 503 `unavailable` and nothing sent. A refused connect is a `connect_failed` transition with no `forward_started`. A mock that accepts and then
+    resets, before or after reading the request, closes the caller connection with no synthetic decision;
+    a held request's audit has `forward_started` and no `completed`, an allowed one's single record has
+    `code = upstream_reset`.
 18. **Denied large POST is readable:** a denied 1 MiB `POST` yields a readable 423 (not a reset) on the
     direct path and through the real front.
 19. **Disconnect through the front:** a caller disconnect while held, made through the real TLS front,
     marks the entry `Abandoned` and frees the slot (the stage 1 measurement of the same path).
 20. **Dedupe and retry during hold:** a second request from the same identity with an equal outbound
     request (same forwarded headers and credential values) while the first is held supersedes it: the older
-    caller gets 503 `superseded`, the notification count stays one and now points at the new entry, the old id's page shows the
-    `superseded` banner with approve and deny disabled and a link to the newest entry, one approval
+    caller gets 503 `superseded`, the notification count stays one and now points at the new entry, the old id's page shows a `superseded` banner (not `gone`), approve and deny disabled, and a link to the newest entry, one approval
     produces exactly one upstream request, and the approval page lists one entry. Ten rapid retries leave one entry. The same body and path with
     a changed `Authorization`, or a changed non-credential header, is not a duplicate: it gets its own
     entry and notification. Order: during a cooldown a duplicate is 503 `cooldown`; at
@@ -803,21 +838,22 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
     `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`,
     `Pragma: no-cache` and `X-Content-Type-Options: nosniff`; a request without Basic credentials is 401
     with `WWW-Authenticate` naming the Basic realm; an approve POST without the per-page CSRF token, or
-    with a reused one, is refused; the page shows forwarded header names and no credential value; a superseded entry's page is visibly
-    distinct (banner, controls disabled).
+    with a reused one, is refused; the page shows forwarded header names and no credential value.
 23. **Cooldown:** after a deny or an expiry, the next hold from the same identity within `cooldown_secs`
     is 503 `unavailable`; with `cooldown_secs = 0` it is held; the slot is free right after a deny.
 24. **Probe route absent:** the stage 1 sleep probe route does not exist in the stage 2 build (404 with a
     valid caller key).
-25. **Deadlines:** a stalled upstream on an allowed request is closed at `upstream_idle_secs`, and a slow
-    total transfer at `request_deadline_secs`.
+25. **Deadlines:** a stalled upstream on an allowed or approved request is closed at `upstream_idle_secs`,
+    and a slow total transfer at `request_deadline_secs` (an approved one counted from `forward_started`).
 26. **SIGTERM during an approved forward:** a request past `forward_started` completes (or reaches
     `request_deadline_secs`); only `Pending` entries get 503 `unavailable`.
 27. **Refusal table:** a table-driven test produces every row of section 3.5 and asserts status,
     `X-AP-Decision` and `code` for each.
 28. **Framing and allowed-body boundary:** stage 1 items 12 and 13 repeated in the stage 2 build.
-29. **Audit failure on writes:** with the audit sink failing, a held request is
-    refused 503 `unavailable` and the mock upstream records nothing; an allowed read still passes.
+29. **Audit failure on writes:** with the sink failing before the hold, a held request is refused 503
+    `audit_unavailable` with no notification and no entry, and the mock upstream records nothing; an allowed
+    read still passes. With the sink failing between approve and send, the caller gets 503
+    `audit_unavailable`, the approve result is `audit_unavailable`, and nothing reaches the mock.
 
 ## 8. Open questions for the owner
 
@@ -854,10 +890,10 @@ Open questions 1 to 4 are stage 1 blockers.
     for the PoC. User-facing text for this mode carries the section 4.3 wording (the gate constrains the
     agent, not the Muse platform).
 12. **Does Muse send request bodies compressed or with a non-JSON content type?** Attachments and multipart
-    are out of scope for the pilot (review comments); they are refused by the held-body cap. Whether Muse
-    compresses bodies is still measured in stage 1.
-13. **Audit failure on writes.** Answered by the owner: a failed `forward_started` audit write on a held
-    route refuses the request (503 `unavailable`, nothing sent); reads keep Phase 1 behaviour (section 3.9).
+    are out of scope for the pilot (review comments); the content-type rule refuses them at any size and the
+    cap independently bounds held bodies. Whether Muse compresses bodies is still measured in stage 1.
+13. **Audit failure on writes.** Answered by the owner: a failed `held` or `forward_started` audit write on a held
+    route refuses the request (503 `audit_unavailable`, nothing sent); reads keep Phase 1 behaviour (section 3.9).
 
 ## 9. Evidence and method
 

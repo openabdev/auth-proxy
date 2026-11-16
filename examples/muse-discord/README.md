@@ -1,11 +1,10 @@
 # Proposal + mock: Muse as a caller, Discord as the upstream
 
 **Scope: this is a proposal plus a mock, not a runnable end-to-end
-Muse -> Discord client today.** It sketches the caller side of issue #6 —
+Muse -> Discord client today.** It sketches the caller side of issue #6:
 a Muse custom-connector helper that would reach Discord only through
-auth-proxy, so every outbound call is policy-checked, audit-logged, and —
-once `require_approval` from issue #5 exists, held for the owner's
-approval before it executes.
+auth-proxy, so every outbound call is policy-checked, audit-logged and, once `require_approval` from issue #5 exists, held for
+the owner's approval before it executes.
 
 It cannot reach Discord end-to-end as submitted, for reasons outside this
 directory: `runtime_pubkey` is unset in `identity.toml` (the session plane
@@ -44,7 +43,7 @@ flowchart LR
 | `identity.toml` | Example proxy config (with placeholder digests only): `muse` identity, `discord` route, credential reference, grants. |
 | `caller.py` | Proposal caller (Python 3.11+, stdlib only). Shape for a connector helper once #5/#6 settle. |
 | `mock_proxy.py` | **Contract sketch for #5, not the real proxy.** Stand-in implementing the sketched caller-facing contract, including the proposed approval flow. It omits canonicalization, policy evaluation, the registry, audit and forwarding. No real Discord call ever happens. |
-| `test_caller.py` | Tests of the caller against the mock only: allow, park → approved, park → denied, park → expired, bad surrogate, bare upstream 202, redirect not followed. Green here does not verify the real proxy. |
+| `test_caller.py` | Tests of the caller against the mock only: allow, park → approved, park → denied, park → expired, bad surrogate, bare upstream 202, redirect not followed, expiry without polling, colliding upstream marker, two-session isolation and revoke, revoke racing a park, admin token. Green here does not verify the real proxy. |
 | `test_policy.py` | Mechanical check of the shipped `identity.toml` against a Python mirror of ap-core's `valid_path` + `Policy::evaluate`. Pins down why a narrow create-message grant is not expressible in Phase 1. |
 
 ## Wire protocol (as implemented by the proxy today)
@@ -69,7 +68,7 @@ a write whose grant requires approval would be answered `202` with a
 `X-Auth-Proxy-Approval: parked`** instead of being forwarded. The marker is
 what distinguishes a parked request from a legitimate upstream `202`:
 `caller.py` treats a bare `202` without that header as an ordinary upstream
-response and returns it as-is. The outcome is caller-scoped —
+response and returns it as-is. The outcome is session-scoped:
 `GET {base}/ap/<caller-key>/_approval/<request-id>`, and reports `parked`,
 `executed` (with the upstream response), `denied`, or `expired`. `caller.py`
 polls it. The poll segment is `_approval`, deliberately not a route-style
@@ -117,19 +116,17 @@ EOF
 
 ## Policy walkthrough (`identity.toml`)
 
-- **Reads are granted**: `GET` on `/api/v10/channels/` and `/api/v10/guilds/`
-  (prefixes). This covers reading message history for mention triage.
+- **Reads are granted**: `GET` on `/api/v10/channels/` (prefix). This covers reading message history for mention triage.
 - **The read grant is broader than message history, and cannot be narrowed
   in Phase 1.** `valid_path` requires a trailing `/`, so the exact
   `.../messages` path cannot be granted, and the `.../messages/` prefix does
   not match it (see below). The grant therefore also authorizes
-  `GET /api/v10/channels/<id>/webhooks` and `GET /api/v10/guilds/<id>/webhooks`.
+  `GET /api/v10/channels/<id>/webhooks`.
   If the bot holds Manage Webhooks, Discord returns webhook tokens there.
   A token lets anyone post to the channel directly through Discord, outside
   policy, audit, revocation and approval. Grant the bot no Manage Webhooks,
   even if you never enable writes. `test_policy.py` pins this behaviour.
-  `GET /api/v10/users/@me/guilds` is not under these prefixes and is not
-  granted.
+  Guild paths and `GET /api/v10/users/@me/guilds` are not granted.
 - **Writes are present but commented out.** Phase 1 policy only allows or
   denies, so an enabled write grant would execute immediately, with no
   approval. Uncomment the write grants only together with the

@@ -28,6 +28,8 @@ Covers the outcome paths of the sketched caller contract:
      the caller execute anything: the fabricated request id is unknown to
      the proxy, the poll answers 404 and the caller exits 2 (the real
      proxy must also strip the header, see README / #5),
+ 11. a revoke racing a park (interleaved deterministically) leaves nothing
+     approvable.
  10. polling is bound to the creating session: a second surrogate cannot
      read another session's parked request, ids are unguessable, and
      revoking a surrogate drops what it parked.
@@ -109,8 +111,13 @@ def start_mock(ttl: str, redirect_location: str = "") -> tuple[subprocess.Popen,
         [sys.executable, os.path.join(HERE, "mock_proxy.py")],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, text=True,
     )
-    line = proc.stdout.readline()
-    port = line.strip().split("=", 1)[1]
+    try:
+        line = proc.stdout.readline()
+        port = line.strip().split("=", 1)[1]
+    except BaseException:
+        proc.kill()
+        proc.wait(timeout=10)
+        raise
     return proc, f"http://127.0.0.1:{port}"
 
 
@@ -180,6 +187,48 @@ def wait_parked(base: str, known: set[str], timeout: float = 10.0) -> str | None
             return fresh[0]
         time.sleep(0.1)
     return None
+
+
+def race_revoke_vs_park() -> None:
+    """H-1 (round 2): a revoke that lands between the caller check and the
+    park must not leave an approvable request. Runs the mock in-process so
+    the interleaving is deterministic (no sleeps)."""
+    os.environ.update(MOCK_CALLER_KEY=CALLER_KEY, MOCK_SURROGATE=SURROGATE,
+                      MOCK_ADMIN_TOKEN=ADMIN_TOKEN, MOCK_SURROGATE_2="")
+    sys.path.insert(0, HERE)
+    import mock_proxy
+    paused, resume = threading.Event(), threading.Event()
+
+    def hook():
+        paused.set()
+        resume.wait(10)
+
+    mock_proxy._after_caller_check = hook
+    server = ThreadingHTTPServer(("127.0.0.1", 0), mock_proxy.Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    result: dict = {}
+
+    def post():
+        result["r"] = http(
+            base, "POST", f"/ap/{CALLER_KEY}/discord/api/v10/channels/{CHANNEL}/messages",
+            {"Authorization": f"Bearer {SURROGATE}", "Content-Type": "application/json"}, {"content": "x"})
+
+    thread = threading.Thread(target=post)
+    try:
+        thread.start()
+        check("race: POST paused after the caller check", paused.wait(10))
+        admin_call(base, "POST", f"/_mock/revoke/{sha(SURROGATE)}")
+        resume.set()
+        thread.join(10)
+        status = result.get("r", (None,))[0]
+        check("race: POST racing a revoke is refused (403)", status == 403, str(result))
+        check("race: nothing parked after the revoke",
+              admin_call(base, "GET", "/_mock/parked")[2].get("parked") == [])
+    finally:
+        resume.set()
+        mock_proxy._after_caller_check = None
+        server.shutdown()
 
 
 def main() -> int:
@@ -285,6 +334,8 @@ def main() -> int:
         status, body = poll_as(base_a, SURROGATE, rid2)
         check("other session's requests survive the revoke",
               status == 200 and body.get("status") == "parked", f"{status} {body}")
+
+        race_revoke_vs_park()
 
         # L-5: the admin routes are not open to the caller listener
         status, _h, _b = admin_call(base_a, "POST", f"/_mock/approve/{rid2}", token="wrong")

@@ -21,9 +21,10 @@ name = "muse"
 # with the sha256 of your own generated caller key (see README.md,
 # "Generating keys"); the raw key (apk_...) is held by the caller only.
 caller_key_sha256 = "<CALLER_KEY_SHA256_HEX>"
-# runtime_pubkey = "..."  # base64 Ed25519 PUBLIC key of the registrar that opens sessions for
-# this identity (the registrar keeps the private seed; never put it in this file). For Muse the registrar is a component on the owner's device (issue #6). Hello
-# is refused until this is set.
+# runtime_pubkey = "..."  # base64 Ed25519 PUBLIC key of the registrar that opens
+# sessions for this identity (the registrar keeps the private seed; never put it
+# in this file). For Muse the registrar is a component on the owner's device
+# (issue #6). Hello is refused until this is set.
 
 [[route]]
 name = "discord"
@@ -45,7 +46,7 @@ routes = ["discord"]
 # Reads: allowed. Path entries ending in "/" are prefixes (crates/ap-core/src/config.rs);
 # "/api/v10/channels/" covers channel reads and message history.
 # READ-SIDE RISK: these prefixes cannot be narrowed to messages only in Phase 1, so they also
-# authorize GET .../channels/<id>/webhooks and GET .../guilds/<id>/webhooks. If the bot holds
+# authorize GET .../channels/<id>/webhooks. If the bot holds
 # Manage Webhooks, Discord returns webhook tokens there, and a token lets anyone post to Discord
 # directly, bypassing policy, audit, revocation and approval. Grant the bot no Manage Webhooks.
 # test_policy.py pins this.
@@ -54,7 +55,7 @@ identity = "muse"
 credential = "discord-bot"
 route = "discord"
 methods = ["GET"]
-paths = ["/api/v10/channels/", "/api/v10/guilds/"]
+paths = ["/api/v10/channels/"]
 
 # Writes: DO NOT enable before require_approval (issue #5) exists, unless you accept that
 # matching requests execute immediately.

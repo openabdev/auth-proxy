@@ -113,6 +113,11 @@ if EXAMPLE_SURROGATE_2:
     _surrogates.add(hashlib.sha256(EXAMPLE_SURROGATE_2.encode()).hexdigest())
 
 
+# Test seam: called between the caller check and the park critical section so
+# a test can interleave a revoke deterministically. None in normal runs.
+_after_caller_check = None
+
+
 def _expire_locked(now: float) -> None:
     """The one deadline transition. Callers hold _lock and call this before
     any list, approve, deny or outcome operation."""
@@ -211,7 +216,13 @@ class Handler(BaseHTTPRequestHandler):
         if not match:
             return _json(self, 404, {"code": "route_unknown"})
         body = self._read_json()
+        if _after_caller_check is not None:
+            _after_caller_check()
         with _lock:
+            # Registration is re-checked in the same critical section that
+            # inserts the entry, so a revoke cannot slip in between.
+            if session not in _surrogates:
+                return _json(self, 403, {"code": "surrogate_unknown"})
             _expire_locked(time.monotonic())
             request_id = "req_" + secrets.token_hex(16)
             _parked[request_id] = {
@@ -292,19 +303,21 @@ class Handler(BaseHTTPRequestHandler):
         with _lock:
             _expire_locked(time.monotonic())
             entry = _parked.get(request_id)
-            if entry is None or entry["status"] != "parked":
+            if entry is None or entry["status"] != "parked" or entry["session"] not in _surrogates:
                 return _json(self, 409, {"code": "not_parked"})
             if action == "deny":
                 entry["status"] = "denied"
             else:
+                sent = entry["body"] if isinstance(entry["body"], dict) else {}
+                content, reference = sent.get("content", ""), sent.get("message_reference")
                 entry["status"] = "executed"
                 entry["result"] = {
                     "status": 201,
                     "body": {
                         "id": "1570000000000000001",
                         "channel_id": entry["channel_id"],
-                        "content": entry["body"].get("content", ""),
-                        "message_reference": entry["body"].get("message_reference"),
+                        "content": content,
+                        "message_reference": reference,
                         "via": "mock-upstream",
                     },
                 }

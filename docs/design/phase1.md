@@ -807,3 +807,25 @@ nightly or by hand, because it needs a cluster with `NET_ADMIN`.
 | `exp1` | `spike/exp1/` on `spike/phase0`; summary in the RFC #1 Phase 0 comment |
 | `exp2 <row>` | `spike/exp2/results/matrix-a.txt`, `matrix-a.json`, `bench-a-*.json`, `live-kiro.json` |
 | `k3s <n>`, `k3s F<n>` | `spike/k3s-egress-a/results/` (`01a-audit.jsonl` for test 1a, `02-03-egress-ap-a.jsonl` for 2 and 3, `04-chat-telemetry-on.txt` for 4, `05-tamper.txt` for 5, `06-*` for 6, `07-tools.txt` for 7, `08-restart.txt` for 8); findings F1 to F3 in the k3s validation report on the same branch |
+
+---
+
+## Implementation status (Kubernetes)
+
+Shipped on branch `feat/phase1-k8s`: workspace with `ap-core`, `ap-broker`, `ap-proxy`,
+`ap-client` (UDS session-plane client only), `ap-egress`; the ported fail-closed matrix;
+`deploy/k8s/` (netinit image and script, pod manifest, example policy); `docs/session-plane.md`,
+`docs/operations.md`, `docs/recipes/kiro-cli.md`, `docs/pre-release-checklist.md`;
+`tests/k8s-egress/run.sh` (written, not run); CI workflow. The design above is not rewritten.
+
+Where the decision record wins over this document:
+
+- The `ap-relay` binary, the `aws-sm` feature, the HTTPS session plane and `deploy/ecs/`
+  (section 6) are deferred with the ECS rollout, not built.
+- The Q1-A "one registered session per pod" fallback has no config shape and is not built
+  (open item in `docs/operations.md`).
+- Credential lifetime: Phase 1 credentials are static API keys, so only the session absolute
+  TTL bounds a surrogate.
+- After a proxy restart the persisted authority token stays valid and the 90 s lock counts
+  as live for one authority lease from the restart.
+- `hello` gets no `SO_PEERCRED` rule; the design has none.

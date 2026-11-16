@@ -1,0 +1,110 @@
+# Option A pod: init netinit (NET_ADMIN only), proxy, ap-egress, agent.
+# Not applied by this repository's CI. Replace every image placeholder.
+#
+# Pod Security Admission: the NET_ADMIN init container needs the namespace at
+# `pod-security.kubernetes.io/enforce: privileged`. Phase 1 documents this; a CNI
+# plugin that sets the rules instead is later work.
+#
+# NetworkPolicy: pod-wide egress restriction for the proxy containers is separate
+# from the per-UID rules. See openab-pty's deploy/k8s/networkpolicy-no-tailnet-egress.yaml
+# for the example this deployment is meant to be paired with (not copied here).
+#
+# The credential Secret and the policy ConfigMap use defaultMode 0444 and NO
+# fsGroup (measured on k3s, docs/design/phase1.md [M k3s]): fsGroup would add the
+# group to every container of the pod. The credential Secret is mounted only into
+# the proxy container. The policy file holds source references, never values, so
+# ap-egress may read it for its [egress] section. The agent mounts neither.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-proxy-policy
+data:
+  policy.toml: |
+    # Replace with deploy/k8s/policy.example.toml filled in for your identity.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ap-agent
+  labels: {app: auth-proxy}
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  shareProcessNamespace: false
+  securityContext:
+    seccompProfile: {type: RuntimeDefault}
+  initContainers:
+  - name: netinit
+    image: REPLACE/auth-proxy-netinit:TAG
+    env:
+    - {name: AGENT_UID, value: "1000"}
+    - {name: PROXY_PORT, value: "18080"}
+    - {name: EGRESS_PORT, value: "3128"}
+    securityContext:
+      runAsUser: 0
+      runAsNonRoot: false
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL], add: [NET_ADMIN]}
+  containers:
+  - name: proxy
+    image: REPLACE/auth-proxy:TAG
+    args: ["--policy", "/etc/auth-proxy/policy.toml"]
+    securityContext:
+      runAsUser: 1001
+      runAsGroup: 1001
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
+    volumeMounts:
+    - {name: kiro-secret, mountPath: /run/secrets/auth-proxy/auth-proxy-kiro, readOnly: true}
+    - {name: policy, mountPath: /etc/auth-proxy, readOnly: true}
+    - {name: admin-sock, mountPath: /run/auth-proxy-admin}   # proxy only
+    - {name: session-sock, mountPath: /run/auth-proxy}       # shared with the agent
+    - {name: proxy-state, mountPath: /var/lib/auth-proxy}    # authority token hash
+  - name: ap-egress
+    image: REPLACE/ap-egress:TAG
+    args: ["--policy", "/etc/auth-proxy/policy.toml", "--listen", "127.0.0.1:3128"]
+    securityContext:
+      runAsUser: 1002
+      runAsGroup: 1002
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
+    volumeMounts:
+    # Policy only. No credential Secret, no session socket, no admin socket.
+    - {name: policy, mountPath: /etc/auth-proxy, readOnly: true}
+  - name: agent
+    image: REPLACE/agent-runtime:TAG       # runtime is PID 1 and speaks the session plane
+    workingDir: /work
+    env:
+    - {name: HOME, value: /home/agent}
+    - {name: HTTPS_PROXY, value: "http://127.0.0.1:3128"}
+    - {name: NO_PROXY, value: "127.0.0.1,localhost"}
+    - {name: KIRO_DISABLE_TELEMETRY, value: "1"}
+    # KIRO_API_KEY is the per-session surrogate; the runtime sets it per child.
+    securityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
+    volumeMounts:
+    - {name: session-sock, mountPath: /run/auth-proxy}
+    - {name: agent-home, mountPath: /home/agent}
+    - {name: agent-tmp, mountPath: /tmp}
+    - {name: work, mountPath: /work}
+  volumes:
+  - name: kiro-secret
+    secret: {secretName: auth-proxy-kiro, defaultMode: 0444}
+  - name: policy
+    configMap: {name: auth-proxy-policy, defaultMode: 0444}
+  - {name: admin-sock, emptyDir: {medium: Memory}}
+  - {name: session-sock, emptyDir: {medium: Memory}}
+  - {name: proxy-state, emptyDir: {}}
+  - {name: agent-home, emptyDir: {}}
+  - {name: agent-tmp, emptyDir: {}}
+  - {name: work, emptyDir: {}}

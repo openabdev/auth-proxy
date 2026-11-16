@@ -1,0 +1,48 @@
+# Example policy for one identity. Placeholders only: nothing here is a real key or hash.
+# Generate the hash with:  printf %s "$CALLER_KEY" | sha256sum
+# Routes, credentials and grants follow docs/design/phase1.md Q3-A.
+# No grant here uses aws_targets: kiro-cli's X-Amz-Target behaviour is on
+# docs/pre-release-checklist.md and unconfirmed.
+version = 1
+identity = "pty-team-a"
+caller_key_sha256 = "0000000000000000000000000000000000000000000000000000000000000000" # placeholder
+
+[listener]
+listen = "127.0.0.1:18080"          # P; the netinit PROXY_PORT must match
+
+[[route]]
+name = "kiro-krs"
+host = "runtime.us-east-1.kiro.dev"
+error_shape = "aws"
+surrogate_header = "authorization"
+credential_header = "authorization"
+pass_headers = ["tokentype"]
+
+[[route]]
+name = "kiro-cps"
+host = "control-plane.placeholder.example"      # placeholder: replace with the kiro control-plane host
+error_shape = "aws"
+surrogate_header = "authorization"
+credential_header = "authorization"
+pass_headers = ["tokentype"]
+
+[[credential]]
+id = "kiro"
+source = "k8s:auth-proxy-kiro:api_key"        # <secrets-dir>/auth-proxy-kiro/api_key, proxy container only
+routes = ["kiro-krs", "kiro-cps"]
+
+[[grant]]
+credential = "kiro"
+route = "kiro-krs"
+methods = ["POST"]
+paths = ["/"]
+
+[[grant]]
+credential = "kiro"
+route = "kiro-cps"
+methods = ["POST"]
+paths = ["/"]
+
+[egress]                                       # read by ap-egress only
+allow = ["github.com:443", "registry.npmjs.org:443", "pypi.org:443",
+         "files.pythonhosted.org:443", "index.crates.io:443", "static.crates.io:443"]

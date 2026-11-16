@@ -1,0 +1,11 @@
+# netinit image: the init container that installs the per-UID egress rules.
+# Only iptables-nft and a shell; it holds no credential and no auth-proxy binary.
+# Build: podman build -f deploy/k8s/Containerfile -t auth-proxy-netinit:dev deploy/k8s
+# (The proxy and ap-egress images are static musl release builds, see docs/operations.md.)
+FROM docker.io/library/debian:12-slim
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iptables iproute2 \
+ && rm -rf /var/lib/apt/lists/*
+COPY netinit.sh /opt/ap/netinit.sh
+RUN chmod 755 /opt/ap/netinit.sh
+ENTRYPOINT ["/bin/sh", "/opt/ap/netinit.sh"]

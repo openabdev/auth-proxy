@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # Same commands as scripts/sync-and-test.sh runs on macmini.
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build --release
+      - name: Fail-closed matrix
+        run: |
+          mkdir -p matrix-out
+          rc=0
+          python3 tests/matrix/matrix.py --bin target/release --json matrix-out/matrix.json > matrix-out/matrix.txt || rc=$?
+          cat matrix-out/matrix.txt
+          exit $rc
+      - run: sh scripts/check-egress-deps.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: matrix-output
+          path: matrix-out/
+  # Static musl release job: documented in docs/operations.md, not run here yet.

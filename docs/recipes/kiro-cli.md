@@ -14,8 +14,9 @@ Claim tags: [M exp1] measured in Phase 0 (`spike/exp1/`), [I] inferred.
   through `ap-egress`. `NO_PROXY=127.0.0.1,localhost` keeps the loopback base URLs direct.
   Both are set in `deploy/k8s/pod.yaml`.
 - **Telemetry.** `KIRO_DISABLE_TELEMETRY=1`.
-- **`aws_targets`.** Whether kiro-cli sends one `X-Amz-Target` per call is not confirmed
-  (`docs/pre-release-checklist.md`); no shipped example grant uses `aws_targets`.
+- **`aws_targets`.** kiro-cli 3.3.0 sends one `X-Amz-Target` per call; the model call on the
+  krs route is `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`
+  [M, `docs/verification/phase1-xamz-target.md`]. Other routes use other targets.
 
 Other CLIs: Phase 0 probe results are in `spike/exp1/` [M exp1]. This repository ships no
 recipe for them in Phase 1 and makes no new claims about them.

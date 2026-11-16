@@ -7,8 +7,8 @@ been run.
    against a cluster with `NET_ADMIN` (ESTABLISHED accept, per-port allow and reject,
    `! -o lo` reject, DNS blocked). Until then the combined set is [I]; the parts were
    measured separately [M k3s F1, F2].
-2. **kiro-cli `X-Amz-Target`.** Confirm kiro-cli sends a single `X-Amz-Target` per call.
-   Until confirmed, no shipped example grant uses `aws_targets`.
+2. **kiro-cli `X-Amz-Target`.** Done: kiro-cli 3.3.0 sends one `X-Amz-Target` per call
+   [M, `docs/verification/phase1-xamz-target.md`]. Re-check after a kiro-cli upgrade.
 3. **Real-pod hello race.** Kill the runtime container with the proxy up, confirm no
    agent-UID orphan survives and the fresh PID 1 wins `hello` after the 90 s lock. (The
    automated version is `crates/ap-proxy/tests/hello_race.rs`.)

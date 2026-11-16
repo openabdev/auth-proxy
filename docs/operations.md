@@ -103,8 +103,8 @@ the way to revoke everything, and readiness can probe the agent listener.
 
 ## Open items
 
-- **The `kiro-cps` route host** in `deploy/k8s/policy.example.toml` is a placeholder. See
-  `docs/pre-release-checklist.md`.
+- **The `kiro-cps` route** host is measured; its `pass_headers`, `error_shape` and other-region
+  probes are unchecked. See `docs/pre-release-checklist.md` item 5.
 - Release gates still open: the real-pod `hello` race (checklist item 3) and the PSA decision
   (item 4). The combined iptables rule set is no longer open: it is [M] in one pod
   (`docs/verification/phase1-k8s-iptables.md`).

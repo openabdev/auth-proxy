@@ -21,10 +21,10 @@ pass_headers = ["tokentype"]
 
 [[route]]
 name = "kiro-cps"
-# OPEN ITEM: this host is a placeholder. The measured kiro-cli capture pointed every endpoint at a
-# local listener, so it never recorded the real api.cps.service host; docs/pre-release-checklist.md
-# says what is needed. The pod cannot be deployed until it is replaced.
-host = "control-plane.placeholder.example"
+# Measured [M] with kiro-cli 3.3.0 (docs/pre-release-checklist.md item 5): GetProfile and
+# ListAvailableModels go to this host on 443 by default. pass_headers and error_shape are still
+# unchecked against a real first response.
+host = "management.us-east-1.kiro.dev"
 error_shape = "aws"
 surrogate_header = "authorization"
 credential_header = "authorization"

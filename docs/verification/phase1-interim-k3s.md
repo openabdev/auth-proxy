@@ -27,5 +27,5 @@ credential and no real model call. Claim tags: [M] measured.
   old session's surrogate then got `403 surrogate_revoked`.
 
 ## Limits
-kiro-cli 2.37.0, not 3.3.0. The runtime is a stand-in, not a real one. The `kiro-cps` host is still open
-(`docs/pre-release-checklist.md` item 5).
+kiro-cli 2.37.0, not 3.3.0. The runtime is a stand-in, not a real one. The `kiro-cps` host was measured later
+(`docs/pre-release-checklist.md` item 5); this run used a stand-in host.

@@ -64,8 +64,9 @@ header lists. It was applied once on a k3s test node with a stub upstream and a 
 
 ## Open items before the first deployment can run
 
-- The `kiro-cps` route host in `deploy/k8s/policy.example.toml` is a placeholder. See
-  `docs/pre-release-checklist.md` for exactly what is needed.
+- The `kiro-cps` route host is measured (`management.us-east-1.kiro.dev`); its `pass_headers`,
+  `error_shape` and the other-region `management.*` probes are unchecked. See
+  `docs/pre-release-checklist.md` item 5.
 - The real-pod hello-race check (checklist item 3) is still a release gate. The interim path
   does not call `hello`, but the gate stays: it protects the Q1-B path this interim path is
   waiting for, and the release is not done without it.

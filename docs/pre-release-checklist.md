@@ -1,7 +1,7 @@
 # Pre-release checklist
 
 Items 1 and 2 are done. The real-pod `hello` race (item 3) is still a **release gate**, and the
-`kiro-cps` host (item 5) is open.
+`kiro-cps` host (item 5) is measured for us-east-1 but its response-side settings are unchecked.
 
 1. **Combined iptables/ip6tables rule set in one pod.** Done [M]: PASS on a real k3s node with the
    real `auth-proxy` and `ap-egress` binaries (`docs/verification/phase1-k8s-iptables.md`; test
@@ -20,14 +20,23 @@ Items 1 and 2 are done. The real-pod `hello` race (item 3) is still a **release 
    (`docs/verification/phase1-interim-k3s.md`). Re-run it with the real runtime before release.
 4. **PSA.** The `NET_ADMIN` init container needs Pod Security Admission `privileged` in the
    target namespace.
-5. **`kiro-cps` route host (open).** `deploy/k8s/policy.example.toml` carries a placeholder.
-   The verified kiro-cli capture (`docs/verification/phase1-xamz-target.md`) pointed every
-   endpoint at a local listener, so it does not contain the real `api.cps.service` host and
-   cannot fill it in. What is needed: the real control-plane host kiro-cli 3.3.0 uses by default,
-   with no credential involved. Either read it from kiro-cli's default `api.cps.service` endpoint
-   setting, or observe the TLS server name kiro-cli connects to for `GetProfile` /
-   `ListAvailableModels` (a DNS or SNI log, with the request not completing). Then set `host`,
-   and check that the route's `pass_headers` and error shape match what that host expects.
+5. **`kiro-cps` route host. Measured [M], response side still open.** kiro-cli 3.3.0 (macOS, one run,
+   dummy `KIRO_API_KEY`, throwaway HOME) was run with `HTTPS_PROXY` pointing at a local listener
+   that logged each `CONNECT host:port` and answered 403, so nothing left the machine and no DNS
+   lookup happened. It asked for `management.us-east-1.kiro.dev:443` 30 times (retries), and for
+   `runtime.us-east-1.kiro.dev:443` for the model path (the `kiro-krs` host, unchanged). In a
+   second run with only the `api.cps.service` endpoint overridden to the local listener, every
+   `management.*` CONNECT disappeared and 29 POSTs arrived at the override instead, so
+   `management.us-east-1.kiro.dev` is the default `api.cps.service` host. `policy.example.toml`
+   now uses it with port 443 and no special `Host` header.
+   Still unchecked: (a) `pass_headers = ["tokentype"]` and `error_shape = "aws"` can only be
+   verified against a real first response from that host; (b) the same run also tried
+   `management.*` hosts in other regions (eu-central-1, us-gov-east-1, us-gov-west-1 and four
+   `us-iso*` hosts, 9 CONNECTs each), probably a profile-region fan-out. TLS was not decrypted,
+   so which call went to which region is unknown. The policy allows only us-east-1, so those
+   would be denied; check with a real session whether kiro-cli copes; (c) the `Host` header
+   value inside TLS was not seen (a CONNECT proxy only sees `host:443`); (d) only the laptop
+   had kiro-cli 3.3.0: `mini` has 2.37.0 and `bl` 2.1.1, so no homelab Linux run was done.
 6. **Interim acceptance.** The first deployment uses the interim static session: no per-session
    revocation, accepted by the owner (`docs/interim-static-session.md`). Confirm the proxy start
    line says `INTERIM static session enabled` and that the pod mounts no session socket into the

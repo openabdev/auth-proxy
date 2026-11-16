@@ -1,4 +1,4 @@
-RESULT: OPEN (not filled; item 4 does not support a concrete host)
+RESULT: SUPERSEDED by item7-cps-host.md (host measured)
 
 # Item 6c: `kiro-cps` route host
 

@@ -853,12 +853,10 @@ nightly or by hand, because it needs a cluster with `NET_ADMIN`.
 
 ## 8. Out of scope and still open
 
-- **kiro-cps route host (open item).** `deploy/k8s/policy.example.toml` still carries a
-  placeholder for the `kiro-cps` route host. The verified kiro-cli capture
-  (`docs/verification/phase1-xamz-target.md`) pointed every endpoint at a local listener, so it
-  records the targets (`GetProfile`, `ListAvailableModels`) but not the real control-plane host.
-  The exact need is in `docs/pre-release-checklist.md`. The first deployment cannot run until it
-  is filled in.
+- **kiro-cps route (partly open).** The host is measured: `management.us-east-1.kiro.dev:443`
+  (`docs/pre-release-checklist.md` item 5). `pass_headers` and `error_shape` for that route are
+  not yet checked against a real response, and kiro-cli also probes `management.*` hosts in other
+  regions that the example policy does not allow.
 - **ECS rollout (Option C)**, deferred by the Q2 decision: the S2 Secrets Manager store and its
   cache bound, per-bot proxy services, `ap-relay`, and the IAM, Secrets Manager and
   execution-role changes. The `aws-sm` feature, the HTTPS session plane and `deploy/ecs/` wait

@@ -29,11 +29,12 @@ Stated by the owner and treated as fixed [A owner]:
 3. The request is the full Discord HTTP request. Policy per identity: reads (`GET` on allowed prefixes)
    pass immediately. Writes (for example `POST /channels/{id}/messages`) are held.
 4. For a held request the proxy holds the connection until the human approves on the phone. It then
-   forwards the held request byte for byte to Discord and returns Discord's response verbatim (status,
-   headers minus hop-by-hop, body). Muse needs no approval proof or token.
-5. On deny or timeout the proxy returns a terminal error that Discord's own responses cannot be mistaken
-   for (distinct status and an `X-AP-Decision: denied|expired|unavailable` header) and sends nothing to
-   Discord.
+   forwards the held request to Discord and returns Discord's response verbatim (status,
+   headers minus hop-by-hop, body). "Unchanged" means the body bytes plus the semantic header set
+   (section 3.1), not the wire framing, header case or header order. Muse needs no approval proof or token.
+5. On deny, caller rejection, timeout or an unavailable gate the proxy returns a terminal error that
+   Discord's own responses cannot be mistaken for (distinct status and an
+   `X-AP-Decision: denied|expired|unavailable|rejected` header) and sends nothing to Discord.
 6. The connection is the state. There is no durable approved state, no polling endpoint and no one-time
    proof. A crash after approval and before forwarding loses the held connection, nothing executes, and
    Muse's retry starts a new approval round.
@@ -44,7 +45,7 @@ Stated by the owner and treated as fixed [A owner]:
 sequenceDiagram
     autonumber
     participant M as Muse egress<br/>(swaps surrogate for real token)
-    participant F as TLS front<br/>(terminates TLS)
+    participant F as TLS front<br/>(tailscale serve, owner's node)
     participant G as auth-proxy<br/>passthrough route
     participant A as Approval plane<br/>(separate listener)
     participant H as Human (phone)
@@ -52,7 +53,7 @@ sequenceDiagram
 
     M->>F: HTTPS request + caller-key header + real Authorization
     F->>G: same request, loopback
-    G->>G: canonicalize, caller key, policy
+    G->>G: canonicalize, route name, caller key, policy
     alt read, grant = allow
         G->>D: forward (caller-key header removed)
         D-->>G: response
@@ -62,8 +63,8 @@ sequenceDiagram
         G-->>A: notify (hook)
         H->>A: open page, review full request, approve or deny
         alt approved before hold_secs
-            A-->>G: approve(id, request hash)
-            G->>D: forward held request byte for byte
+            A-->>G: approve(id)
+            G->>D: forward held request (body bytes unchanged)
             D-->>G: response
             G-->>M: response verbatim
         else denied, expired, gate unavailable
@@ -92,19 +93,33 @@ reuses Phase 1 steps 1 to 3 and 6 and skips steps 4, 5 and 7 [I phase1.md sectio
 5. `allow`: forward now. `hold`: section 3.4. Deny: terminal error (section 3.5).
 6. One audit record per request, extended with the hold transitions (section 3.9).
 
-The upstream host comes only from the route configuration, never from the request. The forwarder keeps
+The upstream host comes only from the route configuration, never from the request. The route is chosen
+by a name in the URL path that policy maps to a fixed host. An unknown route name fails closed (denied,
+nothing sent), and no part of the request, including `Host`, a query parameter or a header, can supply an
+upstream host (this closes server-side request forgery). The forwarder keeps
 its Phase 1 properties: rustls with SNI equal to the route host, no redirect following, so a 3xx from
 Discord goes back to Muse unchanged [I forward.rs `client_builder`].
 
-Route addressing. Muse is given a base URL. The PoC proposes `https://<public-host>/pt/<route>/<discord
-path>`, so the Discord path after `/pt/<route>` is forwarded unchanged (for example `/api/v10/channels/...`).
-Whether a Muse connector accepts a base URL with a path prefix is unknown [A]; see open question 4.
+Route addressing. Muse is given a base URL. The PoC uses path-prefix routing, for example
+`https://<public-host>/discord/api/v10/channels/...`, and not a `?upstream=` query. The Discord path after
+`/<route>` is forwarded unchanged. Whether a Muse connector accepts a base URL with a path prefix is
+unknown [A]; see open question 4.
 
 Headers forwarded upstream (passthrough):
 
 - Forward every inbound header except: the caller-key header, any other `x-ap-*` header, hop-by-hop
   headers and headers named by `Connection`, and `Host` (set to the route host, which necessarily differs
   from what Muse sent).
+- Also strip a configurable list of headers that the front or a proxy hop adds: by default `Forwarded`,
+  `X-Forwarded-*`, `X-Real-IP`, `Via`, `CF-*` and `Tailscale-*`. The identity headers that `tailscale
+  serve` injects are defence in depth only. They never replace the caller key, and they are not sent to
+  Discord. `Cookie` is a credential header and is not forwarded either unless the owner adds it to the
+  keep list (the default list keeps `Authorization` only) [A, Muse is expected to send no cookie].
+- `Expect: 100-continue` is answered by the proxy (a `100 Continue` is sent only after the verdict allows
+  reading the body) and the header is not forwarded. A denied request never receives a `100 Continue`.
+- Semantic header set: the set of header names and values, with repeated headers kept as repeated values
+  in order. Case and wire order may differ. "Unchanged" in this document means the body bytes and this
+  set, with the exclusions above.
 - `Authorization` and every other credential header are **kept**. This is the difference from Phase 1,
   where `strip_request_headers` removes all of `AUTH_HEADERS` before the swap [I headers.rs].
 - `Content-Length` is set from the buffered body for held requests and from the declared length for
@@ -190,33 +205,52 @@ Everything else, including `PUT`, `PATCH`, `DELETE` and `POST` to other paths, i
 
 Sequence for a `hold` verdict:
 
-1. Decide on method and path before reading the body. A denied request is answered without reading the
-   body, and the connection is closed.
+1. Decide on method and path before reading the body. A denied request is answered without holding the
+   body. Before the response the proxy drains up to `held_body_max_bytes` of the inbound body within
+   `body_read_secs`, or else sends the response and half-closes with a short linger, so that a client
+   still writing a large body can read the 423 instead of seeing a reset [A, client behaviour on early
+   response is not verified; stage 2 tests it].
 2. Read the body into memory, bounded by `held_body_max_bytes` and by `body_read_secs`. Over the cap is
    413 with `X-AP-Decision: denied`; the request is not held.
 3. Require `Content-Encoding` absent or `identity`. A compressed body cannot be shown to the approver as
    the bytes Discord will decode. [A] Muse does not compress requests; if it does, the answer is deny,
    not decompress.
-4. Compute the canonical request digest: sha256 over method, route name, raw path, raw query and body
-   bytes (length-prefixed fields). This is the hash the approver signs off on. It binds approval to the
-   exact bytes held, as #5 requires [I issue #5, "approval must bind to exactly what will be sent"]. With
-   an in-memory immutable entry the hash cannot drift, but it is cheap and it lets the approval API
-   refuse an approve call that names a stale id.
-5. Insert the entry in the in-memory table (section 3.7), write the `held` audit record, fire the
-   notification, and await a one-shot decision with a timeout of `hold_secs`.
+4. Compute the request digest: sha256 over method, route name, raw path, raw query and body bytes
+   (length-prefixed fields). The digest is shown to the approver, written to the audit record and used to
+   dedupe pending holds (step 5). It is not an input to approve: the approval API takes the entry id only.
+   The entry is immutable in memory, so the id already names exactly the bytes that will be sent.
+5. Dedupe: a new hold with the same identity and digest as a `Pending` entry supersedes it. The older
+   connection is answered 503 `unavailable` (code `superseded`), nothing is sent for it, and the human sees
+   one prompt, for the newest connection. This bounds a Muse that retries while the first request is still
+   held. Then insert the entry in the in-memory table (section 3.7), write the `held` audit record, fire
+   the notification, and wait for the decision up to `hold_secs`.
 6. The entry is a state machine guarded by one mutex: `Pending` to exactly one of `Approved`, `Denied`,
-   `Expired`, `Abandoned` (caller disconnected). The first transition wins. This is single execution:
-   a held request cannot be approved twice, because `Approved` is not re-enterable.
-7. On `Approved` the handler itself builds the upstream request from the held bytes and sends it. The
-   forward runs in the handler's task, not in a detached task. If Muse drops the connection before the
-   forward starts, the handler future is dropped and nothing is sent. If the drop happens during the
-   forward, the request may already be at Discord; the audit shows `forward_started` without
-   `completed`.
-8. Discord's response streams back unchanged, as for an allowed request [I pipeline.rs step 9].
+   `Expired`, `Abandoned` (caller disconnected), `Superseded` or `Dropped` (identity removed on reload,
+   section 3.9). The first transition wins. A held request cannot be approved twice, because `Approved`
+   is not re-enterable. This design is single-instance only: the table is per process, and a second
+   instance behind the front would not see the first one's entries.
+7. Disconnect detection. The handler owns a Drop guard that moves the entry to `Abandoned` when the
+   handler future is dropped, and it races the decision against a socket-closed signal (a read of the
+   idle connection returning EOF or error). Whether a client disconnect reaches the proxy through the
+   TLS front, and how fast, is unmeasured [A]; stage 1 measures it through the real front (section 7).
+8. On `Approved` the handler re-checks that the caller is still connected, then builds the upstream
+   request from the held bytes and sends it. The forward runs in the handler's task, not in a detached
+   task. The approve call returns success only after the forward has started. If the entry is `Abandoned`
+   or the caller is gone first, the approve call returns `approved_but_abandoned`, nothing is sent, and
+   the audit shows `abandoned_after_approve`. If the drop happens during the forward, the request may
+   already be at Discord; the audit shows `forward_started` without `completed`.
+9. Discord's response streams back unchanged, as for an allowed request [I pipeline.rs step 9].
 
-What the approver sees is the same bytes that will be sent, not a re-rendered form. The page shows the
-method, route, raw path, raw query, content type, body size and body as escaped text (never as HTML), and
-the digest.
+Cooldown. After a human deny or an `expired` verdict, new holds from that identity are refused with 503
+`unavailable` (code `cooldown`) for `cooldown_secs`. The default is 60, and 0 disables it. The slot is
+freed immediately on deny. This bounds the phone prompts from an agent that retries after a refusal.
+
+What the approver sees is the data that will be sent, not a re-rendered form. The page shows the method,
+route, raw path (with token segments redacted, section 3.9), raw query, content type, body size, the body
+as escaped text (never as HTML), the digest, and the names of the headers that will be forwarded with their
+values for non-credential headers. Credential header values (`Authorization` and the rest of
+`AUTH_HEADERS`) are shown as present, not as values. The approver therefore sees every header that will
+reach Discord, by name at least.
 
 ### 3.5 Outcome contract
 
@@ -226,10 +260,13 @@ removes any `x-ap-*` header from the upstream response, so the marker cannot be 
 
 | Case | Status (proposed) | `X-AP-Decision` | Sent to Discord |
 |---|---|---|---|
-| Human denied, or no grant matches, or caller key rejected, or body over cap | 423 | `denied` | nothing |
+| Human denied, or no grant matches | 423 | `denied` | nothing |
+| Caller key missing, duplicate, malformed or unknown (`caller_rejected`) | 401 | `rejected` | nothing |
+| Body over cap | 413 | `denied` | nothing |
 | `hold_secs` elapsed with no decision | 410 | `expired` | nothing |
-| Gate cannot decide: policy unavailable, hold table full, shutting down, upstream connect failure after approval | 503 | `unavailable` | nothing |
+| Gate cannot decide: policy unavailable, hold table full, per-identity cap, cooldown, superseded, shutting down, or upstream connect failure before any request byte was written | 503 | `unavailable` | nothing |
 | Allowed or approved and forwarded | Discord's own | absent | the request |
+| Upstream failure after the request was written | none: the client connection is closed | none | possibly the request |
 
 Why these statuses: Discord's documented API statuses are 2xx, 304, 400, 401, 403, 404, 405, 429 and some
 5xx [A, not checked in this work], so 423 and 410 are not expected from Discord, while 403, 404 and 503 are.
@@ -240,8 +277,13 @@ Two behaviours follow from "terminal":
 
 - No `Retry-After` header and no hint that the same request may succeed later. An expired request is a
   recorded refusal, not a state to poll [I issue #5 comment, "expiry is a verdict, not a state"].
-- A failure after the forward began, for example Discord resets the stream, closes the client connection
-  without a synthetic success, as Phase 1 does [I phase1.md section 4, "Upstream error mid-stream"].
+- A failure after the forward began, for example Discord resets the stream or the connection breaks after
+  the request was written, closes the client connection without a synthetic decision or success, as Phase 1
+  does [I phase1.md section 4, "Upstream error mid-stream"]. The audit shows `forward_started` and no
+  `completed`. "Nothing sent" in the table applies only to the rows that say so: once a request byte has
+  been written upstream the proxy cannot claim that Discord did not see it.
+- `caller_rejected` has its own status (401) and its own code, so an auth failure is never read as a
+  human denial.
 
 ### 3.6 Approval plane (open point e)
 
@@ -258,22 +300,25 @@ Structure, the same in every option below:
   a network property, not a code property; the acceptance test in section 7 checks it from the caller
   path.
 
-Options for how the human reaches it, none built here:
+The PoC approval plane is a minimal web page on a listener bound to loopback and published to the
+owner's phone through a second `tailscale serve` mapping, with reachability limited by ACL or tag to the
+owner's devices and not to Muse's node [A]. A local CLI over a Unix socket remains a fallback. The HTTP
+API is client-agnostic (`GET /pending`, `GET /pending/<id>`, `POST /pending/<id>/approve|deny`), in line
+with the #6 decision that app shells are thin clients over the same endpoints [I issue #6 comment 1].
+WebAuthn approval over the digest is a later replacement for the credential step [I issue #6 comment 1].
 
-| Option | How | Pros | Cons |
-|---|---|---|---|
-| A. Local CLI on the proxy host | Unix socket with mode 0600, CLI over SSH | Smallest. No new network listener. Reuses `bind_unix_socket` [I listener.rs] | Not "on the phone" unless the phone has an SSH client |
-| B. Minimal web page on a private-network listener | `GET /pending`, `GET /pending/<id>`, `POST /pending/<id>/approve\|deny`, approver bearer token, bound to a private-network or loopback address behind the owner's private network | Phone-friendly. Works with any browser. Client-agnostic API, in line with the #6 decision that PWA and native app are thin shells over the same endpoints [I issue #6 comment 1] | A bearer token on a phone browser is weaker than a device-bound key. Needs CSRF protection and strict output escaping |
-| C. B plus the owner's existing notification channel | The hold fires a webhook to an existing notifier; the notification carries a link to B's page and a one-line summary only | No new notification surface. Issue #6 names an existing display daemon as the first consumer [I issue #6 comment 2] | A display is not a reliable push when the phone is locked [I issue #6 comment 2, stated limitation] |
-| D. B with WebAuthn approve | Passkey assertion over the request digest | Strongest, approver key never leaves the device [I issue #6 comment 1] | Largest build. Not for the PoC |
+Page controls:
 
-Recommendation for the PoC: B with C's notification. Keep the HTTP API client-agnostic so D can replace
-the bearer step later. Controls for B: the approver token is compared in constant time against a stored
-hash; the page sets `Content-Security-Policy: default-src 'none'` with only what it needs and renders
-the body with escaping; `approve` and `deny` are `POST` and require the approver token in a header, not a
-cookie, so CSRF does not apply; the page never renders or logs an `Authorization` value from a held
-request (the entry keeps it for forwarding but the view model omits it). The page shows that an
-`Authorization` header is present, not its value.
+- Authentication is an HTTP Basic realm. The approver credential is a secret unrelated to any caller key,
+  compared in constant time against a stored hash.
+- `approve` and `deny` are form `POST`s. A browser sends Basic credentials automatically, so each page
+  carries a per-page CSRF token (random, bound to the entry id, single use) that the POST must echo.
+- The page sets `Content-Security-Policy: default-src 'none'` (plus `form-action 'self'`), has no script
+  and no inline style, and renders the body and every value with HTML escaping.
+- The page never renders or logs an `Authorization` value from a held request (the entry keeps it for
+  forwarding but the view model omits it). It shows that the header is present.
+- Notification carries a link and a one-line summary only (method, route, redacted path), never a body or
+  a credential. A display is not a reliable push when the phone is locked [I issue #6 comment 2].
 
 An unreachable approval plane is not a special case. Holds expire as `expired` after `hold_secs`. The
 gate fails closed in time as well as in space [I issue #5 comment 1, point 3].
@@ -295,7 +340,9 @@ these limits added. Proposed defaults, all configurable [A, values are starting 
 | `held_body_max_bytes` | 1 MiB | 413, `denied`, not held |
 | `max_held_total` | 32 | 503, `unavailable`, not held |
 | `max_held_per_identity` | 4 | 503, `unavailable`, not held |
-| `holds_per_identity_per_minute` | 10 | 503, `unavailable`, not held. Bounds how often a retrying Muse can prompt the phone |
+| `cooldown_secs` (per identity, after deny or expiry) | 60 (0 disables) | 503, `unavailable`, not held (section 3.4) |
+| `request_deadline_secs` (total, from first byte to last response byte, allowed requests; a hold's wait is not counted) | 300 | close the connection |
+| `upstream_idle_secs` (no byte from Discord on an allowed or approved stream) | 30 | close the connection |
 | `hold_secs` | 120 (range 5 to 600) | `expired` |
 | TCP keepalive on accepted sockets | on | keeps idle NAT and middlebox state alive during a hold |
 
@@ -310,7 +357,7 @@ Shutdown: on SIGTERM the proxy answers every held request `unavailable` and exit
 the sockets (section 5).
 
 Held entries live in process memory only. Nothing about a held request, including headers, is written to
-disk, to the audit stream, or to a core dump (set `RLIMIT_CORE` to 0 at startup) [A].
+disk or to the audit stream.
 
 ### 3.8 Canonicalization for policy matching (open point g)
 
@@ -332,37 +379,35 @@ Added for passthrough:
 2. **No second decode.** The path forwarded upstream is the same raw string the policy matched, and the
    query is forwarded raw. Because the policy is an allow list with default deny, an encoding the policy
    does not recognize fails to match and is denied; it cannot turn a write into a read.
-3. **Percent-encoded unreserved characters** (a `%` followed by two hex digits that decode to a letter,
-   digit, `-`, `.`, `_` or `~`) are refused with `path_ambiguous`. Discord paths do not need them, and a
-   legitimate emoji reaction path uses encoded non-ASCII bytes, which stay allowed [A].
-4. **Method** is the exact received token; only listed methods match; `HEAD` and `OPTIONS` need a grant.
-5. **Path patterns** are matched whole-path, segment by segment (section 3.3). Query is not part of the
+3. **Method** is the exact received token; only listed methods match; `HEAD` and `OPTIONS` need a grant.
+4. **Path patterns** are matched whole-path, segment by segment (section 3.3). Query is not part of the
    match, and is shown to the approver.
-6. **Body size cap** per section 3.7 before policy returns `hold`. An `allow` request keeps the Phase 1
+5. **Body size cap** per section 3.7 before policy returns `hold`. An `allow` request keeps the Phase 1
    cap `limits.max_body_bytes`, default 32 MiB [I config.rs `Limits`].
-7. **`Content-Encoding`** on a held request must be absent or `identity`.
-8. **Duplicate security-relevant headers** (caller key, `Authorization`) are refused, not merged.
+6. **`Content-Encoding`** on a held request must be absent or `identity`.
+7. **Duplicate security-relevant headers** (caller key, `Authorization`) are refused, not merged.
 
 ### 3.9 Audit
 
 Phase 1 writes one line per request with no field for a key, credential or query [I audit.rs]. The
 passthrough mode adds fields and transitions, and keeps that property:
 
-- Transitions for a held request: `held`, `approved` or `denied` or `expired` or `abandoned`,
-  `forward_started`, `completed`. Each carries the request id, identity, route, method, route-relative
-  path without query, the digest, and for decisions the approver identity.
-- `auth_present` (boolean) and `auth_scheme` where the scheme is one of `Bot`, `Bearer` or `other`. The
-  scheme is taken only if it matches that fixed list. A header value with no scheme would otherwise put
-  the secret in the first token. This gives stage 1 evidence that Muse's swap happened without logging
-  the token.
+- Transitions for a held request: `held`, then one of `approved`, `denied`, `expired`, `abandoned`,
+  `superseded` or `dropped_on_reload`, then `forward_started`, `completed`, or `abandoned_after_approve`
+  (approved, but the caller was gone before the forward started, nothing sent). Each carries the request
+  id, identity, route, method, the redacted route-relative path (below), the digest, and for decisions the
+  approver identity.
+- `dropped_on_reload`: when a policy reload removes an identity, its `Pending` entries move to `Dropped`,
+  are answered 503 `unavailable`, and nothing is sent. Entries of identities that remain are untouched.
+- `auth_present` (boolean). It gives stage 1 evidence that Muse's swap happened without logging the token.
+- Path redaction. Discord paths can carry secrets: the token segment of `/webhooks/{id}/{token}...` and
+  `/interactions/{id}/{token}/...` is replaced by `<redacted>` in the audit record, on the approval page
+  and in the notification. The audit may instead carry the matched grant pattern. No raw path is logged
+  for these prefixes.
 - No header value of any kind, no query, no body.
-- The `forward_started` record is written before the upstream request is sent. If that write fails, the
-  held request is not forwarded (`unavailable`). This keeps the lesson from the issue #5 discussion that
-  the record precedes the action [I issue #5 comment 1, point 1], without a hash chain.
-
-Phase 1's audit sink is stdout and a failed write does not refuse a request [I phase1.md section 4,
-"Audit write failure"]. The `forward_started` rule above is the one place the PoC makes the write
-load-bearing.
+- The `forward_started` record is written before the upstream request is sent, so the record precedes
+  the action [I issue #5 comment 1, point 1]. Phase 1's audit sink is stdout and a failed write does not
+  refuse a request [I phase1.md section 4, "Audit write failure"]; the PoC keeps that behaviour.
 
 ## 4. Trust model changes (open points b and c)
 
@@ -379,20 +424,21 @@ What still holds: the agent that talks to Muse does not hold the credential (Mus
 
 ### 4.2 Compensating controls (required for the PoC)
 
-1. **Encrypted remote leg only.** Either Muse reaches the gate over the owner's private network, or over
-   public TLS. The proxy keeps `bind_loopback`, which refuses any non-loopback bind [I listener.rs], and a
-   TLS terminator on the same host (a reverse proxy or a tunnel agent) forwards to loopback. No plaintext
-   listener on a non-loopback address. This keeps the existing code invariant intact and avoids adding a
-   TLS server stack to the proxy. If the owner prefers native TLS in the proxy, that is a new code path
-   and a new `bind_remote` that requires a certificate. Caveat: **whoever terminates TLS sees the token**.
-   A self-run terminator is inside the trust boundary. A managed third-party tunnel is not, and the owner
-   should decide whether that is acceptable (open question 3).
+1. **Encrypted remote leg, self-run terminator.** Decided by the owner: TLS terminates in `tailscale
+   serve` on the owner's own node, which forwards to the proxy on loopback. The proxy keeps
+   `bind_loopback`, which refuses any non-loopback bind [I listener.rs]. There is no `bind_remote`, no
+   native TLS in the proxy and no managed third-party tunnel. **Whoever terminates TLS sees the token**;
+   here that is the owner's own node, inside the trust boundary. Reachability of the public mapping is
+   restricted to Muse's node by tailnet ACL or tag [A]. The identity headers `tailscale serve` injects
+   are defence in depth only, never a substitute for the caller key, and are stripped before forwarding
+   (section 3.1). Whether `tailscale serve` interrupts a long-held idle connection is unmeasured [A];
+   stage 1 measures it.
 2. **Redact credentials everywhere.** `Authorization`, `Cookie`, `Proxy-Authorization`, the caller-key
    header and the rest of `AUTH_HEADERS` [I headers.rs] are never written to audit, error bodies, logs,
    panic messages or debug output. Concretely: sensitive-marked header values, hand-written `Debug` for
    held entries and request wrappers, error bodies built from fixed strings (as `Code::message` is
-   [I error.rs]), no request-header logging in the TLS front, core dumps off, and panic handling that
-   does not print request data.
+   [I error.rs]), no request-header logging in the TLS front, and panic handling that does not print
+   request data.
 3. **Held requests in memory only, bounded.** Count, size and lifetime as in section 3.7. Nothing is
    persisted. On shutdown the table is dropped.
 4. **Fail closed.** Unknown, unavailable or full means refuse, with `X-AP-Decision: unavailable`, and
@@ -403,6 +449,11 @@ What still holds: the agent that talks to Muse does not hold the credential (Mus
    token scoped to the channels the connector needs, and rotate it if the gate host is ever suspected.
 
 ### 4.3 What this gate does not protect against (open point c)
+
+The caller key is not bound to the Discord token. Anyone who steals a caller key can send requests for
+that identity, which allows phone-prompt spam, and can use the gate as a relay for a Discord token they
+already hold, within the identity's policy. This is an accepted PoC limit. Revocation is deleting the
+identity, and the cooldown and per-identity cap bound the prompt spam.
 
 The gate protects against the agent: a prompt-injected or mistaken agent behind Muse cannot cause a
 write to Discord without the human approving it, provided the agent can only act through the connector.
@@ -427,17 +478,19 @@ Deployment models]. This mode has no equivalent, because Muse is not inside our 
 | Crash after approve, before forwarding | The approval is lost with the process. Muse sees a connection error | yes |
 | Crash after the forward began | Discord may or may not have the request. Muse sees an error. A retry starts a new round and the human sees a second prompt | no, possibly executed once |
 | Muse drops the connection while held | Entry becomes `Abandoned`. A later approve call is refused as `gone` | yes |
-| Approve races a Muse disconnect | First transition wins. If `Approved` wins and the handler is dropped before the send, nothing is sent | yes, unless the send started |
+| Approve races a Muse disconnect | First transition wins. If `Approved` wins and the caller is gone before the send, the approve call returns `approved_but_abandoned`, audit `abandoned_after_approve`, nothing is sent | yes, unless the send started |
+| Muse retries while the first request is still held | The older entry is superseded (503, nothing sent); one prompt for the newest | yes for the older one |
+| Policy reload removes the identity | Its holds are answered 503 `unavailable`, nothing sent | yes |
+| Discord connection fails after the request was written | Client connection closed, audit `forward_started` without `completed` | no, possibly executed |
 | `hold_secs` elapses | `expired`, 410, nothing sent | yes |
 | Approval plane down | Holds expire | yes |
 | Discord returns 429 or 5xx after approval | Returned verbatim. A Muse retry means a new approval | already executed or rejected by Discord |
 
 Exactly-once is not claimed. The PoC gives **at most one forward per held connection** and **no forward
 without an approval in the same process lifetime**. Duplicate delivery is possible only through the
-sequence "forwarded, response lost, Muse retries, human approves again". Cheap mitigations, both optional:
-the approval page shows when an identical digest was forwarded in the last few minutes (an in-memory ring,
-lost on restart), and Discord's message `nonce` with `enforce_nonce` can make Discord itself drop a
-duplicate [A, Discord behaviour not checked here].
+sequence "forwarded, response lost, Muse retries, human approves again". The PoC does not try to prevent
+this. Dedupe (section 3.4) only covers concurrent pending holds, not a retry after a forward. Accepted PoC
+limit.
 
 ### 5.2 Comparison with #5's durable design
 
@@ -449,13 +502,13 @@ those exists because the caller does not wait. Here the caller waits, so the rea
 |---|---|---|
 | Third verdict `require_approval` in per-identity policy | **Keep** (named `hold`) | Core of the feature |
 | Fail closed, unknown approval state never executed | **Keep** | Free with in-memory state |
-| Canonicalized request, approval bound to its hash | **Keep** | Cheap, and keeps the approve-what-you-see property |
+| Canonicalized request, approval bound to its hash | **Keep as digest for display, audit and dedupe** | Approve names the entry id only. The entry is immutable in memory, so the id names the bytes |
 | Separate approval plane, independent of caller keys, no agent path | **Keep** | The central security property |
 | Notification hook on park | **Keep** | Without it the human does not know to look |
 | Audit transitions `held/approved/denied/expired/executed` | **Keep**, rename `executed` to `forward_started` and `completed` | Same purpose; the record precedes the action |
 | Expiry as a recorded terminal refusal, not a state | **Keep** | Matches the connection model directly |
 | Single execution | **Keep** as at-most-once per connection (section 5.1) | In-memory state machine, no store |
-| WebAuthn approval | **Defer** | Part of the end state in #6. The PoC uses an approver token over a private path |
+| WebAuthn approval | **Defer** | Part of the end state in #6. The PoC uses Basic auth plus a per-page CSRF token |
 | Durable pending store surviving restart | **Drop** | The connection is the state. A restart loses it and that is the specified behaviour |
 | "Consume approval and mark executed in one durable write" (restart-safe exactly once) | **Drop** | Nothing to recover. After a restart there is no approved id to re-execute |
 | Request id and polling endpoint, callback | **Drop** | The response is the connection's own response. The request id remains, as an audit and approval-page key only |
@@ -477,15 +530,15 @@ All of these are changes to code that exists on `main` [I, files cited].
 **Needed:**
 
 1. **A `passthrough` route mode in the forwarder.** A route field `mode`, default `swap` (today's
-   behaviour). A header builder that keeps `Authorization` and strips only the caller-key header, other
-   `x-ap-*` headers, hop-by-hop headers and `Host` (today `outbound_headers` strips `AUTH_HEADERS` and
+   behaviour). A header builder that keeps `Authorization` and strips the caller-key header, other
+   `x-ap-*` headers, the configurable front-added header list, hop-by-hop headers and `Host` (today `outbound_headers` strips `AUTH_HEADERS` and
    sets one credential header [I forward.rs, headers.rs]). A response filter that also removes `x-ap-*`.
 2. **Header-borne caller key** in place of `/ap/<caller-key>/<route>/...` [I canon.rs `parse_ap_path`],
-   with route addressing `/pt/<route>/...` (section 3.1).
+   with route addressing `/<route>/...` (section 3.1).
 3. **A remote-reachable listener.** Today `bind_loopback` refuses non-loopback addresses [I listener.rs].
-   The PoC keeps that and fronts it with a TLS terminator; a `public_authority` setting replaces the bind
-   address in the `Host` check [I pipeline.rs]. Add connection cap, header and body read timeouts, and TCP
-   keepalive (section 3.7).
+   The PoC keeps that and fronts it with `tailscale serve`; a `public_authority` setting replaces the bind
+   address in the `Host` check [I pipeline.rs]. Add connection cap, header and body read timeouts, the
+   total request deadline, the upstream idle timeout and TCP keepalive (section 3.7).
 4. **Policy:** `decision` on grants, optional `credential`, `path_patterns` (section 3.3). Config
    validation must reject a passthrough route that also appears in a credential's `routes`, and a swap
    route grant with `decision = "hold"` unless stage 2 supports it there too.
@@ -521,7 +574,7 @@ Goal: validate Muse's hook format end to end with no approval machinery. A write
 `decision = "allow"` half of item 4.
 
 Evidence to collect from a real Muse connector run (names only, never values): which header carries the
-key, whether `Authorization` arrives, with which scheme class (`Bot`, `Bearer`, `other`), the `Host`
+key, whether `Authorization` arrives (present or absent), the `Host`
 header and path prefix, HTTP version at the TLS front, whether bodies are chunked or compressed, whether
 Muse sends other headers we would forward. A header-names-and-lengths debug record, off by default, is
 the tool for this. It never prints values.
@@ -532,25 +585,36 @@ Acceptance:
    back unchanged (status, headers minus hop-by-hop, body).
 2. A `POST /channels/{id}/messages` is denied with the distinct status and `X-AP-Decision: denied`, and the
    mock upstream records no request.
-3. Missing, duplicate and malformed caller-key headers are `caller_rejected` with `X-AP-Decision: denied`,
-   nothing upstream.
+3. Missing, duplicate and malformed caller-key headers are `caller_rejected`, status 401 with
+   `X-AP-Decision: rejected` (not the 423 of a human denial), nothing upstream. An unknown route name is
+   denied and nothing is sent.
 4. **Caller-key header stripped upstream:** the mock upstream's recorded headers contain neither the
    caller-key header nor any `x-ap-*` header, for allowed requests.
 5. **`Authorization` forwarded unchanged:** the mock upstream receives the identical `Authorization` value
    that the test sent.
 6. **`Authorization` never in any log:** run the proxy with a sentinel token, exercise allow, deny, 413,
    malformed, upstream-failure and panic-injection paths, and assert the sentinel and the caller key are
-   absent from stdout, stderr and the audit stream. (Phase 1 has the same discipline for surrogates and
+   absent from stdout, stderr and the audit stream. The test also sends a path-token sentinel
+   (`/webhooks/<id>/<sentinel>` and `/interactions/<id>/<sentinel>/callback`) and asserts that it is absent
+   from the audit stream and the logs. (Phase 1 has the same discipline for surrogates and
    credentials [I audit.rs].)
 7. Path rows from the existing matrix pass unchanged on a passthrough route: `..`, `%2e`, `%2f`, `//`,
-   `%25 2e`, plus the new "percent-encoded unreserved character" row.
+   `%25 2e`.
 8. A listener bound to a non-loopback address is refused at startup (`bind_loopback` behaviour kept).
 9. Public-listener limits: connection cap, header-read timeout and body-read timeout each close the
    connection and leave the proxy serving others.
-10. **Hold-tolerance probe (answers open question 1):** a test-only route that returns 200 after N seconds,
-    with N configurable per request from a small fixed set (10, 30, 60, 120, 300). Run from the real Muse
-    connector and record the largest N that completes. This is the only stage 1 item that adds code beyond
-    allow and deny, and it is removed or disabled before stage 2 ships.
+10. **Hold-tolerance probe (answers open questions 1 and 5):** a test-only route that returns 200 after N
+    seconds, with N configurable per request from a small fixed set (10, 30, 60, 120, 300; never above
+    300). The probe route requires a valid caller key and is off by default, so it is never an
+    unauthenticated slow endpoint. Use a `POST` with a body, since writes are what will be held. Run from
+    the real Muse connector through the real `tailscale serve` front and record: the largest N that
+    completes; whether `tailscale serve` interrupts a long-held idle connection (unmeasured [A]); whether a
+    client disconnect during the wait reaches the proxy through the front, and how fast; and Muse's
+    reaction to a 423, a 410 and a 503 (shown to the agent, retried, or treated as a connector failure),
+    to its own timeout, to a dropped connection, and its retry behaviour. This is the only stage 1 item
+    that adds code beyond allow and deny, and it is compiled out of the stage 2 build.
+11. Stage 1 results are inputs to the stage 2 design: open questions 1 to 4 are stage 1 blockers, and
+    stage 2 does not start until they are answered.
 
 ### Stage 2: held-connection approval
 
@@ -558,20 +622,26 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
 
 1. **Held request not forwarded until approval:** a `POST` held for 5 s with no approval has produced zero
    requests at the mock upstream; after approve, exactly one request arrives.
-2. **Byte for byte:** the body, method, path, query and every forwarded header the mock upstream records
-   equal what the test sent, except `Host`, hop-by-hop headers and the removed caller-key header.
+2. **Unchanged request:** the body bytes, method, path and query, and the semantic header set the mock
+   upstream records, equal what the test sent, except `Host`, hop-by-hop headers, the removed caller-key
+   header and the stripped front-added headers (wire framing, header case and order may differ). The test
+   covers duplicate headers (kept as repeated values), an `Expect: 100-continue` request (no `Expect`
+   upstream, no `100 Continue` for a denied request), and injected `Forwarded`, `X-Forwarded-*`, `Via`,
+   `CF-*` and `Tailscale-*` headers (absent upstream).
 3. **Verbatim response:** the held connection's response equals the mock upstream's response (status,
    headers minus hop-by-hop, body), including a non-2xx.
 4. **Deny sends nothing upstream:** after deny, the caller gets `X-AP-Decision: denied` and the mock
    upstream recorded no request.
 5. **Expiry sends nothing upstream:** with `hold_secs` set low, the caller gets `X-AP-Decision: expired` at
    about `hold_secs`, no `Retry-After`, no upstream request.
-6. **Unavailable sends nothing upstream:** table full, per-identity cap, per-minute rate cap, policy file
-   removed, and SIGTERM during a hold each give `X-AP-Decision: unavailable`, no upstream request.
+6. **Unavailable sends nothing upstream:** table full, per-identity cap, cooldown, policy file removed,
+   and SIGTERM during a hold each give `X-AP-Decision: unavailable`, no upstream request. A connect
+   failure before any request byte is written also gives 503 `unavailable`.
 7. **Single execution:** two concurrent approve calls for one id produce one upstream request and one
    refused call. Approve after expiry, after deny and after caller disconnect is refused.
-8. **Caller disconnect while held** marks the entry `Abandoned` and frees its slot; a later approve is
-   refused and nothing is sent.
+8. **Caller disconnect while held** marks the entry `Abandoned` and frees its slot; a later approve
+   returns `approved_but_abandoned`, the audit shows `abandoned_after_approve` where an approval came
+   first, and nothing is sent.
 9. **Crash while held executes nothing:** kill -9 the proxy with one request held; the caller sees a
    connection error; restart the proxy; the mock upstream has no request and the approval plane lists no
    pending entries.
@@ -582,38 +652,65 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
     public listener and the TLS front), connection to the approval listener's address and port fails, and
     no approval route exists on the public router (404 for every approval path with a valid caller key).
     A caller key is refused on the approval listener, and the approver token is refused on the public one.
-12. **`Authorization` never in any log or approval page:** the stage 1 sentinel test, extended with hold,
-    approve, deny, expire and abandon paths, and with the approval page body and its notification payload.
+12. **`Authorization` and path tokens never in any log or approval page:** the stage 1 sentinel test
+    (including the path-token sentinel), extended with hold, approve, deny, expire and abandon paths, and
+    with the approval page body and its notification payload.
 13. **Caller-key header stripped upstream** for forwarded held requests (stage 1 item 4, repeated).
-14. **Bounds hold:** with `max_held_total` holds in place, the next request is `unavailable`, and resident
-    memory stays under the computed bound.
+14. **Bounds hold:** with `max_held_total` holds in place, the next request is `unavailable`; with
+    `max_held_per_identity` holds for one identity, that identity's next request is `unavailable` and
+    another identity's is accepted.
 15. **Body rules:** a held body over `held_body_max_bytes` is 413 `denied` and not held; a compressed body
     is `denied`.
-16. **Audit:** the `forward_started` record is present before the upstream request in the mock's timeline;
-    if the audit sink is made to fail, the held request is not forwarded.
+16. **Audit:** the `forward_started` record is present before the upstream request in the mock's
+    timeline, and each hold transition appears once.
+17. **Upstream reset after approval:** the mock resets before any byte is read: the caller gets 503
+    `unavailable`. The mock resets after reading the request: the caller connection is closed, the audit has
+    `forward_started` and no `completed`.
+18. **Denied large POST is readable:** a denied 1 MiB `POST` yields a readable 423 (not a reset) on the
+    direct path and through the real front.
+19. **Disconnect through the front:** a caller disconnect while held, made through the real TLS front,
+    marks the entry `Abandoned` and frees the slot (the stage 1 measurement of the same path).
+20. **Dedupe and retry during hold:** a second identical request (same identity and digest) while the first
+    is held supersedes it; the older caller gets 503 `superseded`; one approval produces exactly one
+    upstream request; the approval page lists one entry.
+21. **Reload drops holds:** removing an identity from the policy and reloading answers its held requests
+    503 `unavailable` with audit `dropped_on_reload`, sends nothing upstream, and leaves other identities'
+    holds untouched.
+22. **Approval page:** a body containing HTML and script is shown escaped; the response carries
+    `Content-Security-Policy: default-src 'none'`; a request without Basic credentials is 401; an approve
+    POST without the per-page CSRF token, or with a reused one, is refused; the page shows forwarded header
+    names and no credential value.
+23. **Cooldown:** after a deny or an expiry, the next hold from the same identity within `cooldown_secs`
+    is 503 `unavailable`; with `cooldown_secs = 0` it is held; the slot is free right after a deny.
+24. **Probe route absent:** the stage 1 sleep probe route does not exist in the stage 2 build (404 with a
+    valid caller key).
+25. **Deadlines:** a stalled upstream on an allowed request is closed at `upstream_idle_secs`, and a slow
+    total transfer at `request_deadline_secs`.
 
 ## 8. Open questions for the owner
+
+Open questions 1 to 4 are stage 1 blockers.
 
 1. **Muse's tolerance for a held connection (open point d).** How long will the Muse custom connector wait
    for a response: its client timeout, any platform gateway timeout, and whether it retries on timeout
    or on a dropped connection? This is unknown [A]. The PoC makes `hold_secs` configurable (default
    120, range 5 to 600) and stage 1 item 10 measures it. Until measured, treat 120 s as a guess. The TLS
-   front's own idle timeout also bounds the window and must be configured to at least `hold_secs`.
+   front's own idle timeout also bounds the window, and whether `tailscale serve` cuts a long idle
+   connection is unmeasured [A] and measured in stage 1.
 2. **Caller-key header name.** Can the connector set an arbitrary header name, and does it constrain the
    name or value format? Default `X-AP-Caller-Key` is a guess [A].
-3. **How does Muse reach the gate, and who terminates TLS?** Private network or public TLS endpoint? If a
-   managed tunnel terminates TLS, that provider sees the Discord token. Is that acceptable, or must TLS
-   terminate on a host the owner runs (or natively in the proxy)?
-4. **Base URL shape.** Does the connector accept a base URL with a path prefix, such as `/pt/discord`,
-   or must the gate sit at the root and serve one route?
+3. **How does Muse reach the gate, and who terminates TLS?** Decided: `tailscale serve` on the owner's
+   own node, proxy loopback-only (section 4.2). Still to confirm in stage 1: can Muse's egress reach that
+   address, given the ACL restriction to Muse's node?
+4. **Base URL shape.** The PoC uses path-prefix routing, `/discord/api/v10/...`. Does the connector accept
+   a base URL with a path prefix, or must the gate sit at the root and serve one route?
 5. **Status codes for the terminal errors.** The proposed 423, 410 and 503 are untested against Muse
    [A]. Does Muse treat unusual statuses or non-Discord bodies as a connector failure, retry on them, or
    show them to the agent?
 6. **Retry behaviour.** After an `expired` or `denied`, does Muse's agent retry automatically? If so each
-   retry is another phone prompt; the per-minute cap bounds this, but the owner may prefer a lower cap or
-   a cooldown after a deny.
-7. **Approver channel.** Is option B with C's notification acceptable for the PoC, with a bearer approver
-   token on the phone, deferring WebAuthn? Which notifier should the hook target?
+   retry is another phone prompt; dedupe, the per-identity cap and the default 60 s cooldown bound this.
+7. **Approver channel.** Is the web page with Basic auth and a per-page CSRF token acceptable for the PoC,
+   deferring WebAuthn? Which notifier should the hook target?
 8. **One caller key per what?** One identity per Muse user, per connector, or per Discord channel set?
    This sets how revocation and the audit identity read.
 9. **Missing `Authorization` on a held route.** Refuse before bothering the human (proposed), or hold it

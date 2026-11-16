@@ -14,6 +14,16 @@
 # group to every container of the pod. The credential Secret is mounted only into
 # the proxy container. The policy file holds source references, never values, so
 # ap-egress may read it for its [egress] section. The agent mounts neither.
+#
+# Session socket access: /run/auth-proxy/session.sock is created by the proxy (UID 1001)
+# with mode 0660, group = the proxy's primary group. The proxy and the agent container
+# both run with runAsGroup 2000, so the agent (UID 1000) can connect; ap-egress (GID 1002)
+# and every other UID cannot. Container-level securityContext has no supplementalGroups
+# and pod-level fsGroup/supplementalGroups would add the group to ap-egress too, so the
+# primary group is the smallest mechanism. The admin socket is in a volume only the proxy
+# mounts. Same-UID caveat: every process in the agent container is in group 2000, so
+# any of them can call `hello`/session calls; the authority lease and token gate the rest
+# (docs/design/phase1.md). Check: scripts/check-session-socket.sh.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -52,7 +62,7 @@ spec:
     args: ["--policy", "/etc/auth-proxy/policy.toml"]
     securityContext:
       runAsUser: 1001
-      runAsGroup: 1001
+      runAsGroup: 2000    # shared with the agent container ONLY: owns session.sock (0660)
       runAsNonRoot: true
       allowPrivilegeEscalation: false
       readOnlyRootFilesystem: true
@@ -87,7 +97,7 @@ spec:
     # KIRO_API_KEY is the per-session surrogate; the runtime sets it per child.
     securityContext:
       runAsUser: 1000
-      runAsGroup: 1000
+      runAsGroup: 2000    # same primary group as the proxy: reaches session.sock, not admin.sock
       runAsNonRoot: true
       allowPrivilegeEscalation: false
       readOnlyRootFilesystem: true

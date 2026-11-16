@@ -84,3 +84,7 @@ revoke-all, `hello` + empty resync and `DELETE` do not end it; it survives a lea
 would have ended a Q1-B session; a proxy restart needs no resync; Q1-B sessions work beside it
 and are still revoked per session; a malformed hash is exit code 2. The Q1-B suites
 (`session_plane.rs`, `hello_race.rs`, the matrix rows P1 and P2) run unchanged.
+
+Note on the session socket: this pod does not mount it into the agent, so it needs no shared group.
+When you move to `deploy/k8s/pod.yaml`, the proxy and agent share GID 2000 for that socket (see
+"Session socket access" in `docs/design/phase1.md`).

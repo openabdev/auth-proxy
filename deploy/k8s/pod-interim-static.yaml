@@ -25,6 +25,9 @@
 # The credential Secret and the policy ConfigMap use defaultMode 0444 and NO
 # fsGroup (measured on k3s): fsGroup would add the group to every container of
 # the pod. The credential Secret is mounted only into the proxy container.
+#
+# Session socket: not mounted into the agent here, so no group is shared. The proxy keeps
+# GID 1001. Moving to deploy/k8s/pod.yaml adds the shared GID 2000 (see its header).
 apiVersion: v1
 kind: ConfigMap
 metadata:

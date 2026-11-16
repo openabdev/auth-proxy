@@ -297,6 +297,30 @@ id, generation, a short hash prefix and the result, never the surrogate.
 
 ---
 
+## Session socket access (Kubernetes)
+
+`/run/auth-proxy/session.sock` is created by the proxy (UID 1001) with mode 0660 and the proxy's
+primary group. The agent container (UID 1000, the runtime as PID 1) must reach it. Mechanism:
+the proxy and the agent container both set `runAsGroup: 2000`, so the socket is
+`srw-rw---- 1001:2000` and the agent connects as a group member. ap-egress (UID/GID 1002) and any
+other UID in the pod cannot. The admin socket (`/run/auth-proxy-admin/admin.sock`, mode 0600) is in
+a volume only the proxy mounts, so the agent has no path to it. No world-writable socket, no
+`AP_SESSION_SOCKET_MODE` override, no extra capability.
+
+Rejected: `fsGroup` or `supplementalGroups` (pod-level only, they add the group to every container,
+ap-egress included, and `fsGroup` changes Secret mount ownership, see the pod header); socket mode
+666 (any UID in the pod); chown of the socket to UID 1000 (needs CAP_CHOWN in the proxy, and the
+agent UID would own it); running the proxy as UID 1000 (breaks the UID separation the netinit rules
+and the credential mount depend on).
+
+Same-UID caveat: every process in the agent container is in group 2000 and can speak to the
+session socket. That adds nothing beyond the existing caveat that same-UID sessions can read each
+other's surrogates (attribution is best effort, `docs/operations.md`): `hello` is unauthenticated
+by design and refused while the authority lease is live, and every other call needs the authority
+token. Check: `sh scripts/check-session-socket.sh` (manifests) and `LIVE=1 ... sh
+scripts/check-session-socket.sh` (UID 1000 in a running pod connects to the session socket and
+cannot reach the admin socket).
+
 ## Q2. Broker placement and store backend
 
 **Decision:** Q2-A for Kubernetes (store S1) only in Phase 1, decided by the owner. Both council

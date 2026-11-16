@@ -19,6 +19,7 @@ jobs:
       # The workspace test run turns the ap-core `test-resolve` feature on for every
       # crate; this run checks the shipped feature set rejects route.connect_to.
       - run: cargo test -p ap-core
+      - run: sh scripts/check-session-socket.sh
       - run: cargo build --release
       - run: sh scripts/check-no-test-resolve.sh target/release/auth-proxy
       # The matrix routes to local mock upstreams with connect_to, so it runs a

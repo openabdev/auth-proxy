@@ -1,0 +1,321 @@
+# Option A pod, split for the runtime container: one volume-prep and netinit init container, then
+# expiry-store-bootstrap, and four app containers, each with its own UID and GID.
+#   agent 1000:1000    no proof, no session socket. Reaches the runtime only via runtime.sock.
+#   proxy 1001:1001    holds the credential and serves session.sock.
+#   runtime 1002:1002  holds the hello proof (runtime-key) and is the only client of session.sock.
+#   egress 1003:1003   allow-listed tunnel only.
+# Images are placeholders. Replace every REPLACE_* value before use.
+#
+# Session expiry store (M-3): the store file lives on its own durable volume, claim
+# auth-proxy-expiry-store, separate from the proxy-tokens emptyDir that holds the authority token
+# hashes. The claim is a PersistentVolumeClaim, so the store survives pod recreation. The proxy
+# refuses to start if the store file is missing, and expiry-store-bootstrap creates it once.
+#
+# Do not add a KIRO_API_KEY env var or a credential Secret mount to the agent container.
+# Do not mount the runtime-key Secret into any container except runtime.
+# Do not set shareProcessNamespace to true (finding F3).
+# The namespace needs PSA "privileged" because netinit requires NET_ADMIN.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: auth-proxy
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: auth-proxy-expiry-store
+  namespace: auth-proxy
+# Precondition, checked by the operator and not by the manifest: the storage class must give a
+# volume root that UID 1001 can write. A fresh root owned by root makes expiry-store-bootstrap fail,
+# and the pod stays in Init. No chown step runs on this claim, since that would need root in the
+# init container.
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: REPLACE_STORAGE_CLASS
+  resources:
+    # One line per session key, at most 76 bytes, never removed (see docs/design/phase1.md).
+    requests:
+      storage: 64Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: auth-proxy-phase1
+  namespace: auth-proxy
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  shareProcessNamespace: false
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  initContainers:
+    # Sets the owner, group and mode of the two socket volume roots, then exits. Runs as root with
+    # CHOWN and FSETID only (init only, no network). Mode comes first: chmod on a root-owned directory
+    # needs no extra capability, and FSETID stops chown from clearing the setgid bit. Then chown sets
+    # the owner and group. The session-plane root becomes 1001:1002 (the proxy creates session.sock,
+    # the runtime connects) and the agent-runtime root becomes 1002:1000 (the runtime creates
+    # runtime.sock, the agent connects). Both stay setgid, so new sockets inherit the group.
+    - name: volume-prep
+      image: REPLACE_PREP_IMAGE
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          chmod 2750 /run/auth-proxy-session
+          chown 1001:1002 /run/auth-proxy-session
+          chmod 2750 /run/auth-proxy-agent
+          chown 1002:1000 /run/auth-proxy-agent
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+          add: ["CHOWN", "FSETID"]
+      volumeMounts:
+        - name: session-plane
+          mountPath: /run/auth-proxy-session
+        - name: agent-runtime
+          mountPath: /run/auth-proxy-agent
+    # Installs the per-UID rule set in the pod netns, then exits. Runs as root with NET_ADMIN only.
+    - name: netinit
+      image: REPLACE_NETINIT_IMAGE
+      command: ["/bin/sh", "/usr/local/bin/netinit.sh"]
+      env:
+        - name: AGENT_UID
+          value: "1000"
+        - name: RUNTIME_UID
+          value: "1002"
+        - name: PROXY_PORT
+          value: "18080"
+        - name: EGRESS_PORT
+          value: "18081"
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_ADMIN"]
+      volumeMounts:
+        - name: netinit-run
+          mountPath: /run
+    # Creates the session expiry store on its durable volume, then exits. It writes the file only
+    # when it is absent, so a recreated pod keeps the existing records. The image must provide
+    # /bin/sh and mv (for example the alpine base pinned for netinit). The volume root must be
+    # writable by UID 1001, the proxy UID, because the proxy writes its temp file next to the store.
+    - name: expiry-store-bootstrap
+      image: REPLACE_BOOTSTRAP_IMAGE
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          f=/var/lib/auth-proxy/store/session-expiry.v1
+          if [ ! -e "$f" ]; then
+            printf '%s\n' 'auth-proxy session expiry v1' > "$f.tmp"
+            mv "$f.tmp" "$f"
+          fi
+      securityContext:
+        runAsUser: 1001
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: expiry-store
+          mountPath: /var/lib/auth-proxy/store
+  containers:
+    # The agent: no credential, no proof, no session socket. It reaches only the runtime's narrow
+    # API on runtime.sock, and loopback reaches only P and E.
+    - name: agent
+      image: REPLACE_AGENT_IMAGE
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      env:
+        - name: HOME
+          value: /home/agent
+        - name: HTTPS_PROXY
+          value: http://127.0.0.1:18081
+        - name: NO_PROXY
+          value: 127.0.0.1,localhost
+        - name: KIRO_DISABLE_TELEMETRY
+          value: "1"
+      volumeMounts:
+        - name: agent-runtime
+          mountPath: /run/auth-proxy-agent
+        - name: caller-key
+          mountPath: /var/run/auth-proxy/caller
+          readOnly: true
+        - name: home
+          mountPath: /home/agent
+        - name: work
+          mountPath: /work
+        - name: tmp
+          mountPath: /tmp
+    # The proxy: the only container that holds the credential. Its listener is 127.0.0.1:18080.
+    - name: proxy
+      image: REPLACE_PROXY_IMAGE
+      command:
+        - auth-proxy
+        - --config
+        - /etc/auth-proxy/identity.toml
+        - --session-socket
+        - /run/auth-proxy-session/session.sock
+        - --admin-socket
+        - /run/auth-proxy-admin/admin.sock
+        - --secret-root
+        - /var/run/auth-proxy/secrets
+        - --token-dir
+        - /var/lib/auth-proxy/tokens
+        - --expiry-store
+        - /var/lib/auth-proxy/store/session-expiry.v1
+      securityContext:
+        runAsUser: 1001
+        runAsGroup: 1001
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: identity-config
+          mountPath: /etc/auth-proxy
+          readOnly: true
+        - name: kiro-secret
+          mountPath: /var/run/auth-proxy/secrets/auth-proxy-kiro
+          readOnly: true
+        - name: session-plane
+          mountPath: /run/auth-proxy-session
+        - name: admin-socket
+          mountPath: /run/auth-proxy-admin
+        - name: proxy-state
+          mountPath: /var/lib/auth-proxy
+        # --token-dir points here. The proxy creates the authority hash file in this directory, so it
+        # must exist before the first hello. Only the proxy mounts it.
+        - name: proxy-tokens
+          mountPath: /var/lib/auth-proxy/tokens
+        # --expiry-store points here. This is the durable store volume, separate from proxy-tokens.
+        # Only the proxy and expiry-store-bootstrap mount it.
+        - name: expiry-store
+          mountPath: /var/lib/auth-proxy/store
+    # The runtime: the hello proof and the only client of session.sock. It serves runtime.sock to the
+    # agent. It runs only ap-runtime-shim and has no network (netinit gives UID 1002 no route out).
+    - name: runtime
+      image: REPLACE_RUNTIME_IMAGE
+      command:
+        - ap-runtime-shim
+        - --identity
+        - pty-team-a
+        - --session-socket
+        - /run/auth-proxy-session/session.sock
+        - --agent-socket
+        - /run/auth-proxy-agent/runtime.sock
+        - --seed-file
+        - /var/run/auth-proxy-runtime/runtime_ed25519.seed
+      securityContext:
+        runAsUser: 1002
+        runAsGroup: 1002
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: session-plane
+          mountPath: /run/auth-proxy-session
+        - name: agent-runtime
+          mountPath: /run/auth-proxy-agent
+        # The proof seed. Only this container mounts the Secret, read-only.
+        - name: runtime-key
+          mountPath: /var/run/auth-proxy-runtime
+          readOnly: true
+    # The egress proxy: no credential and no broker. It only tunnels to allow-listed host:port.
+    - name: egress
+      image: REPLACE_EGRESS_IMAGE
+      command:
+        - ap-egress
+        - --config
+        - /etc/auth-proxy/identity.toml
+        - --listen
+        - 127.0.0.1:18081
+      securityContext:
+        runAsUser: 1003
+        runAsGroup: 1003
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: identity-config
+          mountPath: /etc/auth-proxy
+          readOnly: true
+  volumes:
+    - name: netinit-run
+      emptyDir: {}
+    # The proxy's session socket directory. The proxy and the runtime mount it. The agent does not.
+    - name: session-plane
+      emptyDir: {}
+    # The runtime's agent socket directory. The runtime and the agent mount it, and nothing else.
+    - name: agent-runtime
+      emptyDir: {}
+    - name: admin-socket
+      emptyDir: {}
+    - name: proxy-state
+      emptyDir: {}
+    - name: proxy-tokens
+      emptyDir: {}
+    # Deploy choice (M-3): a PersistentVolumeClaim, so the expiry records outlive the pod. Losing
+    # them lets a restarted proxy give an old session key a new absolute TTL, so the claim must not
+    # be an emptyDir or a node-local path that a pod recreation can lose. ReadWriteOnce fits a
+    # single proxy pod. The claim is defined in this file.
+    - name: expiry-store
+      persistentVolumeClaim:
+        claimName: auth-proxy-expiry-store
+    - name: home
+      emptyDir: {}
+    - name: work
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}
+    - name: identity-config
+      configMap:
+        name: auth-proxy-identity
+    - name: caller-key
+      secret:
+        secretName: auth-proxy-caller
+        defaultMode: 292
+        items:
+          - key: caller_key
+            path: caller_key
+    # The store reads <secret-root>/<secret>/<key>, so this mounts the secret at its own subdirectory.
+    # defaultMode 292 is octal 0444: readable by any UID that mounts it. Only the proxy mounts it,
+    # and the validator fails if the agent does. No fsGroup is set.
+    - name: kiro-secret
+      secret:
+        secretName: auth-proxy-kiro
+        defaultMode: 292
+        items:
+          - key: api_key
+            path: api_key
+    # The hello proof seed (base64 of 32 bytes). Only the runtime mounts it. Mode 0444, as for
+    # kiro-secret. The validator fails if any other container or init container mounts it.
+    - name: runtime-key
+      secret:
+        secretName: auth-proxy-runtime-key
+        defaultMode: 292
+        items:
+          - key: runtime_ed25519.seed
+            path: runtime_ed25519.seed

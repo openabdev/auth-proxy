@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+publish = false
+license = "MIT"
+
+[workspace.dependencies]
+ap-core = { path = "crates/ap-core" }
+ap-broker = { path = "crates/ap-broker" }
+ap-proxy = { path = "crates/ap-proxy" }
+ap-egress = { path = "crates/ap-egress" }
+ap-client = { path = "crates/ap-client" }

@@ -1,0 +1,43 @@
+# Identity file for the proxy and ap-egress (same file for both, mounted read-only).
+# Replace caller_key_sha256 with the sha256 of the operator-generated caller key. The raw key never
+# goes in this file. The all-zero value is a placeholder and REPLACE is required before use.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-proxy-identity
+  namespace: auth-proxy
+data:
+  identity.toml: |
+    version = 1
+
+    [listen]
+    proxy = "127.0.0.1:18080"
+
+    [[identity]]
+    name = "pty-team-a"
+    # Standard base64 of the runtime's Ed25519 public key. Not a secret. It pairs with the seed in
+    # Secret auth-proxy-runtime-key. REPLACE before use.
+    runtime_pubkey = "REPLACE"
+    caller_key_sha256 = "0000000000000000000000000000000000000000000000000000000000000000" # REPLACE
+
+    [[route]]
+    name = "kiro-krs"
+    host = "runtime.us-east-1.kiro.dev"
+    error_shape = "aws"
+    pass_headers = ["tokentype"]
+
+    [[credential]]
+    id = "kiro"
+    source = "k8s:auth-proxy-kiro:api_key"
+    routes = ["kiro-krs"]
+
+    [[grant]]
+    identity = "pty-team-a"
+    credential = "kiro"
+    route = "kiro-krs"
+    methods = ["POST"]
+    paths = ["/"]
+    aws_targets = ["AmazonCodeWhispererStreamingService.GenerateAssistantResponse"]
+
+    [egress]
+    allow = ["github.com:443", "registry.npmjs.org:443"]

@@ -42,6 +42,66 @@ flowchart LR
     egress --> git
 ```
 
+## Deployment models
+
+auth-proxy runs in two deployment models. The gate's mechanisms — caller check,
+canonicalization, per-identity policy, credential swap, and audit — work the same in
+both, and the planned `require_approval` mechanism ([#5](https://github.com/openabdev/auth-proxy/issues/5);
+not implemented in Phase 1) is meant to behave the same in both. What changes is the trust
+scaffolding around the gate: who vouches for the caller, where the proxy sits, and
+where the real credential lives.
+
+```mermaid
+flowchart LR
+    subgraph SIDE["Sidecar mode — in-cluster (Phase 1, implemented)"]
+        RT["Runtime<br/>registrar · Ed25519 session proof"]
+        POD["Agent session + auth-proxy sidecar<br/>same pod · loopback only"]
+        UP1["Upstream APIs"]
+        RT -->|"register / revoke<br/>bound to the session lifecycle"| POD
+        POD -->|"credential swap<br/>proxy in the data path"| UP1
+    end
+
+    UP1 ~~~ TP
+
+    subgraph STAND["Standalone service mode — third-party callers (under development)"]
+        TP["Third-party caller<br/>Muse / Grok · pre-provisioned caller key"]
+        GATE["auth-proxy<br/>standalone service<br/>on a user-controlled host"]
+        UP2["Upstream APIs<br/>Discord is the first consumer"]
+        TP -->|"no registrar — caller key<br/>provisioned out of band"| GATE
+        GATE -->|"platform vault path (proposed, under review): approval proof only<br/>the platform's egress would swap the credential"| UP2
+        GATE -->|"gate-held path (planned): gate holds the credential<br/>swaps and forwards in-path"| UP2
+    end
+```
+
+**Sidecar mode** is the original, in-cluster shape, and the one Phase 1 implements.
+The proxy runs as a same-pod sidecar next to agents spawned by our own runtime
+(openab-pty / OpenAB classic). The runtime registers each session's surrogate with
+an Ed25519 proof, and revocation is bound to the session lifecycle: the session
+ends and the surrogate is revoked. Once `require_approval` ([#5](https://github.com/openabdev/auth-proxy/issues/5))
+lands, the session end is also meant to drop that session's parked requests. The agent
+reaches the proxy over loopback only, the proxy is in the data path, and upstream
+credentials live in the proxy's own store. See
+[Kubernetes deployment (Option A)](#kubernetes-deployment-option-a) below.
+
+**Standalone service mode** serves callers on platforms we do not operate — Muse,
+Grok, or another external agent platform. There is no runtime and no registrar, so
+caller keys are provisioned out of band, and the proxy runs as a standalone,
+reachable service on a host the user controls. Enforcement shifts from network
+control to credential control, in two sub-shapes.
+
+- **Gate-held path.** The gate holds the credential in its own store and forwards
+  in-path. Once `require_approval` lands, this path would forward after approval.
+  This is the shape described in [#5](https://github.com/openabdev/auth-proxy/issues/5).
+- **Platform vault path (proposed, under review).** If the caller's platform has its
+  own vault and egress enforcement (Muse), the gate would hold no credential and stay
+  out of the data path: it would issue a one-time approval proof bound to the request
+  hash, and the platform's egress would swap in the credential. This is a new
+  architecture that #5 does not contain and no design review has covered yet. It is
+  not settled and is not part of Phase 1.
+
+This mode is **under development** and is not part of Phase 1; its first consumer is
+tracked in [#5](https://github.com/openabdev/auth-proxy/issues/5).
+
 ## Features
 
 Implemented and tested in Phase 1:

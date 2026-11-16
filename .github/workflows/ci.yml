@@ -38,6 +38,12 @@ jobs:
 
       - name: Release binaries carry no test hooks
         run: |
+          if grep -q __ap_probe target/release/auth-proxy; then
+            echo "probe route string found in the release auth-proxy"; exit 1
+          fi
+          if grep -q __ap_test_panic target/release/auth-proxy; then
+            echo "panic-injection string found in the release auth-proxy"; exit 1
+          fi
           if grep -q AP_TEST_UPSTREAM_CA target/release/auth-proxy; then
             echo "test hook strings found in the release auth-proxy"; exit 1
           fi
@@ -55,7 +61,7 @@ jobs:
           fi
 
       - name: Build test binaries (matrix-upstream feature; debug profile, default target dir)
-        run: cargo build -p ap-proxy -p ap-egress --features ap-proxy/matrix-upstream,ap-egress/matrix-upstream
+        run: cargo build -p ap-proxy -p ap-egress --features ap-proxy/matrix-upstream,ap-proxy/stage1-probe,ap-egress/matrix-upstream
 
       - name: Matrix cargo target (fails unless every row is PASS)
         run: cargo test -p ap-proxy --features matrix-upstream --test matrix
@@ -65,6 +71,14 @@ jobs:
           set -o pipefail
           python3 tests/matrix/matrix.py --bin target/debug --json matrix.json | tee matrix.txt
 
+      - name: Passthrough matrix cargo target (Muse gate, stage 1)
+        run: cargo test -p ap-proxy --features matrix-upstream,stage1-probe --test matrix_passthrough
+
+      - name: Passthrough matrix driver (writes matrix-pt.json and matrix-pt.txt)
+        run: |
+          set -o pipefail
+          python3 tests/matrix/passthrough.py --bin target/debug --json matrix-pt.json | tee matrix-pt.txt
+
       - name: Upload matrix results
         if: always()
         uses: actions/upload-artifact@v4
@@ -73,3 +87,5 @@ jobs:
           path: |
             matrix.json
             matrix.txt
+            matrix-pt.json
+            matrix-pt.txt

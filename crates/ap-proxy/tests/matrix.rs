@@ -5,6 +5,8 @@
 //!   cargo build -p ap-proxy -p ap-egress --features ap-proxy/matrix-upstream,ap-egress/matrix-upstream
 //!   cargo test -p ap-proxy --features matrix-upstream --test matrix
 //!
+//! The passthrough (Muse gate) rows live in `tests/matrix_passthrough.rs`; this file is unchanged by them.
+//!
 //! The test passes only when the driver exits 0, prints no FAIL row, and reports every registered
 //! row as PASS. If python3 or openssl is missing, the test prints a skip message and returns. The CI
 //! job asserts that both tools exist, so the skip cannot hide a failure there.

@@ -102,6 +102,18 @@ control to credential control, in two sub-shapes.
 This mode is **under development** and is not part of Phase 1; its first consumer is
 tracked in [#5](https://github.com/openabdev/auth-proxy/issues/5).
 
+## Muse gated passthrough (stage 1, pilot)
+
+A second mode for one consumer (Muse) and one upstream (Discord): the caller's own `Authorization`
+passes through unchanged and the gate only decides allow or deny. The caller key travels in a header,
+the route is a path prefix mapped by policy to a fixed host, reads on granted prefixes pass, and
+everything else (writes included) is refused with 423 `no_grant` and an `X-AP-Decision` header. It
+needs no session machinery and does not change the sidecar mode.
+
+The gate constrains the agent, not the Muse platform: Muse's egress holds the real Discord token and
+can call Discord directly. See `docs/design/muse-gated-passthrough.md`, `docs/runbooks/muse-stage1.md`
+and `deploy/muse/pilot-policy.example.toml`.
+
 ## Features
 
 Implemented and tested in Phase 1:

@@ -58,14 +58,19 @@ dependencies = [
  "ap-client",
  "ap-core",
  "axum",
+ "bytes",
  "futures-util",
+ "h2",
  "hex",
  "http",
  "reqwest",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

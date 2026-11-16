@@ -338,6 +338,8 @@ class Env:
     def direct_tls(self, port, sni, path, headers):
         """A naive client following a redirect itself (carries whatever it holds: the surrogate)."""
         ctx = ssl.create_default_context(cafile=f"{self.pki}/ca.pem")
+        # Python >= 3.13 sets VERIFY_X509_STRICT, which rejects the test CA (no keyUsage extension).
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
         c = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=5)
         c._tunnel_host = None
         sock = socket.create_connection(("127.0.0.1", port), 5)

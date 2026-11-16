@@ -473,7 +473,9 @@ mod tests {
                 let (s, stop) = (store.clone(), stop.clone());
                 std::thread::spawn(move || {
                     let mut seen = 0u32;
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // do-while: observe at least once even if the writer finishes before
+                    // this thread is first scheduled (seen on a 4-core aarch64 host)
+                    loop {
                         match s.current() {
                             Ok(p) => {
                                 // a snapshot is internally consistent: identity and grants
@@ -485,6 +487,9 @@ mod tests {
                             Err(c) => assert_eq!(c, Code::PolicyUnavailable),
                         }
                         seen += 1;
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
                     }
                     seen
                 })

@@ -1,0 +1,45 @@
+{
+ "impl": "a",
+ "rss_idle_kb": {
+  "ap-proxy": 2768
+ },
+ "latency_direct": {
+  "p50_ms": 0.198,
+  "p90_ms": 0.238,
+  "p99_ms": 0.409,
+  "mean_ms": 0.208,
+  "n": 2000
+ },
+ "latency_proxied": {
+  "p50_ms": 0.537,
+  "p90_ms": 0.582,
+  "p99_ms": 0.717,
+  "mean_ms": 0.548,
+  "n": 2000
+ },
+ "latency_broker_only": {
+  "p50_ms": 0.199,
+  "p90_ms": 0.231,
+  "p99_ms": 0.293,
+  "mean_ms": 0.205,
+  "n": 2000
+ },
+ "added_p50_ms": 0.339,
+ "added_p99_ms": 0.308,
+ "rss_warm_kb": {
+  "ap-proxy": 4176
+ },
+ "load": {
+  "conc": 32,
+  "seconds": 15.1,
+  "ok": 51279,
+  "errors": 0,
+  "rps": 3397.8,
+  "rss_peak_kb": {
+   "ap-proxy": 13752
+  }
+ },
+ "rss_after_load_kb": {
+  "ap-proxy": 13752
+ }
+}

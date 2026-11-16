@@ -1,0 +1,30 @@
+{"uid": 1000, "target": "tcp:<runtime.us-east-1.kiro.dev-v4>:443", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "tcp:1.1.1.1:443", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "tcp:<github.com-v4>:443", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "udp53:<kube-dns>", "result": "EPERM", "ms": 0}
+{"uid": 1000, "target": "tcp53:<kube-dns>", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "name:runtime.us-east-1.kiro.dev", "result": "gaierror:-3:Temporary failure in name resolution", "ms": 2}
+{"uid": 1000, "target": "tcp6:2606:4700:4700::1111:443", "result": "ENETUNREACH", "ms": 0}
+{"uid": 1000, "target": "tcp6:<cognito-identity-v6>:443", "result": "ENETUNREACH", "ms": 0}
+{"uid": 1000, "target": "tcp6:fd00:a9::1:443", "result": "ECONNREFUSED", "ms": 1054}
+{"uid": 1000, "target": "udp53:fd00:a9::1", "result": "EPERM", "ms": 0}
+{"uid": 1000, "target": "tcp53:fd00:a9::1", "result": "ECONNREFUSED", "ms": 1023}
+{"uid": 1000, "target": "tcp:127.0.0.1:18100", "result": "ok", "ms": 0}
+{"uid": 1000, "target": "tcp:127.0.0.1:18190", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1001, "target": "tcp:<runtime.us-east-1.kiro.dev-v4>:443", "result": "ok", "ms": 9}
+{"uid": 1001, "target": "tcp:1.1.1.1:443", "result": "ok", "ms": 4}
+{"uid": 1001, "target": "tcp:<github.com-v4>:443", "result": "ok", "ms": 9}
+{"uid": 1001, "target": "udp53:<kube-dns>", "result": "ok:answer", "ms": 32}
+{"uid": 1001, "target": "tcp53:<kube-dns>", "result": "ok:answer", "ms": 3}
+{"uid": 1001, "target": "name:runtime.us-east-1.kiro.dev", "result": "ok:<runtime.us-east-1.kiro.dev-v4>,<runtime-v4-alt>,<runtime-v4-alt>", "ms": 140}
+{"uid": 1001, "target": "tcp6:2606:4700:4700::1111:443", "result": "ENETUNREACH", "ms": 0}
+{"uid": 1001, "target": "tcp6:<cognito-identity-v6>:443", "result": "ENETUNREACH", "ms": 0}
+{"uid": 1001, "target": "tcp6:fd00:a9::1:443", "result": "EHOSTUNREACH", "ms": 3112}
+{"uid": 1001, "target": "udp53:fd00:a9::1", "result": "timeout", "ms": 5005}
+{"uid": 1001, "target": "tcp53:fd00:a9::1", "result": "EHOSTUNREACH", "ms": 3058}
+{"uid": 1001, "target": "tcp:127.0.0.1:18100", "result": "ok", "ms": 0}
+{"uid": 1001, "target": "tcp:127.0.0.1:18190", "result": "ok", "ms": 0}
+		oifname "lo" tcp dport 18190 skuid 1000 counter packets 1 bytes 60 reject with tcp reset
+		oifname != "lo" skuid 1000 counter packets 7 bytes 510 reject
+		oifname "lo" tcp dport 18190 skuid 1000 counter packets 0 bytes 0 reject with tcp reset
+		oifname != "lo" skuid 1000 counter packets 5 bytes 396 reject

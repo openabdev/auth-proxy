@@ -1,0 +1,18 @@
+[
+ {
+  "impl": "a",
+  "kiro_cli": "kiro-cli 2.37.0",
+  "wall_s": 3.46,
+  "acp": {"ok": true, "chunks": 15, "first_chunk_s": 2.517, "last_chunk_s": 2.972, "reply_chars": 170, "reply_lines": 60, "error": null},
+  "audit": {"cps:allow:forwarded:200": 4, "krs:allow:forwarded:200": 1},
+  "files_with_real_key": 0
+ },
+ {
+  "impl": "b",
+  "kiro_cli": "kiro-cli 2.37.0",
+  "wall_s": 2.62,
+  "acp": {"ok": true, "chunks": 15, "first_chunk_s": 1.747, "last_chunk_s": 2.09, "reply_chars": 170, "reply_lines": 60, "error": null},
+  "audit": {"cps:allow:authorized:200": 4, "krs:allow:authorized:200": 1, "cw:allow:authorized:200": 1},
+  "files_with_real_key": 0
+ }
+]

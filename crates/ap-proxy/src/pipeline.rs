@@ -42,6 +42,8 @@ use crate::audit_sink::AuditSink;
 use crate::forward;
 
 #[cfg(test)]
+mod h2_tests;
+#[cfg(test)]
 mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +226,7 @@ impl Trail {
             code,
             status,
             duration_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            bytes_sent: None,
         }
     }
 }
@@ -316,12 +319,15 @@ struct StreamAudit {
     trail: Trail,
     status: u16,
     reset: bool,
+    /// Response body bytes forwarded to the agent so far.
+    sent: u64,
 }
 
 impl Drop for StreamAudit {
     fn drop(&mut self) {
         let code = self.reset.then(|| "upstream_reset".to_string());
-        let rec = self.trail.rec("allow", code, self.status);
+        let mut rec = self.trail.rec("allow", code, self.status);
+        rec.bytes_sent = self.reset.then_some(self.sent);
         self.app.audit.write_rec(&rec);
     }
 }
@@ -332,7 +338,10 @@ where
 {
     futures_util::stream::unfold((Box::pin(stream), audit), |(mut s, mut a)| async move {
         match s.next().await {
-            Some(Ok(bytes)) => Some((Ok(bytes), (s, a))),
+            Some(Ok(bytes)) => {
+                a.sent += bytes.len() as u64;
+                Some((Ok(bytes), (s, a)))
+            }
             Some(Err(e)) => {
                 a.reset = true;
                 Some((Err(io::Error::other(e)), (s, a)))
@@ -494,6 +503,7 @@ pub async fn handle(app: Arc<App>, req: Request) -> Response {
         trail,
         status: status.as_u16(),
         reset: false,
+        sent: 0,
     };
     let mut response = Response::new(Body::from_stream(audited(upstream.bytes_stream(), audit)));
     *response.status_mut() = status;

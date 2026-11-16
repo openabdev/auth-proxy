@@ -91,22 +91,7 @@ pub struct Upstream {
 /// Start the upstream. `/redirect` answers 302. Every other path echoes the request headers as
 /// a JSON array of `[name, value]` pairs.
 pub async fn start_upstream() -> Upstream {
-    let mut ca_params = rcgen::CertificateParams::new(Vec::new()).expect("ca params");
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ca_key = rcgen::KeyPair::generate().expect("ca key");
-    let ca = ca_params.self_signed(&ca_key).expect("ca cert");
-    let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
-    let leaf_params = rcgen::CertificateParams::new(vec![HOST.to_string()]).expect("leaf params");
-    let leaf = leaf_params
-        .signed_by(&leaf_key, &ca, &ca_key)
-        .expect("leaf cert");
-    let chain: Vec<CertificateDer<'static>> = vec![leaf.der().clone(), ca.der().clone()];
-    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
-    let mut server = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(chain, key)
-        .expect("server config");
-    server.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let (server, ca_der) = tls_server_config(b"http/1.1");
     let acceptor = TlsAcceptor::from(Arc::new(server));
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -128,10 +113,35 @@ pub async fn start_upstream() -> Upstream {
             });
         }
     });
-    Upstream {
-        addr,
-        hits,
-        ca_der: ca.der().to_vec(),
+    Upstream { addr, hits, ca_der }
+}
+
+/// A server TLS config for [`HOST`] under a fresh throwaway CA, offering only `alpn`. Returns the
+/// config and the CA certificate in DER.
+pub fn tls_server_config(alpn: &[u8]) -> (ServerConfig, Vec<u8>) {
+    let mut ca_params = rcgen::CertificateParams::new(Vec::new()).expect("ca params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().expect("ca key");
+    let ca = ca_params.self_signed(&ca_key).expect("ca cert");
+    let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+    let leaf_params = rcgen::CertificateParams::new(vec![HOST.to_string()]).expect("leaf params");
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &ca, &ca_key)
+        .expect("leaf cert");
+    let chain: Vec<CertificateDer<'static>> = vec![leaf.der().clone(), ca.der().clone()];
+    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+    let mut server = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .expect("server config");
+    server.alpn_protocols = vec![alpn.to_vec()];
+    (server, ca.der().to_vec())
+}
+
+impl Upstream {
+    /// An upstream handle for a server the caller runs itself.
+    pub fn from_parts(addr: SocketAddr, hits: Arc<AtomicUsize>, ca_der: Vec<u8>) -> Upstream {
+        Upstream { addr, hits, ca_der }
     }
 }
 

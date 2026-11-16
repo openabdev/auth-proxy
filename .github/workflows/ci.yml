@@ -16,12 +16,19 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # The workspace test run turns the ap-core `test-resolve` feature on for every
+      # crate; this run checks the shipped feature set rejects route.connect_to.
+      - run: cargo test -p ap-core
       - run: cargo build --release
+      - run: sh scripts/check-no-test-resolve.sh target/release/auth-proxy
+      # The matrix routes to local mock upstreams with connect_to, so it runs a
+      # test-resolve build of auth-proxy in its own target directory.
+      - run: cargo build --release -p ap-proxy --features test-resolve --target-dir target/matrix-bin
       - name: Fail-closed matrix
         run: |
           mkdir -p matrix-out
           rc=0
-          python3 tests/matrix/matrix.py --bin target/release --json matrix-out/matrix.json > matrix-out/matrix.txt || rc=$?
+          python3 tests/matrix/matrix.py --bin target/matrix-bin/release --json matrix-out/matrix.json > matrix-out/matrix.txt || rc=$?
           cat matrix-out/matrix.txt
           exit $rc
       - run: sh scripts/check-egress-deps.sh

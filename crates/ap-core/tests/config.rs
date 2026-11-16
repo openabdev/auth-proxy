@@ -347,15 +347,31 @@ fn rejects_egress() {
             needle,
         );
     }
-    // explicit opt-out
-    let t = sample_toml()
-        .replacen(
-            "allow = [\"github.com:443\",",
-            "allow = [\"api.anthropic.com:443\",",
-            1,
-        )
-        .replacen("[egress]", "[egress]\nallow_route_hosts = true", 1);
-    Config::parse(t.as_bytes()).unwrap();
+    // There is no opt-out: the former `egress.allow_route_hosts` key is an unknown
+    // field, so a policy that sets it (to allow a route host, or alone) is rejected.
+    for (label, t) in [
+        (
+            "opt-out with a route host",
+            sample_toml()
+                .replacen(
+                    "allow = [\"github.com:443\",",
+                    "allow = [\"api.anthropic.com:443\",",
+                    1,
+                )
+                .replacen("[egress]", "[egress]\nallow_route_hosts = true", 1),
+        ),
+        (
+            "opt-out alone",
+            sample_toml().replacen("[egress]", "[egress]\nallow_route_hosts = true", 1),
+        ),
+        (
+            "opt-out false",
+            sample_toml().replacen("[egress]", "[egress]\nallow_route_hosts = false", 1),
+        ),
+    ] {
+        let e = Config::parse(t.as_bytes()).expect_err(label).to_string();
+        assert!(e.contains("allow_route_hosts"), "{label}: {e}");
+    }
 }
 
 #[test]
@@ -448,4 +464,36 @@ fn host_port_parser() {
     );
     assert!(parse_host_port("github.com:").is_err());
     assert!(parse_host_port(":443").is_err());
+}
+
+/// `route.connect_to` is a test aid. A shipped build (no `test-resolve` feature)
+/// has no such key, so a policy that sets it is rejected. Under `cargo test
+/// --workspace` the feature is on for every crate (the proxy's integration tests
+/// need it), so this runs with `cargo test -p ap-core`; CI also runs the shipped
+/// release binary against such a policy (`scripts/check-no-test-resolve.sh`).
+#[cfg(not(feature = "test-resolve"))]
+#[test]
+fn connect_to_is_rejected_in_a_shipped_build() {
+    let t = sample_toml().replacen(
+        "[[route]]\n",
+        "[[route]]\nconnect_to = \"127.0.0.1:9\"\n",
+        1,
+    );
+    let e = Config::parse(t.as_bytes()).unwrap_err().to_string();
+    assert!(e.contains("connect_to"), "{e}");
+}
+
+#[cfg(feature = "test-resolve")]
+#[test]
+fn connect_to_parses_in_a_test_resolve_build() {
+    let t = sample_toml().replacen(
+        "[[route]]\n",
+        "[[route]]\nconnect_to = \"127.0.0.1:9\"\n",
+        1,
+    );
+    let c = Config::parse(t.as_bytes()).unwrap();
+    assert_eq!(
+        c.routes[0].resolve_override(),
+        Some("127.0.0.1:9".parse().unwrap())
+    );
 }

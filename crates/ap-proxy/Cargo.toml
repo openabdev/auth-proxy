@@ -10,6 +10,11 @@ publish.workspace = true
 name = "auth-proxy"
 path = "src/main.rs"
 
+[features]
+# Test-only (see ap-core): a build whose policy accepts `connect_to`. The fail-closed
+# matrix builds the binary with it; the shipped binary never does.
+test-resolve = ["ap-core/test-resolve"]
+
 [dependencies]
 ap-core.workspace = true
 ap-broker.workspace = true
@@ -23,7 +28,8 @@ tokio.workspace = true
 
 [dev-dependencies]
 ap-client.workspace = true
-ap-core.workspace = true
+# Integration tests spawn the binary, and `cargo test` builds it with this feature.
+ap-core = { workspace = true, features = ["test-resolve"] }
 hex.workspace = true
 sha2.workspace = true
 serde_json.workspace = true

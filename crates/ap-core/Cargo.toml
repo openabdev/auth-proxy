@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only: lets a route carry `connect_to` (a resolver override, like curl
+# --resolve). Off in every shipped build, where the key is an unknown field and
+# the policy is rejected. Only dev-dependencies and the matrix build turn it on.
+test-resolve = []
+
 [dependencies]
 hex.workspace = true
 http.workspace = true

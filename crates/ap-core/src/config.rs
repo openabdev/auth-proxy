@@ -87,7 +87,10 @@ pub struct RouteCfg {
     #[serde(default = "d_port")]
     pub port: u16,
     /// Test-only resolver override (like curl --resolve). The destination
-    /// identity (SNI, Host, certificate name) is still `host`.
+    /// identity (SNI, Host, certificate name) is still `host`. The field exists
+    /// only in builds with the `test-resolve` feature; in every shipped build a
+    /// policy that sets it is rejected as an unknown key.
+    #[cfg(feature = "test-resolve")]
     #[serde(default)]
     pub connect_to: Option<SocketAddr>,
     #[serde(default)]
@@ -118,6 +121,18 @@ fn d_bearer() -> String {
 }
 
 impl RouteCfg {
+    /// The resolver override of a `test-resolve` build; always `None` otherwise.
+    pub fn resolve_override(&self) -> Option<SocketAddr> {
+        #[cfg(feature = "test-resolve")]
+        {
+            self.connect_to
+        }
+        #[cfg(not(feature = "test-resolve"))]
+        {
+            None
+        }
+    }
+
     /// `Host` header value the upstream sees (port only when not 443).
     pub fn authority(&self) -> String {
         if self.port == 443 {
@@ -157,9 +172,6 @@ pub struct EgressCfg {
     /// `host:port` entries for ap-egress.
     #[serde(default)]
     pub allow: Vec<String>,
-    /// Turns off the check that an egress host is not a credential route host.
-    #[serde(default)]
-    pub allow_route_hosts: bool,
 }
 
 impl EgressCfg {
@@ -516,10 +528,12 @@ impl Config {
             match parse_host_port(ent) {
                 Err(m) => e(format!("egress.allow entry {ent:?}: {m}")),
                 Ok((h, _)) => {
-                    if !self.egress.allow_route_hosts && credential_hosts.contains(h.as_str()) {
+                    // Baseline rule, no opt-out: a CONNECT tunnel to a credential
+                    // route host could carry another credential the agent found
+                    // straight to that host.
+                    if credential_hosts.contains(h.as_str()) {
                         e(format!(
-                            "egress.allow entry {ent:?}: host is a credential route host \
-                             (set egress.allow_route_hosts = true to allow)"
+                            "egress.allow entry {ent:?}: host is a credential route host"
                         ));
                     }
                 }

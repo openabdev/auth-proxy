@@ -92,11 +92,13 @@ fn build_client(args: &Args, policy: &ap_core::Policy) -> Result<reqwest::Client
             .map_err(|_| "--ca-file is not a PEM certificate".to_string())?;
         b = b.tls_built_in_root_certs(false).add_root_certificate(cert);
     }
-    // Test-only resolver override from the policy (like curl --resolve). The
-    // destination identity (SNI, Host, certificate name) stays the route host.
-    // It is read at startup; a reload that adds one has no effect.
+    // Test-only resolver override from the policy (like curl --resolve), present
+    // only in `test-resolve` builds (always `None` in a shipped build, whose
+    // policy parser rejects the key). The destination identity (SNI, Host,
+    // certificate name) stays the route host. It is read at startup; a reload
+    // that adds one has no effect.
     for r in &policy.config().routes {
-        if let Some(a) = r.connect_to {
+        if let Some(a) = r.resolve_override() {
             b = b.resolve(&r.host, a);
         }
     }

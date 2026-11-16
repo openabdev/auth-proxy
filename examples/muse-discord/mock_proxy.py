@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Mock auth-proxy -- CONTRACT SKETCH for issue #5, NOT the real proxy.
+Requires Python 3.11+ (stdlib only).
 
 This mock is a contract sketch for the approval flow proposed in #5/#6.
 It is NOT a stand-in that verifies the real proxy: it deliberately omits
@@ -46,9 +47,26 @@ for the owner's approval plane):
 
   POST /_mock/approve/<request-id>     approve and "execute" the parked write
   POST /_mock/deny/<request-id>        deny it
+  POST /_mock/revoke/<surrogate-sha256>  unregister a surrogate and drop
+                                       every request it parked
   GET  /_mock/parked                   ids of currently parked requests, so
                                        tests can discover ids instead of
                                        sleeping and guessing them
+
+Every /_mock/ route requires the per-run admin token in the
+"X-Mock-Admin" header (compared in constant time). Without it, anything
+that can reach the caller listener could approve a parked write.
+
+Approval semantics sketched here (all still open in #5):
+
+  * Expiry is enforced under the lock before EVERY list, approve, deny
+    and outcome operation, so a request past its TTL can never be
+    approved, whether or not the caller is still polling.
+  * A parked request is bound to the surrogate (session) that created
+    it. Polling it with any other surrogate answers 404, the same as an
+    unknown id.
+  * Revoking a surrogate drops its parked requests.
+  * Request ids are unguessable (128 random bits), not a counter.
 
 Environment:
   MOCK_TTL         seconds a parked request awaits a decision (default 60)
@@ -57,6 +75,9 @@ Environment:
                    ephemeral MOCK_CALLER_KEY / MOCK_SURROGATE in use.
   MOCK_CALLER_KEY  apk_... caller key to accept (default: generated)
   MOCK_SURROGATE   aps_... surrogate to accept  (default: generated)
+  MOCK_SURROGATE_2 optional second aps_... surrogate (a second session),
+                   used by the two-session isolation tests
+  MOCK_ADMIN_TOKEN token required by /_mock/ routes (default: generated)
   MOCK_REDIRECT_LOCATION  Location returned by the fabricated
                    /api/v10/redirect-me endpoint (default:
                    https://example.invalid/steal); tests point it at a
@@ -64,6 +85,7 @@ Environment:
 """
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -76,7 +98,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 EXAMPLE_CALLER_KEY = os.environ.get("MOCK_CALLER_KEY") or ("apk_" + secrets.token_hex(32))
 EXAMPLE_SURROGATE = os.environ.get("MOCK_SURROGATE") or ("aps_" + secrets.token_hex(32))
 CALLER_SHA256 = hashlib.sha256(EXAMPLE_CALLER_KEY.encode()).hexdigest()
-SURROGATE_SHA256 = hashlib.sha256(EXAMPLE_SURROGATE.encode()).hexdigest()
+EXAMPLE_SURROGATE_2 = os.environ.get("MOCK_SURROGATE_2") or ""
+ADMIN_TOKEN = os.environ.get("MOCK_ADMIN_TOKEN") or secrets.token_hex(32)
 SURROGATE_FORM = re.compile(r"^Bearer (aps_[0-9a-f]{64})$")
 CHANNEL_MESSAGES = re.compile(r"^/api/v10/channels/(\d+)/messages$")
 
@@ -84,7 +107,18 @@ TTL = float(os.environ.get("MOCK_TTL", "60"))
 REDIRECT_LOCATION = os.environ.get("MOCK_REDIRECT_LOCATION", "https://example.invalid/steal")
 _lock = threading.Lock()
 _parked: dict[str, dict] = {}
-_counter = [0]
+# Registered surrogates (sha256 hex), the mock's stand-in for the registry.
+_surrogates: set[str] = {hashlib.sha256(EXAMPLE_SURROGATE.encode()).hexdigest()}
+if EXAMPLE_SURROGATE_2:
+    _surrogates.add(hashlib.sha256(EXAMPLE_SURROGATE_2.encode()).hexdigest())
+
+
+def _expire_locked(now: float) -> None:
+    """The one deadline transition. Callers hold _lock and call this before
+    any list, approve, deny or outcome operation."""
+    for entry in _parked.values():
+        if entry["status"] == "parked" and now > entry["expires_at"]:
+            entry["status"] = "expired"
 
 
 def _json(handler: BaseHTTPRequestHandler, status: int, payload, extra_headers: dict | None = None) -> None:
@@ -119,29 +153,43 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return {}
 
-    def _check_caller(self, caller_key: str) -> bool:
+    def _check_caller(self, caller_key: str) -> str | None:
+        """Return the session id (surrogate sha256) or None after answering."""
         digest = hashlib.sha256(caller_key.encode()).hexdigest()
         if digest != CALLER_SHA256:
             _json(self, 403, {"code": "caller_rejected"})
-            return False
+            return None
         match = SURROGATE_FORM.match(self.headers.get("Authorization") or "")
         if not match:
             _json(self, 403, {"code": "surrogate_malformed"})
-            return False
-        if hashlib.sha256(match.group(1).encode()).hexdigest() != SURROGATE_SHA256:
+            return None
+        session = hashlib.sha256(match.group(1).encode()).hexdigest()
+        with _lock:
+            registered = session in _surrogates
+        if not registered:
             _json(self, 403, {"code": "surrogate_unknown"})
+            return None
+        return session
+
+    def _check_admin(self) -> bool:
+        supplied = self.headers.get("X-Mock-Admin") or ""
+        if not hmac.compare_digest(supplied.encode(), ADMIN_TOKEN.encode()):
+            _json(self, 403, {"code": "admin_rejected"})
             return False
         return True
 
     # -- routing ---------------------------------------------------------
     def do_POST(self):  # noqa: N802 (http.server naming)
         if self.path.startswith("/_mock/"):
+            if not self._check_admin():
+                return
             return self._admin(self.path)
         parts = self.path.split("/", 4)
         if len(parts) < 5 or parts[1] != "ap":
             return _json(self, 404, {"code": "route_unknown"})
         _empty, _ap, caller_key, route, rest = parts
-        if not self._check_caller(caller_key):
+        session = self._check_caller(caller_key)
+        if session is None:
             return
         upstream_path = "/" + rest.split("?")[0]
         if route == "discord" and upstream_path == "/api/v10/redirect-me":
@@ -153,14 +201,21 @@ class Handler(BaseHTTPRequestHandler):
             # Fabricated upstream endpoint that legitimately answers a bare
             # 202 (no approval marker): the caller must return it as data.
             return _json(self, 202, {"status": "accepted", "via": "mock-upstream"})
+        if route == "discord" and upstream_path == "/api/v10/marker-collision":
+            # Fabricated HOSTILE upstream: it answers 202 with the same
+            # marker header and a request id of its choosing. Nothing in
+            # this mock strips it. The real proxy must (see README, #5).
+            return _json(self, 202, {"request_id": "req_" + "ab" * 16, "status": "parked"},
+                         extra_headers={"X-Auth-Proxy-Approval": "parked"})
         match = CHANNEL_MESSAGES.match(upstream_path) if route == "discord" else None
         if not match:
             return _json(self, 404, {"code": "route_unknown"})
         body = self._read_json()
         with _lock:
-            _counter[0] += 1
-            request_id = f"req_{_counter[0]:04d}"
+            _expire_locked(time.monotonic())
+            request_id = "req_" + secrets.token_hex(16)
             _parked[request_id] = {
+                "session": session,
                 "status": "parked",
                 "channel_id": match.group(1),
                 "body": body,
@@ -180,11 +235,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) < 4 or parts[1] != "ap":
             return _json(self, 404, {"code": "route_unknown"})
         caller_key, route = parts[2], parts[3]
-        if not self._check_caller(caller_key):
+        session = self._check_caller(caller_key)
+        if session is None:
             return
         if route == "_approval":
             request_id = parts[4] if len(parts) > 4 else ""
-            return self._outcome(request_id)
+            return self._outcome(request_id, session)
         if route != "discord" or len(parts) < 5:
             return _json(self, 404, {"code": "route_unknown"})
         upstream_path = "/" + parts[4].split("?")[0]
@@ -195,25 +251,28 @@ class Handler(BaseHTTPRequestHandler):
                 "id": "1570000000000000000",
                 "channel_id": upstream_path.split("/")[4],
                 "content": "canned message from the mock upstream",
-                "author": {"id": "1499476122885423204", "username": "mock-bot"},
+                "author": {"id": "9999999999999999001", "username": "mock-bot"},
             }])
         return _json(self, 404, {"code": "route_unknown"})
 
     # -- approval outcome + test-only admin ------------------------------
     def _admin_get(self, path: str) -> None:
+        if not self._check_admin():
+            return
         if path.strip("/") == "_mock/parked":
             with _lock:
+                _expire_locked(time.monotonic())
                 ids = [rid for rid, e in _parked.items() if e["status"] == "parked"]
             return _json(self, 200, {"parked": ids})
         return _json(self, 404, {"code": "admin_unknown"})
 
-    def _outcome(self, request_id: str) -> None:
+    def _outcome(self, request_id: str, session: str) -> None:
         with _lock:
+            _expire_locked(time.monotonic())
             entry = _parked.get(request_id)
-            if entry is None:
+            # Another session's id answers exactly like an unknown id.
+            if entry is None or entry["session"] != session:
                 return _json(self, 404, {"code": "request_unknown"})
-            if entry["status"] == "parked" and time.monotonic() > entry["expires_at"]:
-                entry["status"] = "expired"
             payload = {"request_id": request_id, "status": entry["status"]}
             if entry["status"] == "executed":
                 payload["result"] = entry["result"]
@@ -221,10 +280,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _admin(self, path: str) -> None:
         bits = path.strip("/").split("/")
-        if len(bits) != 3 or bits[1] not in ("approve", "deny"):
+        if len(bits) != 3 or bits[1] not in ("approve", "deny", "revoke"):
             return _json(self, 404, {"code": "admin_unknown"})
         action, request_id = bits[1], bits[2]
+        if action == "revoke":
+            with _lock:
+                _surrogates.discard(request_id)
+                for rid in [r for r, e in _parked.items() if e["session"] == request_id]:
+                    del _parked[rid]
+            return _json(self, 200, {"revoked": request_id})
         with _lock:
+            _expire_locked(time.monotonic())
             entry = _parked.get(request_id)
             if entry is None or entry["status"] != "parked":
                 return _json(self, 409, {"code": "not_parked"})
@@ -251,6 +317,7 @@ def main() -> None:
     print(f"MOCK_PORT={server.server_address[1]}", flush=True)
     print(f"MOCK_CALLER_KEY={EXAMPLE_CALLER_KEY}", flush=True)
     print(f"MOCK_SURROGATE={EXAMPLE_SURROGATE}", flush=True)
+    print(f"MOCK_ADMIN_TOKEN={ADMIN_TOKEN}", flush=True)
     server.serve_forever()
 
 

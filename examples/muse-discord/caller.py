@@ -165,6 +165,9 @@ class Caller:
             return err.code, headers, err.read().decode("utf-8", "replace")
         except urllib.error.URLError as err:
             die(f"cannot reach the proxy at {self.base}: {err.reason}", 2)
+        except TimeoutError:
+            # A read timeout is not a URLError; exit 2 instead of a traceback.
+            die(f"timed out talking to the proxy at {self.base}", 2)
 
     def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, str]:
         """One upstream call through the proxy, following the proposed approval flow."""

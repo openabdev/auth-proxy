@@ -159,7 +159,25 @@ async fn run(args: Args) -> Result<(), String> {
         },
         Arc::new(SystemClock::new()),
     )?);
-    let broker = LocalBroker::new(plane, Arc::new(FileStore::new(&args.secrets_dir)));
+    let mut broker = LocalBroker::new(plane, Arc::new(FileStore::new(&args.secrets_dir)));
+    if let Some(hash) = args.interim_static_surrogate_sha256 {
+        // INTERIM Q1-A path. One session for the life of this process, bound to
+        // every credential the policy defines; the policy's grants still decide
+        // what it may do. Say so on every start.
+        let ids: Vec<String> = snap
+            .config()
+            .credentials
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        eprintln!(
+            "auth-proxy: INTERIM static session enabled (Q1-A): one surrogate for the life of \
+             this process, {} credential(s), NO per-session revocation (ends only when this \
+             process ends); see docs/interim-static-session.md",
+            ids.len()
+        );
+        broker = broker.with_interim_static_session(hash, snap.identity(), ids);
+    }
     let client = build_client(&args, &snap)?;
     drop(snap);
     let app = Arc::new(App::new(

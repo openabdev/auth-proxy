@@ -246,6 +246,8 @@ pub struct Opts {
     pub absolute_ttl_secs: Option<u64>,
     pub max_sessions: Option<u64>,
     pub max_body_bytes: Option<u64>,
+    /// INTERIM Q1-A: sha256 (hex) of the pod-lifetime surrogate.
+    pub interim_static_sha256: Option<String>,
 }
 
 pub fn grant(cred: &str, route: &str, methods: &[&str], paths: &[&str], aws: &[&str]) -> String {
@@ -468,6 +470,9 @@ routes = ["other"]
             if let Some(v) = v {
                 c.args([flag, &v.to_string()]);
             }
+        }
+        if let Some(h) = &o.interim_static_sha256 {
+            c.args(["--interim-static-surrogate-sha256", h]);
         }
         c.env_clear().env("PATH", "/usr/bin:/bin");
         c

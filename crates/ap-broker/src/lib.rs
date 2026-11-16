@@ -15,7 +15,7 @@ pub mod store;
 pub use authority::{
     AuthorityLock, AUTHORITY_RENEW_SECS, DEFAULT_AUTHORITY_LEASE_SECS, MIN_AUTHORITY_LEASE_SECS,
 };
-pub use broker::{Binding, Broker, LocalBroker};
+pub use broker::{Binding, Broker, LocalBroker, INTERIM_SESSION};
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use error::PlaneError;
 pub use plane::{HelloOk, LeaseOk, PlaneConfig, RenewOk, ResyncOk, SessionPlane};

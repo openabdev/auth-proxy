@@ -26,6 +26,13 @@ auth-proxy: credential-swapping reverse proxy (Phase 1, Kubernetes)
   --session-lease-secs N     session lease, >= 1                         AP_SESSION_LEASE_SECS [900]
   --absolute-ttl-secs N      session absolute TTL                        AP_ABSOLUTE_TTL_SECS [43200]
   --max-sessions N           registered sessions cap                     AP_MAX_SESSIONS [256]
+  --interim-static-surrogate-sha256 HEX
+                             INTERIM Q1-A path: admit this one surrogate  AP_INTERIM_STATIC_SURROGATE_SHA256
+                             (sha256, 64 lowercase hex) for the pod's
+                             lifetime, bound to every credential in the
+                             policy. NO per-session revocation: it ends
+                             only when this process does. See
+                             docs/interim-static-session.md.
   --help
 
 Exit codes: 0 clean stop, 2 invalid arguments, policy or sockets.
@@ -46,6 +53,8 @@ pub struct Args {
     pub session_lease_secs: u64,
     pub absolute_ttl_secs: u64,
     pub max_sessions: usize,
+    /// INTERIM Q1-A: sha256 of the one pod-lifetime surrogate.
+    pub interim_static_surrogate_sha256: Option<[u8; 32]>,
 }
 
 pub enum Parsed {
@@ -112,6 +121,10 @@ const OPTS: &[Opt] = &[
     Opt {
         flag: "--max-sessions",
         env: "AP_MAX_SESSIONS",
+    },
+    Opt {
+        flag: "--interim-static-surrogate-sha256",
+        env: "AP_INTERIM_STATIC_SURROGATE_SHA256",
     },
 ];
 
@@ -181,6 +194,22 @@ pub fn parse(argv: impl IntoIterator<Item = String>, env: Env<'_>) -> Result<Par
             .filter(|m| *m <= 0o777 && m & 0o600 == 0o600)
             .ok_or("--session-socket-mode must be octal with owner read/write, e.g. 660")?,
     };
+    let interim = match get("--interim-static-surrogate-sha256") {
+        None => None,
+        Some(h) => {
+            let mut out = [0u8; 32];
+            let ok = h.len() == 64
+                && h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && hex::decode_to_slice(&h, &mut out).is_ok();
+            if !ok {
+                return Err(
+                    "--interim-static-surrogate-sha256 must be 64 lowercase hex characters".into(),
+                );
+            }
+            Some(out)
+        }
+    };
     Ok(Parsed::Run(Box::new(Args {
         policy,
         secrets_dir: path("--secrets-dir", Some("/run/secrets/auth-proxy"))?.unwrap(),
@@ -207,6 +236,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>, env: Env<'_>) -> Result<Par
             1,
         )?,
         max_sessions: num("--max-sessions", ap_broker::DEFAULT_MAX_SESSIONS as u64, 1)? as usize,
+        interim_static_surrogate_sha256: interim,
     })))
 }
 
@@ -236,6 +266,39 @@ mod tests {
         assert_eq!(a.session_socket_mode, 0o660);
         assert_eq!(a.max_sessions, 256);
         assert!(a.listen.is_none());
+        assert!(a.interim_static_surrogate_sha256.is_none());
+    }
+
+    #[test]
+    fn interim_static_hash_is_64_lowercase_hex_or_an_error() {
+        let ok = "ab".repeat(32);
+        let a = run(
+            &["--policy", "/p", "--interim-static-surrogate-sha256", &ok],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(a.interim_static_surrogate_sha256, Some([0xab; 32]));
+        let a = run(
+            &["--policy", "/p"],
+            &[("AP_INTERIM_STATIC_SURROGATE_SHA256", &ok)],
+        )
+        .unwrap();
+        assert_eq!(a.interim_static_surrogate_sha256, Some([0xab; 32]));
+        for bad in [
+            "abc".to_string(),
+            "AB".repeat(32),
+            format!("{}g", "a".repeat(63)),
+            "ab".repeat(33),
+        ] {
+            assert!(
+                run(
+                    &["--policy", "/p", "--interim-static-surrogate-sha256", &bad],
+                    &[]
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,151 @@
+# INTERIM Q1-A pod: the first end-to-end Kubernetes deployment, for agent runtimes
+# that do not speak the session plane yet. Read docs/interim-static-session.md first.
+#
+#   *** INTERIM. ONE surrogate, registered for the pod's lifetime. NO per-session
+#   *** revocation: the surrogate stops working only when the proxy container
+#   *** stops (delete the pod, or remove the flag and restart the proxy). The
+#   *** owner accepted this for the interim period. Q1-B (deploy/k8s/pod.yaml) stays
+#   *** the accepted design and is the target; this file is not a second design.
+#
+# Differences from pod.yaml, and nothing else:
+#   - the proxy gets --interim-static-surrogate-sha256 (the hash, not the surrogate);
+#   - the session socket is NOT mounted into the agent container, so nothing in the
+#     agent container can call the Q1-B session plane (no `hello`, no registration);
+#   - the agent container reads the surrogate from Secret `auth-proxy-interim-agent`
+#     into KIRO_API_KEY, and an init container writes kiro-cli's endpoint settings
+#     (the base URLs carry the caller key) once into the agent HOME.
+#
+# Make the secret and the two hashes with deploy/k8s/interim-keygen.sh. Not applied by
+# this repository's CI and not yet run on a cluster: the first deployment is the test.
+# The kiro-cps route host in policy.example.toml is still a placeholder.
+#
+# Pod Security Admission: the NET_ADMIN init container needs the namespace at
+# `pod-security.kubernetes.io/enforce: privileged`.
+#
+# The credential Secret and the policy ConfigMap use defaultMode 0444 and NO
+# fsGroup (measured on k3s): fsGroup would add the group to every container of
+# the pod. The credential Secret is mounted only into the proxy container.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-proxy-policy
+data:
+  policy.toml: |
+    # Replace with deploy/k8s/policy.example.toml filled in for your identity.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ap-agent
+  labels: {app: auth-proxy}
+spec:
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  shareProcessNamespace: false
+  securityContext:
+    seccompProfile: {type: RuntimeDefault}
+  initContainers:
+  - name: netinit
+    image: REPLACE/auth-proxy-netinit:TAG
+    env:
+    - {name: AGENT_UID, value: "1000"}
+    - {name: PROXY_PORT, value: "18080"}
+    - {name: EGRESS_PORT, value: "3128"}
+    securityContext:
+      runAsUser: 0
+      runAsNonRoot: false
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL], add: [NET_ADMIN]}
+  - name: kiro-settings
+    # Writes kiro-cli's endpoint settings once into the agent HOME. The caller key goes
+    # into the base URL path, as the design says; only this init container mounts it.
+    image: REPLACE/agent-runtime:TAG
+    command: ["sh", "-c"]
+    args:
+    - |
+      set -eu
+      K=$(cat /run/ap-agent/caller-key)
+      for pair in krs:kiro-krs cps:kiro-cps; do
+        kiro-cli settings "api.${pair%%:*}.service" \
+          "{\"endpoint\":\"http://127.0.0.1:18080/ap/${K}/${pair##*:}\",\"region\":\"us-east-1\"}"
+      done
+    env:
+    - {name: HOME, value: /home/agent}
+    securityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
+    volumeMounts:
+    - {name: interim-agent, mountPath: /run/ap-agent, readOnly: true}
+    - {name: agent-home, mountPath: /home/agent}
+  containers:
+  - name: proxy
+    image: REPLACE/auth-proxy:TAG
+    # INTERIM Q1-A: the sha256 of the one surrogate (not secret). Printed by interim-keygen.sh.
+    args: ["--policy", "/etc/auth-proxy/policy.toml",
+           "--interim-static-surrogate-sha256=REPLACE_WITH_SHA256_OF_THE_SURROGATE"]
+    securityContext:
+      runAsUser: 1001
+      runAsGroup: 1001
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
+    volumeMounts:
+    - {name: kiro-secret, mountPath: /run/secrets/auth-proxy/auth-proxy-kiro, readOnly: true}
+    - {name: policy, mountPath: /etc/auth-proxy, readOnly: true}
+    - {name: admin-sock, mountPath: /run/auth-proxy-admin}   # proxy only
+    - {name: session-sock, mountPath: /run/auth-proxy}       # proxy only here: NOT mounted into the agent
+    - {name: proxy-state, mountPath: /var/lib/auth-proxy}    # authority token hash
+  - name: ap-egress
+    image: REPLACE/ap-egress:TAG
+    args: ["--policy", "/etc/auth-proxy/policy.toml", "--listen", "127.0.0.1:3128"]
+    securityContext:
+      runAsUser: 1002
+      runAsGroup: 1002
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
+    volumeMounts:
+    # Policy only. No credential Secret, no session socket, no admin socket.
+    - {name: policy, mountPath: /etc/auth-proxy, readOnly: true}
+  - name: agent
+    image: REPLACE/agent-runtime:TAG       # INTERIM: the runtime need not speak the session plane
+    workingDir: /work
+    env:
+    - {name: HOME, value: /home/agent}
+    - {name: HTTPS_PROXY, value: "http://127.0.0.1:3128"}
+    - {name: NO_PROXY, value: "127.0.0.1,localhost"}
+    - {name: KIRO_DISABLE_TELEMETRY, value: "1"}
+    # INTERIM: one surrogate for the whole pod, the same value in every child.
+    - name: KIRO_API_KEY
+      valueFrom: {secretKeyRef: {name: auth-proxy-interim-agent, key: surrogate}}
+    securityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: {drop: [ALL]}
+    volumeMounts:
+    - {name: agent-home, mountPath: /home/agent}
+    - {name: agent-tmp, mountPath: /tmp}
+    - {name: work, mountPath: /work}
+  volumes:
+  - name: kiro-secret
+    secret: {secretName: auth-proxy-kiro, defaultMode: 0444}
+  - name: policy
+    configMap: {name: auth-proxy-policy, defaultMode: 0444}
+  - name: interim-agent
+    secret: {secretName: auth-proxy-interim-agent, defaultMode: 0444}
+  - {name: admin-sock, emptyDir: {medium: Memory}}
+  - {name: session-sock, emptyDir: {medium: Memory}}
+  - {name: proxy-state, emptyDir: {}}
+  - {name: agent-home, emptyDir: {}}
+  - {name: agent-tmp, emptyDir: {}}
+  - {name: work, emptyDir: {}}

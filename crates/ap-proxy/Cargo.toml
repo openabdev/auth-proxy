@@ -20,6 +20,7 @@ ap-core.workspace = true
 ap-broker.workspace = true
 axum.workspace = true
 futures-util.workspace = true
+hex.workspace = true
 http.workspace = true
 reqwest.workspace = true
 serde.workspace = true

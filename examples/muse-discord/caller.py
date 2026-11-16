@@ -42,6 +42,15 @@ Environment:
 
 Exit codes: 0 executed, 2 proxy refusal or upstream error, 3 approval denied,
 4 approval expired, 5 approval wait timed out, 64 usage/config error.
+
+Transport hardening: all requests go through an explicit opener with no
+redirect following and no ambient proxy. The proxy itself is built with
+``reqwest::redirect::Policy::none()``, so an upstream 3xx reaches this
+caller unchanged; following it here would resend the surrogate
+``Authorization`` header to whatever host the ``Location`` names, and
+honouring ``http_proxy``/``https_proxy`` from the environment would route
+the surrogate through a third party. A 3xx is therefore returned as a
+status and treated by ``main`` as a proxy/upstream error (exit 2).
 """
 
 import json
@@ -61,6 +70,19 @@ REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SNOWFLAKE_RE = re.compile(r"^\d+$")
 APPROVAL_HEADER = "x-auth-proxy-approval"
 APPROVAL_MARKER = "parked"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: returning None makes urllib raise HTTPError
+    for the 3xx, which _send returns as a status (exit 2 in main)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# Explicit opener: ProxyHandler({}) disables ambient http_proxy/https_proxy,
+# and _NoRedirect disables redirect following (see module docstring).
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
 def die(message: str, code: int = 64) -> "SystemExit":
@@ -135,7 +157,7 @@ class Caller:
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with _OPENER.open(req, timeout=30) as resp:
                 headers = {k.lower(): v for k, v in resp.headers.items()}
                 return resp.status, headers, resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as err:

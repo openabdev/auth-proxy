@@ -43,6 +43,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ap-egress"
+version = "0.1.0"
+dependencies = [
+ "ap-core",
+ "tokio",
+]
+
+[[package]]
 name = "ap-proxy"
 version = "0.1.0"
 dependencies = [

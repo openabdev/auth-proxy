@@ -1,0 +1,21 @@
+[package]
+name = "ap-egress"
+description = "auth-proxy egress: a CONNECT-only allowlist proxy for non-credential traffic. Holds no credential, depends on no broker, never terminates TLS."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ap-egress"
+path = "src/main.rs"
+
+# Do NOT add ap-broker, reqwest, rustls or hyper-rustls here. scripts/check-egress-deps.sh
+# fails CI if any of them enters this crate's normal dependency tree.
+[dependencies]
+ap-core.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+ap-core.workspace = true
+tokio.workspace = true

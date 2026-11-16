@@ -84,8 +84,22 @@ def main() -> int:
     # 2. shipped read grants authorize the caller's read paths
     check("read grant matches message history path",
           evaluate(shipped, "GET", f"/api/v10/channels/{CHANNEL}/messages"))
-    check("read grant matches guild list path",
-          evaluate(shipped, "GET", "/api/v10/guilds/@me/guilds"))
+    check("read grant matches a guild's channel list",
+          evaluate(shipped, "GET", f"/api/v10/guilds/{CHANNEL}/channels"))
+    # /users/@me/guilds is the real "list my guilds" endpoint. It is NOT
+    # under the granted prefixes, so the example does not claim it.
+    check("read grant does NOT cover /users/@me/guilds",
+          not evaluate(shipped, "GET", "/api/v10/users/@me/guilds"))
+
+    # M-1: the default read grant is a prefix and cannot be narrowed to
+    # messages only (valid_path forbids the exact path). It therefore
+    # DOES authorize listing webhooks, which returns webhook tokens when
+    # the bot holds Manage Webhooks. Documented in README/identity.toml;
+    # pinned here so a change in either direction is noticed.
+    check("DOCUMENTED RISK: read grant authorizes GET .../webhooks (tokens if bot has Manage Webhooks)",
+          evaluate(shipped, "GET", f"/api/v10/channels/{CHANNEL}/webhooks"))
+    check("DOCUMENTED RISK: read grant authorizes GET guild webhooks",
+          evaluate(shipped, "GET", f"/api/v10/guilds/{CHANNEL}/webhooks"))
 
     # 3. the documented write trap (round-2 F1/F2)
     narrow = [{"methods": ["POST"], "paths": [f"/api/v10/channels/{CHANNEL}/messages/"]}]

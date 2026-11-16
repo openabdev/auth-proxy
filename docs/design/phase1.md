@@ -641,8 +641,9 @@ registry and store reader. Every refusal sends nothing upstream.
    roots [M exp2 R6, R7]; never follow redirects [M exp2 R4]; stream the response chunk by chunk
    with `TCP_NODELAY` on both sides [M exp2: without it p99 rose by 44 ms].
 9. Audit one JSON line to stdout: identity, session id, generation, route, method, route-relative
-   path, AWS target, decision, code, status, duration. Never the caller key, surrogate, credential
-   or query string.
+   path, AWS target, decision, code, status, duration, and optionally `bytes_sent`. `bytes_sent`
+   is omitted from every record except `upstream_reset`. Never the caller key, surrogate,
+   credential or query string.
 
 | Code | Status | Body dialect | Logged at | Notes |
 |---|---|---|---|---|

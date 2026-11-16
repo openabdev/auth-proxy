@@ -339,7 +339,9 @@ where
     futures_util::stream::unfold((Box::pin(stream), audit), |(mut s, mut a)| async move {
         match s.next().await {
             Some(Ok(bytes)) => {
-                a.sent += bytes.len() as u64;
+                a.sent = a
+                    .sent
+                    .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
                 Some((Ok(bytes), (s, a)))
             }
             Some(Err(e)) => {

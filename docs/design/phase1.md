@@ -433,7 +433,9 @@ Follow-ups attached to the decision:
 - `ap-egress` connects to the exact address it validated and never resolves the name a second
   time (DNS rebinding).
 - The platform sets `NO_PROXY=127.0.0.1,localhost` next to `HTTPS_PROXY`.
-- A test confirms that kiro-cli sends `X-Amz-Target` before any grant relies on `aws_targets`.
+- [x] A test confirms that kiro-cli sends `X-Amz-Target` before any grant relies on `aws_targets`.
+  Done for kiro-cli 3.3.0, one call each, no real request [M, `docs/evidence/xamz-target.md`].
+  Re-check after a kiro-cli upgrade.
 - The combined Option A rule set is measured in one pod before release.
 
 Remaining risk, accepted: the agent can still send data to allowlisted hosts such as github.com,

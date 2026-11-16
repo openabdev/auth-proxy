@@ -497,3 +497,38 @@ fn connect_to_parses_in_a_test_resolve_build() {
         Some("127.0.0.1:9".parse().unwrap())
     );
 }
+
+/// Shipped policies (everything under `deploy/`) must parse, and none may use
+/// `aws_targets`: the matcher stays dormant until a real grant needs it.
+#[test]
+fn shipped_policies_parse_and_use_no_aws_targets() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "toml") {
+                out.push(p);
+            }
+        }
+    }
+    let deploy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
+    let mut files = Vec::new();
+    walk(&deploy, &mut files);
+    assert!(
+        files.iter().any(|f| f.ends_with("policy.example.toml")),
+        "the example policy was not found under deploy/: {files:?}"
+    );
+    for f in files {
+        let raw = std::fs::read(&f).unwrap();
+        let c = Config::parse(&raw).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+        for (i, g) in c.grants.iter().enumerate() {
+            assert!(
+                g.aws_targets.is_empty(),
+                "{}: grant #{} uses aws_targets, which is dormant (no shipped policy may use it)",
+                f.display(),
+                i + 1
+            );
+        }
+    }
+}

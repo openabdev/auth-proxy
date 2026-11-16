@@ -1,8 +1,9 @@
 # Example policy for one identity. Placeholders only: nothing here is a real key or hash.
 # Generate the hash with:  printf %s "$CALLER_KEY" | sha256sum
 # Routes, credentials and grants follow docs/design/phase1.md Q3-A.
-# No grant here uses aws_targets: kiro-cli's X-Amz-Target behaviour is on
-# docs/pre-release-checklist.md and unconfirmed.
+# No shipped policy may use aws_targets (enforced by a test in crates/ap-core/tests/config.rs).
+# The matcher is dormant: kiro-cli 3.3.0 was measured to send exactly one X-Amz-Target per
+# call (docs/verification/phase1-xamz-target.md), so the assumption holds, but no grant needs it yet.
 version = 1
 identity = "pty-team-a"
 caller_key_sha256 = "0000000000000000000000000000000000000000000000000000000000000000" # placeholder
@@ -20,7 +21,10 @@ pass_headers = ["tokentype"]
 
 [[route]]
 name = "kiro-cps"
-host = "control-plane.placeholder.example"      # placeholder: replace with the kiro control-plane host
+# OPEN ITEM: this host is a placeholder. The measured kiro-cli capture pointed every endpoint at a
+# local listener, so it never recorded the real api.cps.service host; docs/pre-release-checklist.md
+# says what is needed. The pod cannot be deployed until it is replaced.
+host = "control-plane.placeholder.example"
 error_shape = "aws"
 surrogate_header = "authorization"
 credential_header = "authorization"

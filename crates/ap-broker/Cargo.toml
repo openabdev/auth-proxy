@@ -1,0 +1,17 @@
+[package]
+name = "ap-broker"
+description = "auth-proxy broker: session registry with leases, authority lock, credential store (file), Broker trait. The only crate that holds a credential value."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ap-core.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true

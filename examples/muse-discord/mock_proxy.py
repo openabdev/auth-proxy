@@ -24,7 +24,11 @@ Implements just enough of the caller-facing shape to exercise caller.py:
     with a configured route. A bare 202 without the marker
     header is NOT a parked request (caller.py returns it as upstream data);
     the fabricated upstream answers POST /api/v10/async-accepted with a
-    bare 202 so tests can exercise that path.
+    bare 202 so tests can exercise that path. The fabricated upstream also
+    answers /api/v10/redirect-me (GET or POST) with a 302 whose Location
+    is MOCK_REDIRECT_LOCATION, so tests can exercise the caller's
+    no-redirect transport: the caller must treat the 302 as an error and
+    must not make a second request to that Location.
 
 Simplifications, deliberately: one identity, one route, one registered
 surrogate, no canonicalization, no policy evaluation, no registry, no
@@ -53,6 +57,10 @@ Environment:
                    ephemeral MOCK_CALLER_KEY / MOCK_SURROGATE in use.
   MOCK_CALLER_KEY  apk_... caller key to accept (default: generated)
   MOCK_SURROGATE   aps_... surrogate to accept  (default: generated)
+  MOCK_REDIRECT_LOCATION  Location returned by the fabricated
+                   /api/v10/redirect-me endpoint (default:
+                   https://example.invalid/steal); tests point it at a
+                   local counting server to assert no second request.
 """
 
 import hashlib
@@ -73,6 +81,7 @@ SURROGATE_FORM = re.compile(r"^Bearer (aps_[0-9a-f]{64})$")
 CHANNEL_MESSAGES = re.compile(r"^/api/v10/channels/(\d+)/messages$")
 
 TTL = float(os.environ.get("MOCK_TTL", "60"))
+REDIRECT_LOCATION = os.environ.get("MOCK_REDIRECT_LOCATION", "https://example.invalid/steal")
 _lock = threading.Lock()
 _parked: dict[str, dict] = {}
 _counter = [0]
@@ -87,6 +96,13 @@ def _json(handler: BaseHTTPRequestHandler, status: int, payload, extra_headers: 
         handler.send_header(key, value)
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def _redirect(handler: BaseHTTPRequestHandler, location: str) -> None:
+    handler.send_response(302)
+    handler.send_header("Location", location)
+    handler.send_header("Content-Length", "0")
+    handler.end_headers()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -128,6 +144,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_caller(caller_key):
             return
         upstream_path = "/" + rest.split("?")[0]
+        if route == "discord" and upstream_path == "/api/v10/redirect-me":
+            # Fabricated upstream endpoint that answers 302 with an
+            # external Location: the caller must not follow it (its
+            # surrogate Authorization header would leave the proxy).
+            return _redirect(self, REDIRECT_LOCATION)
         if route == "discord" and upstream_path == "/api/v10/async-accepted":
             # Fabricated upstream endpoint that legitimately answers a bare
             # 202 (no approval marker): the caller must return it as data.
@@ -167,6 +188,8 @@ class Handler(BaseHTTPRequestHandler):
         if route != "discord" or len(parts) < 5:
             return _json(self, 404, {"code": "route_unknown"})
         upstream_path = "/" + parts[4].split("?")[0]
+        if upstream_path == "/api/v10/redirect-me":
+            return _redirect(self, REDIRECT_LOCATION)
         if CHANNEL_MESSAGES.match(upstream_path):
             return _json(self, 200, [{
                 "id": "1570000000000000000",

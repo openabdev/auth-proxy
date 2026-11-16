@@ -18,6 +18,9 @@ Covers the outcome paths of the sketched caller contract:
   5. a bad surrogate is refused by the mock (exit 2),
   6. a bare upstream 202 without the approval marker is returned as
      ordinary data, not mistaken for a parked request.
+  7. an upstream 302 with an external Location is treated as an error
+     (exit 2) and is NOT followed: no second request reaches the
+     external server, so the surrogate never leaves the proxy.
 
 Parked request ids are discovered by polling the mock's test-only
 /_mock/parked endpoint -- never by sleeping a fixed time and guessing
@@ -35,8 +38,10 @@ import os
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CALLER_KEY = "apk_" + secrets.token_hex(32)
@@ -52,9 +57,39 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         failures.append(name)
 
 
-def start_mock(ttl: str) -> tuple[subprocess.Popen, str]:
+class _ExternalHandler(BaseHTTPRequestHandler):
+    """Counting 'external' server: any hit means the caller followed a
+    redirect and sent a second request (with the surrogate) outside."""
+
+    hits: list[str] = []
+
+    def log_message(self, *args):
+        pass
+
+    def _hit(self):
+        type(self).hits.append(self.path)
+        body = json.dumps({"status": "external-reached"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = _hit
+    do_POST = _hit
+
+
+def start_external() -> tuple[ThreadingHTTPServer, str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ExternalHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}/steal"
+
+
+def start_mock(ttl: str, redirect_location: str = "") -> tuple[subprocess.Popen, str]:
     env = dict(os.environ, MOCK_TTL=ttl, MOCK_PORT="0",
                MOCK_CALLER_KEY=CALLER_KEY, MOCK_SURROGATE=SURROGATE)
+    if redirect_location:
+        env["MOCK_REDIRECT_LOCATION"] = redirect_location
     proc = subprocess.Popen(
         [sys.executable, os.path.join(HERE, "mock_proxy.py")],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, text=True,
@@ -101,7 +136,8 @@ def wait_parked(base: str, known: set[str], timeout: float = 10.0) -> str | None
 
 
 def main() -> int:
-    mock_a, base_a = start_mock("60")
+    external, external_location = start_external()
+    mock_a, base_a = start_mock("60", redirect_location=external_location)
     mock_b, base_b = start_mock("1.5")
     try:
         # 1. allow-listed read
@@ -147,9 +183,18 @@ def main() -> int:
         res = run_caller(base_a, ["request", "POST", "/api/v10/async-accepted"])
         check("bare upstream 202 returned as data", res.returncode == 0 and "accepted" in res.stdout,
               f"rc={res.returncode} out={res.stdout!r} err={res.stderr!r}")
+
+        # 7. upstream 302 with an external Location is not followed
+        _ExternalHandler.hits.clear()
+        res = run_caller(base_a, ["request", "GET", "/api/v10/redirect-me"])
+        check("redirect treated as error (exit 2)", res.returncode == 2,
+              f"rc={res.returncode} out={res.stdout!r} err={res.stderr!r}")
+        check("no second request to external Location", _ExternalHandler.hits == [],
+              f"hits={_ExternalHandler.hits!r}")
     finally:
         mock_a.terminate()
         mock_b.terminate()
+        external.shutdown()
 
     print(f"\n{'ALL PASS' if not failures else 'FAILURES: ' + ', '.join(failures)}")
     return 1 if failures else 0

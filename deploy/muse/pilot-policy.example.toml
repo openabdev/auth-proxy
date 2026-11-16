@@ -1,0 +1,35 @@
+# Muse pilot, stage 1 (measurement plus allow/deny passthrough).
+# Placeholders only: replace every <...> value. Never commit a real host name or key hash.
+# See docs/runbooks/muse-stage1.md.
+version = 1
+
+[listen]
+# Loopback only. The TLS front (for example `tailscale serve`) forwards to this address.
+proxy = "127.0.0.1:8443"
+
+[passthrough]
+# The Host header the front passes to the loopback listener.
+public_authority = "<public-host>"
+
+[probe]
+# Only for the stage 1 measurement build (cargo build --features stage1-probe).
+enabled = true
+
+[[identity]]
+name = "muse-pilot"
+# sha256 of the issued apk_ key, 64 lowercase hex characters.
+caller_key_sha256 = "<64 lowercase hex, sha256 of the issued apk_ key>"
+
+[[route]]
+name = "discord"
+host = "discord.com"
+mode = "passthrough"
+
+# Reads pass. Every other method or path (including POST /api/v10/channels/{id}/messages)
+# is refused 423 no_grant.
+[[grant]]
+identity = "muse-pilot"
+route = "discord"
+methods = ["GET"]
+paths = ["/api/v10/channels/", "/api/v10/guilds/", "/api/v10/users/@me"]
+decision = "allow"

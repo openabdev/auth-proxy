@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ap_broker::store::SecretBytes;
-use ap_core::config::Route;
-use ap_core::headers::{strip_request_headers, HOP_HEADERS};
+use ap_core::config::{Passthrough, Route};
+use ap_core::headers::{strip_request_headers, AUTH_HEADERS, HOP_HEADERS};
 use axum::body::Body;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use http::header::{CONTENT_LENGTH, HOST};
+use http::header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST};
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder};
@@ -123,6 +123,108 @@ pub fn capped_body(body: Body, max: u64, overflow: Arc<AtomicBool>) -> reqwest::
     reqwest::Body::wrap_stream(stream)
 }
 
+/// Whether `name` matches a front-header pattern: exact, or a prefix when the pattern ends in `*`.
+fn matches_pattern(name: &str, pattern: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == pattern,
+    }
+}
+
+/// Build the outbound headers for a passthrough route (design 3.1, ordered algorithm).
+///
+/// Removed: the caller-key header, every `x-ap-*` header, hop-by-hop headers, every header named
+/// by `Connection`, `Expect`, `Host`, the configured front headers, and every `AUTH_HEADERS`
+/// member except `authorization` and the route's `keep_auth_headers`. Everything else is kept,
+/// repeated values included. A declared `Content-Length` is put back, so the upstream request
+/// keeps the declared framing. `Authorization` is marked sensitive and otherwise unchanged.
+pub fn passthrough_headers(inbound: &HeaderMap, route: &Route, pt: &Passthrough) -> HeaderMap {
+    let nominated: Vec<String> = inbound
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    let mut out = HeaderMap::new();
+    for (name, value) in inbound {
+        let n = name.as_str();
+        let drop = n == pt.caller_key_header
+            || n.starts_with("x-ap-")
+            || n == "expect"
+            || HOP_HEADERS.contains(&n)
+            || nominated.iter().any(|c| c == n)
+            || pt.front_strip_headers.iter().any(|p| matches_pattern(n, p))
+            || (AUTH_HEADERS.contains(&n)
+                && n != AUTHORIZATION.as_str()
+                && !route.keep_auth_headers.iter().any(|k| k == n));
+        if drop {
+            continue;
+        }
+        let mut v = value.clone();
+        if n == AUTHORIZATION.as_str() {
+            v.set_sensitive(true);
+        }
+        out.append(name.clone(), v);
+    }
+    if let Some(len) = inbound.get(CONTENT_LENGTH) {
+        out.insert(CONTENT_LENGTH, len.clone());
+    }
+    out
+}
+
+/// Shared flags a [`guarded_body`] sets while the upstream client reads it.
+#[derive(Clone, Default)]
+pub struct BodyFlags {
+    /// At least one body chunk was handed to the upstream request.
+    pub sent_any: Arc<AtomicBool>,
+    /// The body went over the cap.
+    pub overflow: Arc<AtomicBool>,
+    /// The client stalled longer than the per-chunk limit.
+    pub stalled: Arc<AtomicBool>,
+}
+
+/// Wrap the inbound request body for an allowed passthrough request.
+///
+/// Bytes are counted against `max`, each chunk must arrive within `stall`, and the flags record
+/// what happened. Chunks are forwarded as they come, with no buffering.
+pub fn guarded_body(body: Body, max: u64, stall: Duration, flags: BodyFlags) -> reqwest::Body {
+    let stream = futures_util::stream::unfold(
+        (Box::pin(body.into_data_stream()), 0u64, flags, false),
+        move |(mut s, seen, flags, failed)| async move {
+            if failed {
+                return None;
+            }
+            let next = match tokio::time::timeout(stall, s.next()).await {
+                Ok(n) => n,
+                Err(_) => {
+                    flags.stalled.store(true, Ordering::SeqCst);
+                    let e = io::Error::new(io::ErrorKind::TimedOut, "request body stalled");
+                    return Some((Err(e), (s, seen, flags, true)));
+                }
+            };
+            match next {
+                None => None,
+                Some(Err(e)) => Some((Err(io::Error::other(e)), (s, seen, flags, true))),
+                Some(Ok(chunk)) => {
+                    let seen = seen.saturating_add(chunk.len() as u64);
+                    if seen > max {
+                        flags.overflow.store(true, Ordering::SeqCst);
+                        let e = io::Error::other("request body exceeds the configured limit");
+                        return Some((Err(e), (s, seen, flags, true)));
+                    }
+                    if !chunk.is_empty() {
+                        flags.sent_any.store(true, Ordering::SeqCst);
+                    }
+                    Some((Ok::<Bytes, io::Error>(chunk), (s, seen, flags, false)))
+                }
+            }
+        },
+    );
+    reqwest::Body::wrap_stream(stream)
+}
+
 /// Copy the upstream response headers for the agent. Hop-by-hop headers are dropped.
 /// `Content-Length` is kept, because the body is streamed without re-framing.
 pub fn response_headers(upstream: &HeaderMap) -> HeaderMap {
@@ -150,4 +252,186 @@ pub async fn send(
         .body(body)
         .send()
         .await
+}
+
+#[cfg(test)]
+mod passthrough_tests {
+    use super::*;
+    use ap_core::config::{load, Config};
+    use http::HeaderValue;
+
+    fn cfg(extra_route: &str) -> Config {
+        load(&format!(
+            r#"version = 1
+[listen]
+proxy = "127.0.0.1:8443"
+[passthrough]
+public_authority = "gate.example.test"
+[[identity]]
+name = "m"
+caller_key_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+[[route]]
+name = "discord"
+host = "discord.com"
+mode = "passthrough"
+{extra_route}
+[[grant]]
+identity = "m"
+route = "discord"
+methods = ["GET"]
+paths = ["/"]
+"#
+        ))
+        .expect("valid")
+    }
+
+    fn build(c: &Config, pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        passthrough_headers(&h, &c.routes[0], c.passthrough.as_ref().unwrap())
+    }
+
+    #[test]
+    fn keeps_authorization_and_ordinary_headers_and_repeats() {
+        let c = cfg("");
+        let out = build(
+            &c,
+            &[
+                ("authorization", "Bot abc"),
+                ("content-type", "application/json"),
+                ("x-custom", "1"),
+                ("x-custom", "2"),
+                ("user-agent", "DiscordBot"),
+            ],
+        );
+        assert_eq!(out.get("authorization").unwrap(), "Bot abc");
+        assert!(out.get("authorization").unwrap().is_sensitive());
+        assert_eq!(out.get("content-type").unwrap(), "application/json");
+        assert_eq!(out.get_all("x-custom").iter().count(), 2);
+        assert_eq!(out.get("user-agent").unwrap(), "DiscordBot");
+    }
+
+    #[test]
+    fn strips_caller_key_front_hop_and_credential_headers() {
+        let c = cfg("");
+        let out = build(
+            &c,
+            &[
+                ("authorization", "Bot abc"),
+                ("x-ap-caller-key", "apk_x"),
+                ("x-ap-foo", "1"),
+                ("forwarded", "for=1"),
+                ("x-forwarded-for", "1"),
+                ("x-real-ip", "1"),
+                ("via", "1"),
+                ("cf-ray", "1"),
+                ("tailscale-user-login", "someone"),
+                ("cookie", "a=b"),
+                ("proxy-authorization", "x"),
+                ("x-api-key", "k"),
+                ("expect", "100-continue"),
+                ("host", "gate.example.test"),
+                ("connection", "x-private, keep-alive"),
+                ("x-private", "1"),
+                ("keep-alive", "5"),
+                ("te", "trailers"),
+                ("upgrade", "websocket"),
+            ],
+        );
+        let names: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, vec!["authorization"], "left: {names:?}");
+    }
+
+    #[test]
+    fn keep_auth_headers_keeps_a_named_member_only() {
+        let c = cfg("keep_auth_headers = [\"x-api-key\"]");
+        let out = build(&c, &[("x-api-key", "k"), ("cookie", "a=b")]);
+        assert_eq!(out.get("x-api-key").unwrap(), "k");
+        assert!(out.get("cookie").is_none());
+    }
+
+    #[test]
+    fn declared_content_length_is_put_back() {
+        let c = cfg("");
+        let out = build(&c, &[("content-length", "12")]);
+        assert_eq!(out.get("content-length").unwrap(), "12");
+        let out = build(&c, &[("transfer-encoding", "chunked")]);
+        assert!(out.get("content-length").is_none());
+        assert!(out.get("transfer-encoding").is_none());
+    }
+
+    async fn drain(b: reqwest::Body) -> Vec<Result<Bytes, String>> {
+        let mut out = Vec::new();
+        let mut s = http_body_util::BodyDataStream::new(b);
+        while let Some(c) = s.next().await {
+            out.push(c.map_err(|e| e.to_string()));
+        }
+        out
+    }
+
+    fn flags() -> BodyFlags {
+        BodyFlags::default()
+    }
+
+    #[tokio::test]
+    async fn stall_after_a_prefix_sets_sent_any_and_stalled() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(2);
+        tx.send(Ok(Bytes::from_static(b"abc"))).await.unwrap();
+        let f = flags();
+        let body = guarded_body(
+            Body::from_stream(tokio_stream_from(rx)),
+            100,
+            Duration::from_millis(50),
+            f.clone(),
+        );
+        let got = drain(body).await;
+        assert!(got[0].is_ok());
+        assert!(got[1].is_err());
+        assert!(f.sent_any.load(Ordering::SeqCst));
+        assert!(f.stalled.load(Ordering::SeqCst));
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn stall_before_any_chunk_leaves_sent_any_false() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(2);
+        let f = flags();
+        let body = guarded_body(
+            Body::from_stream(tokio_stream_from(rx)),
+            100,
+            Duration::from_millis(50),
+            f.clone(),
+        );
+        let got = drain(body).await;
+        assert!(got[0].is_err());
+        assert!(!f.sent_any.load(Ordering::SeqCst));
+        assert!(f.stalled.load(Ordering::SeqCst));
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn over_cap_sets_overflow() {
+        let f = flags();
+        let body = guarded_body(
+            Body::from(vec![0u8; 10]),
+            5,
+            Duration::from_secs(5),
+            f.clone(),
+        );
+        let got = drain(body).await;
+        assert!(got[0].is_err());
+        assert!(f.overflow.load(Ordering::SeqCst));
+        assert!(!f.sent_any.load(Ordering::SeqCst));
+    }
+
+    fn tokio_stream_from(
+        mut rx: tokio::sync::mpsc::Receiver<Result<Bytes, io::Error>>,
+    ) -> impl futures_util::Stream<Item = Result<Bytes, io::Error>> {
+        futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
+    }
 }

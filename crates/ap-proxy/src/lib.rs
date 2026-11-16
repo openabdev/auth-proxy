@@ -5,11 +5,16 @@
 
 pub mod admin_http;
 pub mod audit_sink;
+pub mod evidence;
 pub mod forward;
 pub mod listener;
 #[cfg(feature = "matrix-upstream")]
 pub mod matrix_hooks;
+pub mod passthrough;
 pub mod pipeline;
+mod policy_store;
+#[cfg(feature = "stage1-probe")]
+mod probe;
 pub mod session_http;
 
 use std::future::IntoFuture;
@@ -106,6 +111,9 @@ pub async fn run(opts: Options) -> i32 {
             return 2;
         }
     };
+    if cfg.is_passthrough_only() {
+        return run_passthrough(&opts, cfg).await;
+    }
     let listen = cfg.listen.proxy;
     // The store is never created here. A missing file means it was lost or never provisioned,
     // and the proxy must not start over it.
@@ -200,4 +208,47 @@ pub async fn run(opts: Options) -> i32 {
 
 async fn agent_response(app: Arc<App>, req: Request) -> Response {
     pipeline::handle(app, req).await
+}
+
+/// A passthrough-only deployment (the Muse gate). It needs no expiry store, broker, session
+/// socket or admin socket, so none is read or bound, and the sidecar flags are ignored.
+async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
+    if cfg.probe.enabled && !cfg!(feature = "stage1-probe") {
+        eprintln!("auth-proxy: [probe] is enabled but this build lacks the stage1-probe feature");
+        return 2;
+    }
+    let Some(pt) = cfg.passthrough.clone() else {
+        eprintln!("auth-proxy: passthrough settings are missing");
+        return 2;
+    };
+    let client = match forward::client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("auth-proxy: cannot build the upstream client: {e}");
+            return 1;
+        }
+    };
+    let listen = cfg.listen.proxy;
+    let listener = match listener::bind_loopback(listen).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("auth-proxy: cannot bind the public listener: {e}");
+            return 2;
+        }
+    };
+    // A panic line carries the source location only, never the payload, which could hold a
+    // header value.
+    std::panic::set_hook(Box::new(|info| match info.location() {
+        Some(l) => eprintln!("auth-proxy: panic at {}:{}", l.file(), l.line()),
+        None => eprintln!("auth-proxy: panic"),
+    }));
+    let app = passthrough::PtApp::new(opts.config.clone(), cfg, AuditSink::stdout(), client);
+    let limits = listener::public::PublicLimits {
+        max_connections: pt.max_connections,
+        header_read: std::time::Duration::from_secs(pt.header_read_secs),
+    };
+    eprintln!("auth-proxy: listening");
+    listener::public::serve_public(listener, app, limits).await;
+    eprintln!("auth-proxy: public listener stopped");
+    1
 }

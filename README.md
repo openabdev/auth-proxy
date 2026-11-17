@@ -244,6 +244,45 @@ flowchart TB
 - **Names come from `deploy/k8s/pod.yaml`:** container, volume and port names match that file.
   Image references are placeholders until a release pins digests.
 
+### Runtime container hardening
+
+The runtime container holds the Ed25519 proof seed, so its surface is the smallest in the pod
+(issue #24). The settings below are in `deploy/k8s/pod.yaml`. `deploy/k8s/validate_manifests.py`
+fails on each rule, and each rule has a bad-manifest test. Evidence:
+[docs/evidence/runtime-hardening.md](docs/evidence/runtime-hardening.md).
+
+| Setting | Value | Why it is safe |
+|---|---|---|
+| Seccomp | pod-level `RuntimeDefault`, inherited by every init and app container; no container overrides it | The shim started, said `hello`, registered and revoked a session under it, with no denial. A custom profile is not needed, and a `Localhost` profile would need a file on every node. |
+| Root filesystem | `readOnlyRootFilesystem: true` | The shim writes only `runtime.sock`. No `/tmp` and no other path. Measured: `touch` fails on `/`, on the seed directory and on `session-plane`. |
+| Writable mounts | `agent-runtime` only | `session-plane` is mounted `readOnly: true`: connecting to `session.sock` needs write permission on the socket file, not on its directory. Measured: `hello`, register and renew work with the read-only mount. |
+| Privileges | `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, no `add`, not privileged | `CapEff` and `CapBnd` are all zero, `NoNewPrivs` is 1. |
+| User | UID and GID 1002, `runAsNonRoot: true` | Fixed, distinct from the agent (1000), the proxy (1001) and egress (1003). |
+| Seed file | Secret volume, `defaultMode` 0444, owned by root, mounted read-only into `runtime` only | The kubelet writes Secret files as root, and the validator forbids `fsGroup`, so 0444 is the only mode UID 1002 can read. The agent cannot read it because it does not mount the volume and shares no process namespace. Measured: the file is absent in the agent container. Not a mode protection: any process in the runtime container can read the seed. |
+| Env, ports | none | The seed is never in an env var. |
+| PID namespace | `shareProcessNamespace: false` | Other containers cannot reach the runtime's `/proc/<pid>/root`. |
+| Service account | `automountServiceAccountToken: false` | A compromised runtime has no API token. |
+| Termination | `terminationGracePeriodSeconds: 10` | The binaries run as PID 1 without a SIGTERM handler, so deletion takes about the full grace period (10.8 s measured, 30 s by default). |
+| AppArmor | not set in the manifest | A node without AppArmor refuses a pod that names a profile. containerd applies its default profile (`cri-containerd.apparmor.d`, enforce) on a node that has AppArmor, with or without a field. To pin it, add `appArmorProfile: {type: RuntimeDefault}` to the container. The validator accepts `RuntimeDefault` or `Localhost` and refuses `Unconfined`. |
+
+Validator rules added for this (names as printed): `every-container-has-an-enforcing-seccomp-profile`,
+`apparmor-profile-if-set-is-not-unconfined`, `every-container-drops-all-and-is-read-only-root`
+(no capability beyond `CHOWN` and `FSETID` for `volume-prep` and `NET_ADMIN` for `netinit` and
+`netcheck`; no privileged, no hostPort, no non-default procMount),
+`only-volume-prep-netinit-netcheck-run-as-root`, `non-root-containers-have-a-fixed-uid-and-gid`,
+`runtime-only-writable-mount-is-the-agent-socket-dir`, `runtime-has-no-env-port-or-envfrom`,
+`runtime-seed-flag-is-the-secret-item`, `runtime-key-not-in-any-other-container-list` (init and
+ephemeral containers included), `runtime-key-not-referenced-by-env`,
+`termination-grace-period-is-short` (1 to 15 s) and
+`no-service-account-token-and-no-service-links`. The existing seed rules still apply: mode 0444,
+one Secret volume, mounted only into `runtime`, read-only, no `fsGroup`.
+
+**Residual risk.** A compromised runtime container can still sign `hello` and session calls with
+the seed for as long as that container runs, and it can read the seed. Hardening limits what the attacker can do from there: no
+network (netinit gives UID 1002 no route), no writable filesystem, no capability, no API token, no
+view of the other containers. It does not stop forged proofs from inside the container. Threshold
+shares and per-start derived seeds are out of scope.
+
 ### Credential Secret at-rest requirements
 
 The real credential lives in the Secret `auth-proxy-kiro`. The file the proxy reads is not a plain
@@ -370,6 +409,13 @@ verified against a cluster.
 
 - [ ] `python3 deploy/k8s/validate_manifests.py` passes (credential mount, volume type, mode,
       read-only and env rules).
+- [ ] The same run passes the runtime-hardening rules listed under "Runtime container hardening":
+      seccomp on every container, read-only root filesystems, no capability beyond the three
+      allowed, fixed UID and GID, the runtime's only writable mount is `agent-runtime`, the seed
+      mounted only into `runtime`, a short grace period.
+- [ ] On the target node, `kubectl exec` into the agent container shows `CapEff` zero, `Seccomp: 2`
+      and a read-only root, and the seed path does not exist there. If the node has AppArmor,
+      `/proc/<pid>/attr/current` of the runtime shows an enforcing profile.
 - [ ] Etcd encryption at rest is on for `secrets` in the target cluster with a provider that is
       not `identity` and not `aescbc` (`secretbox` or `kms` v2), `k3s secrets-encrypt status`
       shows `Enabled`, and `auth-proxy-kiro` was written or rewritten after it was enabled and

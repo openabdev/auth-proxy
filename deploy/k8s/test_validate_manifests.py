@@ -649,6 +649,145 @@ class ValidatorTests(unittest.TestCase):
         copy.edit_pod(mutate)
         self.assert_fails(copy, "containers-agent-proxy-runtime-egress")
 
+    # ---- Runtime container hardening (issue #24): one minimal bad manifest per rule ----
+
+    def init_container(self, pod, name):
+        return next(c for c in pod["spec"]["initContainers"] if c["name"] == name)
+
+    def test_pod_seccomp_unconfined_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: pod["spec"]["securityContext"].__setitem__(
+            "seccompProfile", {"type": "Unconfined"}))
+        self.assert_fails(copy, "every-container-has-an-enforcing-seccomp-profile")
+
+    def test_missing_pod_seccomp_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: pod["spec"]["securityContext"].pop("seccompProfile"))
+        self.assert_fails(copy, "every-container-has-an-enforcing-seccomp-profile")
+
+    def test_runtime_container_seccomp_unconfined_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: copy.container(pod, "runtime")["securityContext"].__setitem__(
+            "seccompProfile", {"type": "Unconfined"}))
+        self.assert_fails(copy, "every-container-has-an-enforcing-seccomp-profile")
+
+    def test_localhost_seccomp_without_a_profile_name_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: pod["spec"]["securityContext"].__setitem__(
+            "seccompProfile", {"type": "Localhost"}))
+        self.assert_fails(copy, "every-container-has-an-enforcing-seccomp-profile")
+
+    def test_apparmor_runtime_default_on_the_runtime_is_accepted(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: copy.container(pod, "runtime")["securityContext"].__setitem__(
+            "appArmorProfile", {"type": "RuntimeDefault"}))
+        code, out = run_validator(copy.root)
+        self.assertEqual(code, 0, out)
+
+    def test_apparmor_unconfined_field_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: copy.container(pod, "runtime")["securityContext"].__setitem__(
+            "appArmorProfile", {"type": "Unconfined"}))
+        self.assert_fails(copy, "apparmor-profile-if-set-is-not-unconfined")
+
+    def test_apparmor_unconfined_annotation_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: pod["metadata"].setdefault("annotations", {}).__setitem__(
+            "container.apparmor.security.beta.kubernetes.io/runtime", "unconfined"))
+        self.assert_fails(copy, "apparmor-profile-if-set-is-not-unconfined")
+
+    def test_init_container_with_a_writable_root_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: self.init_container(pod, "expiry-store-bootstrap")[
+            "securityContext"].__setitem__("readOnlyRootFilesystem", False))
+        self.assert_fails(copy, "every-container-drops-all-and-is-read-only-root")
+
+    def test_privileged_egress_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: copy.container(pod, "egress")["securityContext"].__setitem__(
+            "privileged", True))
+        self.assert_fails(copy, "every-container-drops-all-and-is-read-only-root")
+
+    def test_extra_capability_on_the_runtime_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: copy.container(pod, "runtime")["securityContext"][
+            "capabilities"].__setitem__("add", ["NET_BIND_SERVICE"]))
+        self.assert_fails(copy, "every-container-drops-all-and-is-read-only-root")
+
+    def test_extra_capability_on_volume_prep_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: self.init_container(pod, "volume-prep")["securityContext"][
+            "capabilities"].__setitem__("add", ["CHOWN", "FSETID", "DAC_OVERRIDE"]))
+        self.assert_fails(copy, "every-container-drops-all-and-is-read-only-root")
+
+    def test_bootstrap_running_as_root_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: self.init_container(pod, "expiry-store-bootstrap")[
+            "securityContext"].__setitem__("runAsUser", 0))
+        self.assert_fails(copy, "only-volume-prep-netinit-netcheck-run-as-root")
+
+    def test_bootstrap_without_a_group_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: self.init_container(pod, "expiry-store-bootstrap")[
+            "securityContext"].pop("runAsGroup"))
+        self.assert_fails(copy, "non-root-containers-have-a-fixed-uid-and-gid")
+
+    def test_runtime_with_a_writable_session_plane_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for m in copy.container(pod, "runtime")["volumeMounts"]:
+                if m["name"] == "session-plane":
+                    m.pop("readOnly")
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "runtime-only-writable-mount-is-the-agent-socket-dir")
+
+    def test_runtime_with_an_env_var_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: copy.container(pod, "runtime").__setitem__(
+            "env", [{"name": "X", "value": "1"}]))
+        self.assert_fails(copy, "runtime-has-no-env-port-or-envfrom")
+
+    def test_seed_flag_naming_another_file_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            cmd = copy.container(pod, "runtime")["command"]
+            cmd[cmd.index("--seed-file") + 1] = "/var/run/auth-proxy-runtime/other.seed"
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "runtime-seed-flag-is-the-secret-item")
+
+    def test_ephemeral_container_mounting_the_seed_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: pod["spec"].__setitem__("ephemeralContainers", [{
+            "name": "dbg", "image": "x",
+            "volumeMounts": [{"name": "runtime-key", "mountPath": "/k", "readOnly": True}]}]))
+        self.assert_fails(copy, "runtime-key-not-in-any-other-container-list")
+
+    def test_seed_secret_as_env_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: copy.container(pod, "egress").__setitem__("env", [{
+            "name": "SEED", "valueFrom": {"secretKeyRef": {
+                "name": "auth-proxy-runtime-key", "key": "runtime_ed25519.seed"}}}]))
+        self.assert_fails(copy, "runtime-key-not-referenced-by-env")
+
+    def test_missing_grace_period_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: pod["spec"].pop("terminationGracePeriodSeconds"))
+        self.assert_fails(copy, "termination-grace-period-is-short")
+
+    def test_long_grace_period_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: pod["spec"].__setitem__("terminationGracePeriodSeconds", 300))
+        self.assert_fails(copy, "termination-grace-period-is-short")
+
+    def test_service_account_token_automount_is_refused(self):
+        copy = Copy(self)
+        copy.edit_pod(lambda pod: pod["spec"].__setitem__("automountServiceAccountToken", True))
+        self.assert_fails(copy, "no-service-account-token-and-no-service-links")
+
 
 if __name__ == "__main__":
     unittest.main()

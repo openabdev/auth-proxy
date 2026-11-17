@@ -58,6 +58,19 @@ spec:
   automountServiceAccountToken: false
   enableServiceLinks: false
   shareProcessNamespace: false
+  # Short on purpose: the proxy and the runtime hold no state that needs a long drain (the expiry
+  # store is on its own volume), and a compromised runtime should not outlive its pod by the default
+  # 30 s. See "Runtime container hardening" in the README.
+  terminationGracePeriodSeconds: 10
+  # Seccomp: the pod-level profile applies to every init and app container, and no container
+  # overrides it (the validator fails on an override or on Unconfined). RuntimeDefault is enough for
+  # the runtime shim (measured on a k3s node, see the README). AppArmor is not set here, because a node without AppArmor refuses a pod that names
+  # a profile. To opt in on a node that has it, add to each container's securityContext (or to this
+  # pod-level one):
+  #   appArmorProfile:
+  #     type: RuntimeDefault
+  # The validator accepts RuntimeDefault or Localhost and refuses Unconfined, here or as a
+  # container.apparmor.security.beta.kubernetes.io/* annotation.
   securityContext:
     seccompProfile:
       type: RuntimeDefault
@@ -133,6 +146,7 @@ spec:
           fi
       securityContext:
         runAsUser: 1001
+        runAsGroup: 1001
         runAsNonRoot: true
         allowPrivilegeEscalation: false
         readOnlyRootFilesystem: true
@@ -256,6 +270,9 @@ spec:
           readOnly: true
     # The runtime: the hello proof and the only client of session.sock. It serves runtime.sock to the
     # agent. It runs only ap-runtime-shim and has no network (netinit gives UID 1002 no route out).
+    # Its only writable path is agent-runtime, where it creates runtime.sock. Its root filesystem is
+    # read-only, session-plane is mounted read-only (connecting to session.sock needs no write access
+    # to the directory), and the proof seed is read-only. It has no env, no port and no capability.
     - name: runtime
       image: REPLACE_RUNTIME_IMAGE
       command:
@@ -279,6 +296,7 @@ spec:
       volumeMounts:
         - name: session-plane
           mountPath: /run/auth-proxy-session
+          readOnly: true
         - name: agent-runtime
           mountPath: /run/auth-proxy-agent
         # The proof seed. Only this container mounts the Secret, read-only.
@@ -413,7 +431,10 @@ spec:
           - key: api_key
             path: api_key
     # The hello proof seed (base64 of 32 bytes). Only the runtime mounts it. Mode 0444, as for
-    # kiro-secret. The validator fails if any other container or init container mounts it.
+    # kiro-secret: the kubelet writes the file as root, and with no fsGroup (the validator forbids
+    # one) 0444 is the only mode UID 1002 can read. The agent UID cannot read it because the agent
+    # container does not mount the volume and shares no process namespace, not because of the mode.
+    # The validator fails if any other container, init container or ephemeral container mounts it.
     - name: runtime-key
       secret:
         secretName: auth-proxy-runtime-key

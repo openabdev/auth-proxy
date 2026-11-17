@@ -40,7 +40,9 @@ pub struct Evidence {
     pub content_type_class: &'static str,
     pub expect_continue: bool,
     pub front_headers_present: FrontFamilies,
-    /// sha256 over the sorted, lowercased, de-duplicated request header NAMES. Values never enter it.
+    /// sha256 over the sorted, de-duplicated header NAMES as the handler sees them, joined by `\n`.
+    /// The `http` crate lowercases names on parse. Names hyper already removed or merged (for
+    /// example `Content-Length` next to `Transfer-Encoding: chunked`) are not in it. Values never enter it.
     pub fwd_names_digest: String,
 }
 

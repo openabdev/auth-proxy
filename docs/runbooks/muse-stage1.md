@@ -109,7 +109,10 @@ proxy and Muse retries without bound, stop and rethink the design instead of bui
   naming `Content-Length`, directly and through the front. The upstream must see nothing. Record which
   layer refused (hyper or the gate) and whether the answer carries `X-AP-Decision`. The automated matrix
   (`tests/matrix/passthrough.py`, row PT-12) records the direct path. It also shows that hyper collapses a
-  duplicate `Content-Length` with identical values before the gate sees it.
+  duplicate `Content-Length` with identical values before the gate sees it. The same row measures a GET
+  with `Content-Length` and chunked, and bare-LF line endings. All three are the design 3.1 known gap:
+  forwarded on a direct request, not asserted as refused, deferred to stage 2 (raw-head scanner). The
+  listener is loopback-only, so direct requests come only from the proxy host.
 
 ## 8. Automated checks
 

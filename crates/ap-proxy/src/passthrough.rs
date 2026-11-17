@@ -101,6 +101,7 @@ impl Trail {
             code: code.map(str::to_string),
             status,
             duration_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            bytes_sent: None,
         }
     }
 
@@ -224,7 +225,7 @@ where
 
 /// Handle one request on the public listener.
 pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body>, ConnAbort> {
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let mut trail = Trail::new(parts.method.as_str());
 
     // 1. CONNECT and Upgrade.
@@ -260,7 +261,15 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
         return Ok(refuse(&app, &trail, Code::FramingRefused));
     }
 
-    // 5. Caller key from its header.
+    // 5. Caller key from its header. Mark every value sensitive first so no Debug print of the
+    // request or its headers can show it.
+    if let Ok(name) = http::HeaderName::from_bytes(pt.caller_key_header.as_bytes()) {
+        if let http::header::Entry::Occupied(mut e) = parts.headers.entry(name) {
+            for v in e.iter_mut() {
+                v.set_sensitive(true);
+            }
+        }
+    }
     let key = match canon::caller_key_from_header(&parts.headers, &pt.caller_key_header) {
         Ok(k) => k,
         Err(code) => return Ok(refuse(&app, &trail, code)),

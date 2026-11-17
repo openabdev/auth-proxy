@@ -543,7 +543,7 @@ impl Config {
                     }
                 }
                 RouteMode::Passthrough => {
-                    if r.name == "ap" || r.name == "__ap_probe" {
+                    if r.name == "ap" {
                         return Err(invalid(format!(
                             "passthrough route name {:?} is reserved",
                             r.name

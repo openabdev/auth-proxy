@@ -138,9 +138,21 @@ Tailnet identity headers that `tailscale serve` injects are ignored: no decision
   `Transfer-Encoding`, with more than one or a comma-joined `Content-Length`, or with a `Transfer-Encoding`
   other than a single `chunked` is refused 400 (`framing_refused`) and produces no upstream request. hyper's
   HTTP/1 parser may refuse some of these before the handler runs, in which case the answer is hyper's, not
-  ours [A, not checked in this work]. The gate does not rely on that. Stage 1 sends raw HTTP/1 requests
+  ours. The gate does not rely on that. Stage 1 sends raw HTTP/1 requests
   directly and through the front and records which layer refused and whether the answer carries
   `X-AP-Decision`.
+  **Known gap (stage 1, decided by the owner):** hyper 1.12 changes three cases before the handler can see
+  them [I hyper-1.12.0 `proto/h1/role.rs`]: it deletes `Content-Length` when `Transfer-Encoding: chunked`
+  is present, it collapses identical duplicate `Content-Length` headers into one, and its parser accepts a
+  bare LF line ending. The handler therefore cannot refuse these three, and a direct request carrying one is
+  forwarded. Stage 1 accepts this because the listener is loopback-only, so a direct request is possible
+  only from the proxy host itself, and the real path goes through the owner's `tailscale serve`, which was
+  measured to normalise or terminate all three [M, source: `.agents/tasks/muse-stage1/owner-report.md`].
+  The fix is a connection-level raw-head scanner (about 100 lines, with a Content-Length and chunked
+  body-length tracker so it finds each head on a keep-alive connection). It is the stage 2 candidate and must be decided
+  before any listener is exposed beyond the front. It was not built now because a second HTTP parser in
+  front of hyper adds a parser-differential surface, and `keep_alive(false)` would change behaviour that
+  the front's pooled connections rely on.
 - Body framing: a held body gets a `Content-Length` computed from the buffered bytes. An allowed request
   forwards a declared `Content-Length` as declared, and an allowed chunked body is forwarded chunked, with
   no buffering and no computed length. The body bytes are unchanged; only framing, which is hop-by-hop,
@@ -357,7 +369,7 @@ a locally generated status plus `X-AP-Decision`, and Discord is not expected to 
 | Failure after the first upstream request byte (reset, stalled or undeclared oversized allowed body, upstream error) | none: the client connection is closed | none | n/a | possibly the request |
 
 If hyper refuses a request before the handler runs (section 3.1 framing policy), the answer is hyper's and
-may lack the header; stage 1 records this.
+may lack the header; stage 1 records this. The three cases in the section 3.1 known gap never reach the handler.
 
 Why these statuses: Discord's documented API statuses are 2xx, 304, 400, 401, 403, 404, 405, 429 and some
 5xx [A, not checked in this work]. 423 and 410 are not expected from Discord. 400, 401, 405, 413 and 503
@@ -750,7 +762,11 @@ Acceptance:
 12. **Framing:** raw HTTP/1 requests with both `Content-Length` and `Transfer-Encoding`, duplicate and
     comma-joined `Content-Length`, a `Transfer-Encoding` other than `chunked`, and conflicting `Connection`
     nominations, sent directly and through the real front: the mock upstream records no request. Record
-    which layer refused and whether the answer carries `X-AP-Decision`.
+    which layer refused and whether the answer carries `X-AP-Decision`. Stage 1 asserts this for the
+    refused cases (differing or comma-joined `Content-Length`, bad `Transfer-Encoding`, `Connection`
+    nominations, obs-fold, wrong or duplicate `Host`). Identical duplicate `Content-Length`, a request with
+    `Content-Length` and `Transfer-Encoding: chunked`, and bare LF are the section 3.1 known gap: they are
+    documented and measured, not asserted as refused.
 13. **Allowed-body boundary:** an allowed body that stalls after a prefix, and an undeclared body that
     exceeds the cap after the mock upstream consumed a prefix, close the client connection with one audit record, `code = body_failed_after_send`. A stall before the
     first upstream byte is 503 `unavailable`, and an undeclared over-cap body before it is 413. An

@@ -302,7 +302,20 @@ def pt12(c):
         r = exchange(c.port, build("POST", "/discord/v1/upload/x", c.good(hs), b"{}"))
         layer = "gate" if r["headers"].get("x-ap-decision") else ("hyper" if r["status"] else "closed")
         out.append(f"{name}:{r['status']}/{layer}/decision={r['headers'].get('x-ap-decision')}")
+    # obs-fold: a folded header line. hyper's parser answers it; the layer is recorded.
+    fold = build("POST", "/discord/v1/upload/x", c.good([("X-Folded", "a\r\n b"), ("Content-Length", "2")]), b"{}")
+    r = exchange(c.port, fold)
+    layer = "gate" if r["headers"].get("x-ap-decision") else ("hyper" if r["status"] else "closed")
+    out.append(f"obs-fold:{r['status']}/{layer}")
     n = len(c.ulog())
+    # Known gap, measured not asserted (design 3.1): hyper deletes Content-Length when chunked is
+    # present, accepts bare LF, and collapses identical duplicate Content-Length. The proxy is
+    # loopback-only and the front normalises these, so stage 1 documents them.
+    r = exchange(c.port, build("GET", "/discord/api/x", c.good([("Content-Length", "2"), ("Transfer-Encoding", "chunked")]), b"0\r\n\r\n"))
+    out.append(f"get-cl+te(known gap, not asserted):{r['status']}")
+    lf = build("GET", "/discord/api/x", c.good(), b"").replace(b"\r\n", b"\n")
+    r = exchange(c.port, lf)
+    out.append(f"bare-lf(known gap, not asserted):{r['status']}")
     # Measurement, not an assertion: hyper collapses a duplicate Content-Length with identical
     # values into one before the handler runs, so the gate cannot see it and forwards one value.
     r = exchange(c.port, build("POST", "/discord/v1/upload/x", c.good([("Content-Length", "2"), ("Content-Length", "2")]), b"{}"))

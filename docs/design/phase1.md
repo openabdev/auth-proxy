@@ -522,8 +522,9 @@ the spike's canonical-host check [M exp2 R5]; every credential route exists; eve
 credential and one of its routes; methods are upper-case tokens; paths start with `/` and contain
 no dot segment, `%` or `//`; at most 256 grants; egress entries are `host:port`, with a canonical
 host and a port from 1 to 65535, and no host that is also a credential route host (otherwise a
-CONNECT tunnel could carry another credential the agent found straight to a credential host; an
-explicit `allow_route_hosts = true` turns the check off).
+CONNECT tunnel could carry another credential the agent found straight to a credential host). The
+rule has no opt-out: a policy that sets the former `egress.allow_route_hosts` key is rejected as an
+unknown field.
 
 ### Getting git, npm, pip and cargo out under the Option A deny
 

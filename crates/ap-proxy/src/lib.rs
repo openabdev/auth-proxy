@@ -364,6 +364,8 @@ async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
     // requests already approved run to their end or to `request_deadline_secs`. A second signal
     // ends the wait.
     eprintln!("auth-proxy: shutting down");
+    // The approval future is not polled again, so it accepts nothing more; an approval already
+    // accepted meets the closed table at `claim_start`.
     let _ = shutdown.send(true);
     app.hold.drain_pending();
     let wait = std::time::Duration::from_secs(pt.request_deadline_secs)

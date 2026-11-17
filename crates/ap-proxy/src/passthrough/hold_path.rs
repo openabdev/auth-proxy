@@ -288,6 +288,7 @@ struct HeldBody {
     confirm: SharedConfirm,
     started: Arc<Started>,
     audit_failed: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     failed: bool,
 }
 
@@ -301,6 +302,16 @@ impl Stream for HeldBody {
         }
         if this.first {
             this.first = false;
+            // Shutdown (design 3.7): only a request that claims its start before the drain runs
+            // on. Otherwise nothing is sent and no `forward_started` is written.
+            if !this.app.hold.claim_start() {
+                this.failed = true;
+                this.shutdown.store(true, Ordering::SeqCst);
+                if let Some(c) = take_confirm(&this.confirm) {
+                    c.send(Confirm::Abandoned);
+                }
+                return Poll::Ready(Some(Err(io::Error::other("shutdown"))));
+            }
             // Milestone 1: the connection exists and no request byte has been flushed. The record
             // must reach the sink first; if it cannot, the body fails and nothing is sent.
             let rec = this
@@ -577,6 +588,7 @@ async fn forward_approved(f: Forward<'_>) -> Result<Response<Body>, ConnAbort> {
     app.pause.after_approve().await;
 
     let audit_failed = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
     let stream = HeldBody {
         app: Arc::clone(&app),
         ctx: guard.ctx.clone(),
@@ -587,6 +599,7 @@ async fn forward_approved(f: Forward<'_>) -> Result<Response<Body>, ConnAbort> {
         confirm: Arc::clone(&confirm),
         started: Arc::clone(&guard.started),
         audit_failed: Arc::clone(&audit_failed),
+        shutdown: Arc::clone(&shutdown),
         failed: false,
     };
     let send = app
@@ -615,6 +628,11 @@ async fn forward_approved(f: Forward<'_>) -> Result<Response<Body>, ConnAbort> {
                     Some(503),
                 );
                 return Ok(finish(&app, &trail, Code::AuditUnavailable));
+            }
+            if shutdown.load(Ordering::SeqCst) {
+                // Approved just before shutdown, refused at the start claim: nothing was sent.
+                guard.write("abandoned_after_approve", None, Some("shutdown"), Some(503));
+                return Ok(refuse(&app, &trail, Code::Shutdown));
             }
             if started.get().is_none() {
                 // The body was never polled: no connection, nothing sent.

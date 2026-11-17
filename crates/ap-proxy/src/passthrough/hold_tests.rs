@@ -1028,6 +1028,34 @@ async fn disconnect_after_approve_before_the_send_sends_nothing() {
     assert_eq!(mock.hits(), 0);
 }
 
+#[tokio::test]
+async fn shutdown_between_approve_and_the_send_sends_nothing() {
+    let mock = Mock::start().await;
+    let t = Ht::new("shutdown-after-approve", &mock.up).await;
+    let gate = Gate::new();
+    t.app.pause.set_after_approve(Arc::clone(&gate));
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    let table = Arc::clone(&t.app.hold);
+    let approve = tokio::spawn(async move { table.approve(&id, "alice").await });
+    gate.arrived().await;
+    // Approved, not yet past forward_started: the drain finds no Pending entry, and the start
+    // claim then refuses.
+    assert_eq!(t.app.hold.drain_pending(), 0);
+    gate.release();
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(
+        (p.status.as_u16(), decision(&p), code(&b)),
+        (503, "unavailable".into(), "shutdown".into())
+    );
+    assert_eq!(approve.await.unwrap(), ApproveResult::ApprovedButAbandoned);
+    assert_eq!(t.count("forward_started"), 0);
+    assert_eq!(t.count("abandoned_after_approve"), 1);
+    // The connection opens before the start claim; no request reaches the upstream.
+    assert!(mock.recorded().is_empty());
+    t.assert_clean();
+}
+
 // ---------------------------------------------------------------- 15
 
 #[tokio::test]
@@ -1301,6 +1329,55 @@ async fn approved_requests_are_closed_at_the_idle_and_total_deadlines() {
     // Reset and timeouts after forward_started write no `completed`.
     assert_eq!(t.count("forward_started"), 3);
     assert_eq!(t.count("completed"), 0);
+}
+
+#[tokio::test]
+async fn allowed_requests_are_closed_at_the_idle_and_total_deadlines() {
+    let mock = Mock::start().await;
+    let o = Opts {
+        extra: "request_deadline_secs = 2\nupstream_idle_secs = 1".into(),
+        ..Opts::default()
+    };
+    let t = Ht::with("allow-deadlines", &mock.up, o).await;
+    let get = |path: &str| t.builder(&t.key, "GET", path).body(Body::empty()).unwrap();
+
+    // No byte for upstream_idle_secs after the head: the body ends in an error.
+    let start = Instant::now();
+    let (p, b) = t.send(get("/discord/api/stall-body")).await.unwrap();
+    assert_eq!(p.status, 200);
+    assert_eq!(&b[..], b"", "body is cut when it errors");
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_millis(1900),
+        "{took:?}"
+    );
+
+    // A trickle never idles, so the total deadline closes it.
+    let start = Instant::now();
+    t.send(get("/discord/api/trickle")).await.unwrap();
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(1800) && took < Duration::from_millis(3200),
+        "{took:?}"
+    );
+
+    // No response head at all: the total deadline closes the caller.
+    let start = Instant::now();
+    assert!(t.send(get("/discord/api/stall")).await.is_err());
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(1800) && took < Duration::from_millis(3200),
+        "{took:?}"
+    );
+
+    // Each of the three ends is one `allow` line with `upstream_reset`.
+    let resets = t
+        .lines()
+        .iter()
+        .filter(|v| v["decision"] == "allow" && v["code"] == "upstream_reset")
+        .count();
+    assert_eq!(resets, 3, "{}", t.text());
+    t.assert_clean();
 }
 
 // ---------------------------------------------------------------- 29

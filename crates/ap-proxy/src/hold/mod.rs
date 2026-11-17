@@ -388,11 +388,19 @@ impl Table {
         self.drop_where(|_| true, || Decision::Dropped)
     }
 
-    /// Shutdown: answer every `Pending` entry `Shutdown` and refuse new admissions. Entries past
-    /// approval are not in the table any more and run on in their handlers.
+    /// Shutdown: answer every `Pending` entry `Shutdown` and refuse new admissions. An approved
+    /// entry that has not yet claimed its start (`claim_start`) is refused at the claim; one that
+    /// has claimed runs on in its handler.
     pub fn drain_pending(&self) -> usize {
         self.lock().closed = true;
         self.drop_where(|_| true, || Decision::Shutdown)
+    }
+
+    /// An approved request asks to start its forward (design 3.7). Shutdown and this claim take
+    /// the same lock, so a request either claims before `drain_pending` and runs to its end, or
+    /// finds the table closed and sends nothing.
+    pub fn claim_start(&self) -> bool {
+        !self.lock().closed
     }
 
     /// The `Pending` entries in admission order, as the approval API may show them.

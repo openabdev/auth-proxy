@@ -915,7 +915,7 @@ def pt23(c):
     return ok, f"status={r and r['status']} code={r and code_of(r)} exit={rc} listening={listening} upstream={len(c.ulog())}"
 
 
-@case("PT-24", "acc 26", "SIGTERM during an approved forward: the response completes, exit 0 (streaming, and inside the injected pause)", "hold")
+@case("PT-24", "acc 26", "SIGTERM during an approved forward: a started response completes, exit 0 (streaming); approved but before the send, 503 shutdown with zero upstream", "hold")
 def pt24(c):
     e = c.e
     out, ok = [], True
@@ -949,10 +949,10 @@ def pt24(c):
     r = t.result(20)
     rc = e.proc.wait(10)
     th.join(5)
-    good = (r is not None and r["status"] == 200 and r["body"].startswith(b"upstream-body")
-            and rc == 0 and len(c.ulog()) == 1)
+    good = (r is not None and r["status"] == 503 and r["headers"].get("x-ap-decision") == "unavailable"
+            and code_of(r) == "shutdown" and rc == 0 and len(c.ulog()) == 0)
     ok &= good
-    out.append(f"pause: status={r and r['status']} exit={rc} upstream={len(c.ulog())}")
+    out.append(f"pause: status={r and r['status']} code={r and code_of(r)} exit={rc} upstream={len(c.ulog())}")
     return ok, " | ".join(out)
 
 

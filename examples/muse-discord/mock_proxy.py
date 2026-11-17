@@ -16,8 +16,11 @@ What it models, in the order the real gate applies it:
   1. Caller key from exactly one place: the X-AP-Caller-Key header, or the
      /ap/<caller-key>/ path prefix (stripped before routing). Both present is
      400 caller_key_ambiguous. A missing, malformed or unknown key is 401
-     caller_rejected. The key is compared by sha256.
-  2. Route name from the first path segment. An unknown route is 423
+     caller_rejected. The key is compared by sha256. The path form mirrors
+     canon::parse_ap_path: /ap/<key> with no slash after the key is 401
+     caller_rejected, /ap/<key>/ is authenticated and then 423 route_unknown.
+  2. Route name from the first path segment ([a-z0-9-]{1,32}). An unknown
+     route, with the names read from the policy's [[route]] tables, is 423
      route_unknown.
   3. More than one Authorization header is 400 authorization_duplicate.
   4. Grant: the policy is read from deploy/muse/pilot-policy.example.toml
@@ -83,8 +86,31 @@ def load_grants(path: str) -> list[dict]:
         return tomllib.load(fh).get("grant", [])
 
 
-GRANTS = load_grants(os.environ.get("MOCK_POLICY") or DEFAULT_POLICY)
-ROUTES = {"discord"}
+def load_routes(path: str) -> set[str]:
+    with open(path, "rb") as fh:
+        return {r["name"] for r in tomllib.load(fh).get("route", []) if "name" in r}
+
+
+_POLICY_PATH = os.environ.get("MOCK_POLICY") or DEFAULT_POLICY
+GRANTS = load_grants(_POLICY_PATH)
+ROUTES = load_routes(_POLICY_PATH)
+ROUTE_NAME_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+
+
+def parse_ap_path(path: str) -> tuple[str, str]:
+    """Mirror of ap_core::canon::parse_ap_path plus the gate's handling of its
+    errors. Returns (key, path after the key). Raises KeyError(code).
+
+    `/ap/<key>` with no `/` after the key is caller_rejected (split_once fails);
+    `/ap/<key>/` is a well formed key with no route, authenticated first and
+    then route_unknown."""
+    rest = path[len("/ap/"):]
+    if "/" not in rest:
+        raise KeyError("caller_rejected")
+    key, _after = rest.split("/", 1)
+    if not KEY_RE.match(key):
+        raise KeyError("caller_rejected")
+    return key, path[len("/ap/") + len(key):]
 
 
 def granted(route: str, method: str, path: str) -> bool:
@@ -136,8 +162,10 @@ class Handler(BaseHTTPRequestHandler):
         if header_keys and path_form:
             return refuse(self, "caller_key_ambiguous")
         if path_form:
-            _empty, _ap, key, *_ = (path.split("/", 3) + ["", ""])[:4]
-            path = path[len("/ap/") + len(key):]
+            try:
+                key, path = parse_ap_path(path)
+            except KeyError as code:
+                return refuse(self, code.args[0])
         elif len(header_keys) == 1:
             key = header_keys[0]
         else:
@@ -145,11 +173,13 @@ class Handler(BaseHTTPRequestHandler):
         if not KEY_RE.match(key) or hashlib.sha256(key.encode()).hexdigest() != CALLER_SHA256:
             return refuse(self, "caller_rejected")
 
-        # 2. Route name in the path.
-        segments = path.split("/", 2)  # ["", route, rest]
-        route = segments[1] if len(segments) > 1 else ""
-        rel = "/" + segments[2] if len(segments) > 2 else "/"
-        if route not in ROUTES:
+        # 2. Route name in the path (canon::parse_route_path: [a-z0-9-]{1,32}).
+        rest = path[1:] if path.startswith("/") else None
+        if rest is None:
+            return refuse(self, "route_unknown")
+        route, _, tail = rest.partition("/")
+        rel = "/" + tail if "/" in rest else "/"
+        if not ROUTE_NAME_RE.match(route) or route not in ROUTES:
             return refuse(self, "route_unknown")
 
         # 3. One Authorization header at most.
@@ -168,14 +198,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        forwarded_names = [k for k in self.headers.keys() if not k.lower().startswith("x-ap-")]
+        # What the caller SENT (raw request), apart from what the gate forwards.
+        raw_target = self.path
+        sent_key_headers = [k for k, v in self.headers.items() if CALLER_KEY in v]
+        forwarded = [(k, v) for k, v in self.headers.items() if not k.lower().startswith("x-ap-")]
         if rel == "/api/v10/users/@me":
             return upstream_json(self, 200, {
                 "upstream_saw_authorization": authorization[0] if authorization else None,
                 # The gate removes the caller-key header and every x-ap-* header.
+                # Computed from the forwarded values, so a key smuggled into any
+                # other header is visible here.
                 "upstream_saw_caller_key_header": any(
-                    k.lower().startswith("x-ap-") for k in forwarded_names),
-                "upstream_saw_key_in_path": "apk_" in rel,
+                    k.lower() == KEY_HEADER or CALLER_KEY in v for k, v in forwarded),
+                "upstream_saw_key_in_path": "apk_" in self.path.replace(
+                    "/ap/" + CALLER_KEY, "", 1) if path_form else "apk_" in self.path,
+                # Raw request, before the mock's own stripping.
+                "caller_sent_key_header_names": [k.lower() for k in sent_key_headers],
+                "caller_sent_key_in_query": CALLER_KEY in (split[1] if len(split) > 1 else ""),
+                "caller_sent_key_in_target_after_prefix": CALLER_KEY in (
+                    raw_target.replace("/ap/" + CALLER_KEY, "", 1) if path_form else raw_target),
             })
         match = re.match(r"^/api/v10/channels/(\d+)/messages$", rel)
         if match and not authorization:

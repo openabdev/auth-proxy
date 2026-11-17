@@ -43,10 +43,33 @@ Environment:
   AP_AUTHORIZATION  optional Authorization value to send (normally injected
                     by the Muse platform, not by this script)
 
-Exit codes: 0 success, 2 transport error, upstream error or malformed gate
-answer, 3 refused by the gate (denied or rejected), 4 gate decision
-"expired", 5 gate unavailable (503, retry later), 64 usage/config error.
-Code 4 is part of the design but stage 2 (in review); main never sends it.
+Exit codes: 0 success, 2 transport error (cannot connect, TLS failure,
+timeout, the gate closed the connection without answering, a malformed or
+truncated HTTP answer), upstream error, malformed gate answer or a response
+over the size cap, 3 refused by the gate (denied or rejected), 4 gate decision
+"expired", 5 gate unavailable (503, retry later), 64 usage/config error
+(including a malformed AP_BASE), 70 unexpected internal error.
+Code 4 is part of the design but stage 2 (in review). Main sends "expired"
+only from its stage 1 measurement probe, which this caller cannot reach; no
+production path sends it.
+
+A closed connection with no answer (exit 2) is NOT a gate refusal. In main it
+is the abort signal for an upstream failure after the request was sent, so the
+write may have reached Discord. Do not treat it as "nothing was sent".
+
+Key safety: the caller key travels in the request path in the default form, so
+every error message here is fixed text. No message, exception string or
+traceback ever contains a URL, the /ap/<key> prefix or the key. AP_BASE is
+validated before any URL holding the key is built, and every exception raised
+while building or sending the request is mapped to a fixed message.
+
+Bounds: a response body is capped at MAX_RESPONSE_BYTES (8 MiB). A declared
+Content-Length over the cap is rejected before reading, and reads stop at
+cap + 1 bytes on both the success and the HTTP error path (exit 2). A body
+shorter than its declared Content-Length is a transport error (exit 2). An
+upstream error body is echoed to stderr truncated to MAX_SHOWN_CHARS. The whole
+exchange has a wall-clock budget of TOTAL_TIMEOUT_SECS (60 s), checked
+between reads, on top of the 30 s per-socket-operation timeout.
 
 Transport hardening: all requests go through an explicit opener with no
 redirect following and no ambient proxy. The gate forwards without following
@@ -56,11 +79,16 @@ honouring http_proxy/https_proxy would route it through a third party. A 3xx
 is returned as a status and treated by main as an error (exit 2).
 """
 
+import http.client
 import json
 import os
 import re
+import socket
+import ssl
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 KEY_RE = re.compile(r"^apk_[0-9a-f]{64}$")
@@ -68,6 +96,12 @@ SNOWFLAKE_RE = re.compile(r"^\d+$")
 ROUTE_RE = re.compile(r"^[a-z0-9-]+$")
 HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]+$")
 DECISIONS = {"denied", "rejected", "unavailable", "expired"}
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+SOCKET_TIMEOUT_SECS = 30
+MAX_SHOWN_CHARS = 2048  # of an upstream error body echoed to stderr
+TOTAL_TIMEOUT_SECS = 60
+# scheme://host[:port] only: a bracketed IPv6 literal, or a DNS name / IPv4.
+BASE_RE = re.compile(r"^(https?)://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?/?$")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -81,6 +115,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # Explicit opener: ProxyHandler({}) disables ambient http_proxy/https_proxy,
 # and _NoRedirect disables redirect following (see module docstring).
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+class _TooLarge(Exception):
+    """A response body went over MAX_RESPONSE_BYTES."""
+
+
+class _Deadline(Exception):
+    """The wall-clock budget for one exchange ran out."""
 
 
 def die(message: str, code: int = 64) -> "SystemExit":
@@ -113,6 +155,30 @@ def _validate_user_path(path: str) -> str:
     return path
 
 
+def _validate_base(raw: str) -> str:
+    """Return a normalised scheme://host[:port] or exit 64 with a fixed message.
+
+    Runs before any URL holding the caller key exists. The raw value is never
+    echoed: a bad AP_BASE is exactly the input most likely to be mistyped."""
+    bad = "AP_BASE must be http:// or https:// followed by a host and an optional port only (no path, query, fragment, userinfo, whitespace or control characters)"
+    if not raw.isascii() or _has_control(raw) or " " in raw or "\\" in raw:
+        die(bad)
+    m = BASE_RE.match(raw)
+    if not m:
+        die(bad)
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        port = parts.port
+        host = parts.hostname
+    except ValueError:
+        die(bad)
+    if not host or parts.query or parts.fragment or "?" in raw or "#" in raw or "@" in raw:
+        die(bad)
+    if port is not None and not 0 < port < 65536:
+        die(bad)
+    return f"{m.group(1)}://{m.group(2)}{m.group(3) or ''}"
+
+
 def gate_decision(text: str) -> tuple[str, str] | None:
     """Return (ap_decision, code) when `text` is exactly a gate refusal body.
 
@@ -120,7 +186,7 @@ def gate_decision(text: str) -> tuple[str, str] | None:
     Discord error object, is not a gate decision."""
     try:
         body = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(body, dict) or set(body) != {"ap_decision", "code"}:
         return None
@@ -132,7 +198,7 @@ def gate_decision(text: str) -> tuple[str, str] | None:
 
 class Caller:
     def __init__(self) -> None:
-        self.base = os.environ.get("AP_BASE", "http://127.0.0.1:8443").rstrip("/")
+        self.base = _validate_base(os.environ.get("AP_BASE", "http://127.0.0.1:8443"))
         self.caller_key = os.environ.get("AP_CALLER_KEY", "")
         self.placement = os.environ.get("AP_KEY_PLACEMENT", "path")
         self.key_header = os.environ.get("AP_KEY_HEADER", "X-AP-Caller-Key")
@@ -155,29 +221,91 @@ class Caller:
         return f"{self.base}/{self.route}{path}"
 
     def _send(self, method: str, url: str, body: dict | None) -> tuple[int, str]:
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method)
-        if self.placement == "header":
-            req.add_header(self.key_header, self.caller_key)
-        if self.authorization:
-            req.add_header("Authorization", self.authorization)
-        if data is not None:
-            req.add_header("Content-Type", "application/json")
+        failure = self._exchange(method, url, body)
+        if isinstance(failure, str):
+            die(failure, 2)
+        return failure
+
+    def _exchange(self, method: str, url: str, body: dict | None) -> "tuple[int, str] | str":
+        """Return (status, text) or a fixed failure message. Never raises and
+        never formats the URL, the exception text or the exception chain."""
+        deadline = time.monotonic() + TOTAL_TIMEOUT_SECS
         try:
-            with _OPENER.open(req, timeout=30) as resp:
-                return resp.status, resp.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as err:
-            return err.code, err.read().decode("utf-8", "replace")
-        except urllib.error.URLError as err:
-            die(f"cannot reach the gate at {self.base}: {err.reason}", 2)
-        except TimeoutError:
-            # A read timeout is not a URLError; exit 2 instead of a traceback.
-            die(f"timed out talking to the gate at {self.base}", 2)
+            data = json.dumps(body).encode() if body is not None else None
+            req = urllib.request.Request(url, data=data, method=method)
+            if self.placement == "header":
+                req.add_header(self.key_header, self.caller_key)
+            if self.authorization:
+                req.add_header("Authorization", self.authorization)
+            if data is not None:
+                req.add_header("Content-Type", "application/json")
+            try:
+                with _OPENER.open(req, timeout=SOCKET_TIMEOUT_SECS) as resp:
+                    return resp.status, _read_bounded(resp, deadline)
+            except urllib.error.HTTPError as err:
+                try:
+                    return err.code, _read_bounded(err, deadline)
+                finally:
+                    err.close()
+        except BaseException as exc:  # noqa: BLE001 - mapped to fixed text below
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            return _failure_message(exc)
 
     def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, str]:
         """One call through the gate. Returns (status, body text)."""
         _validate_internal_path(path)
         return self._send(method, self._url(path), body)
+
+
+def _read_bounded(resp, deadline: float) -> str:
+    declared = resp.headers.get("Content-Length")
+    if declared is not None and declared.strip().isdigit() and int(declared) > MAX_RESPONSE_BYTES:
+        raise _TooLarge
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        if time.monotonic() > deadline:
+            raise _Deadline
+        chunk = resp.read(min(65536, MAX_RESPONSE_BYTES + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > MAX_RESPONSE_BYTES:
+            raise _TooLarge
+    if declared is not None and declared.strip().isdigit() and total != int(declared):
+        # urllib returns a short body silently; a truncated answer is not an answer.
+        raise http.client.IncompleteRead(b"", int(declared) - total)
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+def _failure_message(exc: BaseException) -> str:
+    """Map any request-construction or transport exception to fixed text.
+
+    The exception text is never used: http.client.InvalidURL and friends embed
+    the full request target, which in path form holds the caller key."""
+    if isinstance(exc, _TooLarge):
+        return f"the gate's answer is larger than the {MAX_RESPONSE_BYTES}-byte cap; discarded"
+    if isinstance(exc, (_Deadline, TimeoutError, socket.timeout)):
+        return "timed out talking to the gate"
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else None
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "timed out talking to the gate"
+    if isinstance(exc, ssl.SSLError) or isinstance(reason, ssl.SSLError):
+        return "TLS failure talking to the gate"
+    if isinstance(exc, (http.client.RemoteDisconnected, ConnectionError)) or isinstance(reason, ConnectionError):
+        if isinstance(exc, ConnectionRefusedError) or isinstance(reason, ConnectionRefusedError):
+            return "cannot reach the gate (connection refused)"
+        return ("the gate closed the connection without a complete answer; this is not a refusal, "
+                "and the request may already have reached Discord")
+    if isinstance(exc, http.client.HTTPException):
+        return "malformed or truncated HTTP answer from the gate"
+    if isinstance(exc, urllib.error.URLError) or isinstance(exc, OSError):
+        return "cannot reach the gate"
+    if isinstance(exc, ValueError):
+        return "the request could not be built (invalid URL or header value)"
+    return "unexpected error while talking to the gate"
 
 
 def report_refusal(status: int, decision: str, code: str) -> int:
@@ -238,9 +366,28 @@ def main(argv: list[str]) -> int:
     if 200 <= status < 300:
         print(text)
         return 0
-    print(f"caller: upstream or transport answered {status}: {text}", file=sys.stderr)
+    shown = text if len(text) <= MAX_SHOWN_CHARS else text[:MAX_SHOWN_CHARS] + "...(truncated)"
+    print(f"caller: upstream or transport answered {status}: {shown}", file=sys.stderr)
     return 2
 
 
+def run(argv: list[str]) -> int:
+    """main() behind a top-level guard: an unexpected exception prints fixed
+    text and exits 70, never a traceback (a traceback can carry the key)."""
+    try:
+        return main(argv)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("caller: interrupted", file=sys.stderr)
+        return 130
+    except BaseException:  # noqa: BLE001
+        try:
+            print("caller: unexpected internal error (details withheld)", file=sys.stderr)
+        except BaseException:  # noqa: BLE001
+            pass
+        return 70
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(run(sys.argv))

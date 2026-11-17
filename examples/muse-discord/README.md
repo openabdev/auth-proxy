@@ -57,19 +57,31 @@ flowchart LR
   |---|---|---|---|
   | no grant (writes included) | 423 | `denied` | `no_grant` |
   | unknown route | 423 | `denied` | `route_unknown` |
-  | missing, duplicate, malformed or unknown key | 401 | `rejected` | `caller_rejected` |
+  | missing, duplicate, malformed or unknown key, or `/ap/<key>` with no `/` after the key | 401 | `rejected` | `caller_rejected` |
+  | valid key with no route (`/ap/<key>/`) | 423 | `denied` | `route_unknown` |
   | key in both header and path | 400 | `denied` | `caller_key_ambiguous` |
   | more than one `Authorization` | 400 | `denied` | `authorization_duplicate` |
+  | `CONNECT` | 405 | `denied` | `connect_refused` |
+  | WebSocket upgrade | 501 | `denied` | `websocket_unsupported` |
+  | body over the limit | 413 | `denied` | `body_too_large` |
   | other canonicalization or framing refusal | 400 | `denied` | Phase 1 code |
-  | gate cannot decide, or upstream connect failed | 503 | `unavailable` | e.g. `connect_failed` |
+  | gate cannot decide, request body read timed out, or upstream connect failed | 503 | `unavailable` | e.g. `policy_unavailable`, `body_read_timeout`, `connect_failed` |
+
+  The complete list is `ap_core::outcome::passthrough_outcome`. `caller.py`
+  maps every `denied`/`rejected` to exit 3 and every `unavailable` to exit 5.
+
+  A failure after the request was sent upstream is not a refusal: the gate
+  closes the connection and sends no answer. `caller.py` reports that as a
+  transport error (exit 2) and says the write may have reached Discord.
 
 ## Stage 2: in review, not on main
 
 The design also has held writes (`decision = "hold"`, a human approves, then
 the held request is forwarded; 410 `expired` if nobody decides). None of that
 is merged. `caller.py` already maps an `expired` decision to exit 4 so the
-helper does not need to change shape, but main never sends it, and the mock
-does not model hold or approval. Do not rely on either until stage 2 lands.
+helper does not need to change shape, but main sends `expired` only from its
+stage 1 measurement probe (which this caller cannot reach), never from a
+production path, and the mock does not model hold or approval. Do not rely on either until stage 2 lands.
 
 ## Credential scheme (issue #12)
 
@@ -84,12 +96,32 @@ does not change this example.
 
 | File | What it is |
 |---|---|
-| `caller.py` | Reference caller (Python 3.11+, stdlib only): path or header key, own `Authorization`, decision read from the body, no redirects, no ambient proxy. |
+| `caller.py` | Reference caller (Python 3.11+, stdlib only): path or header key, own `Authorization`, decision read from the body, no redirects, no ambient proxy, validated `AP_BASE`, bounded responses, fixed key-free error messages. |
 | `mock_proxy.py` | **Mock of the stage 1 gate, not the real proxy.** Models key placement, route, duplicate `Authorization`, grant (read from the pilot policy) and the refusal shape, with a fabricated upstream. It omits canonicalization, the `Host` check, framing checks, body limits, audit, TLS and real forwarding, and has no hold or approval flow. |
 | `test_caller.py` | Tests of the caller against the mock only. |
 | `test_policy.py` | Checks the pilot policy against a Python mirror of ap-core's `valid_prefix_path` and `Policy::evaluate`, and pins what it does and does not authorize. |
 
 There is no config file in this directory: the policy is the pilot example under `deploy/muse/`.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success (2xx) |
+| 2 | transport error (cannot connect, TLS, timeout, connection closed without a complete answer, malformed HTTP), upstream error, malformed gate answer, or response over the cap |
+| 3 | refused by the gate (`denied` or `rejected`) |
+| 4 | decision `expired` (stage 2, in review) |
+| 5 | gate `unavailable` (503, retry later) |
+| 64 | usage or configuration error, including a malformed `AP_BASE` |
+| 70 | unexpected internal error (fixed message, no traceback) |
+
+`AP_BASE` must be `http://` or `https://` plus a host and an optional port:
+no path, query, fragment, userinfo, whitespace or control characters. It is
+validated before any URL holding the caller key is built. Response bodies are
+capped at 8 MiB (a larger declared `Content-Length` is rejected before reading;
+reads stop at cap + 1 bytes) and one exchange has a 60 s wall-clock budget.
+Every error message is fixed text: none contains a URL, the `/ap/<key>` prefix
+or the key, and none is followed by a traceback.
 
 ## Generating a key
 
@@ -117,14 +149,15 @@ platform: Muse's egress holds the real token and can call Discord directly.
 python3 test_caller.py        # caller vs the mock: path and header key, Authorization unchanged,
                               # 423 no_grant for writes, 401, route_unknown, ambiguous key,
                               # duplicate Authorization, upstream 401 is not a gate refusal,
-                              # redirect not followed
+                              # redirect not followed, malformed AP_BASE, aborted connections,
+                              # oversized bodies, and no key in any output on any exit path
 python3 test_policy.py        # pilot policy vs ap-core matching rules (mirror; no network)
                               # Both are manual: nothing runs them in CI, and green here
                               # does not verify the real gate.
 python3 mock_proxy.py &       # or run the mock yourself; it prints MOCK_PORT and a fresh MOCK_CALLER_KEY
-AP_BASE=http://127.0.0.1:<port> \
-AP_CALLER_KEY=<apk_... printed by the mock> \
-AP_AUTHORIZATION="Bot placeholder" \
+export AP_BASE=http://127.0.0.1:<port>
+export AP_CALLER_KEY=<apk_... printed by the mock>
+export AP_AUTHORIZATION="Bot placeholder"
 python3 caller.py get-messages 2222222222222222222 5
 python3 caller.py send 2222222222222222222 hi        # exit 3: 423 denied/no_grant
 ```
@@ -147,3 +180,7 @@ reusable key material is committed here.
   and ambient `http_proxy`/`https_proxy` ignored, so an upstream 3xx is an
   error (exit 2) instead of resending the header to the `Location` host.
   `test_caller.py` pins this with a 302 to a counting external server.
+- The key never reaches stdout or stderr. `test_caller.py` runs every failure
+  mode (malformed bases, refusals, aborted connections, oversized bodies,
+  forced exceptions) with a sentinel key and asserts neither the key nor
+  `/ap/` appears in either stream.

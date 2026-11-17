@@ -68,7 +68,7 @@ pub fn audit_digest(req: &HeldRequest) -> String {
 }
 
 /// Random lowercase hex of `n` bytes, from the operating system.
-pub(super) fn random_hex(n: usize) -> String {
+pub fn random_hex(n: usize) -> String {
     let mut buf = vec![0u8; n];
     getrandom::getrandom(&mut buf).expect("operating system random source failed");
     hex(&buf)

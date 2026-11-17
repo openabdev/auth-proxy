@@ -702,3 +702,16 @@ async fn no_secret_or_fingerprint_in_any_debug_output() {
     }
     assert!(shown.contains("Fingerprint(..)"));
 }
+
+#[tokio::test(start_paused = true)]
+async fn list_returns_pending_entries_in_admission_order_and_no_decided_ones() {
+    let t = table(8, 8, 0);
+    let a = held(&t, "x", req("Bot a", "1"));
+    let b = held(&t, "x", req("Bot b", "2"));
+    let c = held(&t, "y", req("Bot c", "3"));
+    let ids = |t: &Table| t.list().into_iter().map(|v| v.id).collect::<Vec<_>>();
+    assert_eq!(ids(&t), vec![a.id.clone(), b.id.clone(), c.id.clone()]);
+    assert!(t.list().iter().all(|v| v.content.is_some()));
+    assert_eq!(t.deny(&b.id, "alice"), DenyResult::Denied);
+    assert_eq!(ids(&t), vec![a.id, c.id]);
+}

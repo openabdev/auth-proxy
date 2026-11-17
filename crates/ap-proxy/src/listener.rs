@@ -9,6 +9,7 @@ use std::path::Path;
 
 use tokio::net::{TcpListener, UnixListener};
 
+pub mod approval;
 pub mod public;
 
 #[cfg(test)]

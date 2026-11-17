@@ -190,6 +190,8 @@ impl DenyResult {
 
 /// A `Pending` entry.
 pub(super) struct Entry {
+    /// Admission order, for listing.
+    pub seq: u64,
     pub identity: String,
     pub fingerprint: Fingerprint,
     pub digest: String,

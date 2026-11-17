@@ -4,6 +4,7 @@
 //! two Unix sockets, and serves until one of them stops. Startup failures return exit code 2.
 
 pub mod admin_http;
+pub mod approval;
 pub mod audit_sink;
 pub mod evidence;
 pub mod forward;
@@ -245,6 +246,19 @@ async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
             return 2;
         }
     };
+    // The approval listener is a second socket (design 3.6). Without an `[approval]` block there
+    // is none, and holds simply expire.
+    let approval_listener = match &cfg.approval {
+        Some(a) => match listener::bind_loopback(a.listen).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("auth-proxy: cannot bind the approval listener: {e}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+    let approval_cfg = cfg.approval.clone();
     // A panic line carries the source location only, never the payload, which could hold a
     // header value.
     std::panic::set_hook(Box::new(|info| match info.location() {
@@ -262,8 +276,23 @@ async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
         max_connections: pt.max_connections,
         header_read: std::time::Duration::from_secs(pt.header_read_secs),
     };
+    let approval = async {
+        match (approval_listener, approval_cfg) {
+            (Some(l), Some(cfg)) => {
+                let state = approval::ApprovalApp::new(Arc::clone(&app.hold), &cfg);
+                listener::approval::serve_approval(l, state, Default::default()).await;
+            }
+            _ => std::future::pending::<()>().await,
+        }
+    };
     eprintln!("auth-proxy: listening");
-    listener::public::serve_public(listener, app, limits).await;
-    eprintln!("auth-proxy: public listener stopped");
+    tokio::select! {
+        () = listener::public::serve_public(listener, Arc::clone(&app), limits) => {
+            eprintln!("auth-proxy: public listener stopped");
+        }
+        () = approval => {
+            eprintln!("auth-proxy: approval listener stopped");
+        }
+    }
     1
 }

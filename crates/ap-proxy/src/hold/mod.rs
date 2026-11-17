@@ -90,6 +90,8 @@ struct Inner {
     cooldown: HashMap<String, Instant>,
     /// Set by `drain_pending`: no new entry is admitted.
     closed: bool,
+    /// Next admission sequence number.
+    next_seq: u64,
 }
 
 impl Inner {
@@ -141,6 +143,7 @@ impl Table {
                 done_order: VecDeque::new(),
                 cooldown: HashMap::new(),
                 closed: false,
+                next_seq: 0,
             }),
         }
     }
@@ -235,9 +238,12 @@ impl Table {
             }
         }
         let (tx, rx) = oneshot::channel();
+        let seq = g.next_seq;
+        g.next_seq += 1;
         g.pending.insert(
             id.clone(),
             Entry {
+                seq,
                 identity: identity.to_string(),
                 fingerprint,
                 digest: digest.clone(),
@@ -387,6 +393,19 @@ impl Table {
     pub fn drain_pending(&self) -> usize {
         self.lock().closed = true;
         self.drop_where(|_| true, || Decision::Shutdown)
+    }
+
+    /// The `Pending` entries in admission order, as the approval API may show them.
+    pub fn list(&self) -> Vec<View> {
+        let mut ids: Vec<(u64, String)> = {
+            let g = self.lock();
+            g.pending
+                .iter()
+                .map(|(id, e)| (e.seq, id.clone()))
+                .collect()
+        };
+        ids.sort();
+        ids.iter().filter_map(|(_, id)| self.view(id)).collect()
     }
 
     /// What the approval API may show about `id`. Credential header values are left out, and

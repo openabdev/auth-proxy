@@ -5,5 +5,6 @@ pub mod canon;
 pub mod config;
 pub mod error;
 pub mod headers;
+pub mod outcome;
 pub mod policy;
 pub mod session_wire;

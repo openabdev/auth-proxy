@@ -27,7 +27,7 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (  # noqa: E402
     AUTH, DEFAULT_GRANTS, EGRESS_NAME, MAX_BODY, PORT_AUTHORITY, PORT_EGRESS, PORT_LEASE, PORT_MAIN, PORT_PROBE,
-    PORT_RESTART, UPSTREAM_PORTS, Env, check_hello_vector, read_response, sha256_hex, tls_get,
+    PORT_NETFILTER, PORT_RESTART, UPSTREAM_PORTS, Env, UnixHTTP, check_hello_vector, read_response, sha256_hex, tls_get,
 )
 
 CASES = []  # (id, row, name, instance, fn)
@@ -39,7 +39,14 @@ GATE_IDS = [
 ]
 P1_IDS = ["P1-01", "P1-02", "P1-03", "P1-04", "P1-05", "P1-06", "P1-07", "P1-08", "P1-09", "P1-10",
           "P1-11", "P1-12", "P1-13"]
-EXPECTED = GATE_IDS + P1_IDS
+# Canonicalization rows (issue #19): one per class of input, wire level, nothing reaches upstream
+# unless the forwarded path is byte-identical to the path the policy matched.
+CANON_IDS = ["C1-1", "C1-2", "C1-3", "C1-4", "C1-5", "C1-6", "C1-7"]
+# Netfilter self-check rows (issue #20): the proxy reads two checker status files and refuses to
+# serve unless both are healthy and ticking. The checkers are faked here by a thread that writes the
+# same one-line files; the cluster test uses the real ones.
+NF_IDS = ["NF-01", "NF-02", "NF-03", "NF-04", "NF-05", "NF-06", "NF-07", "NF-08", "NF-09", "NF-10", "NF-11"]
+EXPECTED = GATE_IDS + P1_IDS + CANON_IDS + NF_IDS
 
 
 def case(cid, row, name, instance="main"):
@@ -754,6 +761,498 @@ def _(e):
     return st1 == 413 and st2 == 400, f"oversize_put={st1} invalid_session={st2}"
 
 
+# ================================================================ C1 canonicalization classes (issue #19)
+def audit_count(e):
+    return sum(1 for _ in open(e.audit_file, "rb")) if os.path.exists(e.audit_file) else 0
+
+
+def audit_paths_since(e, before):
+    with open(e.audit_file, "rb") as f:
+        new = f.read().splitlines()[before:]
+    return [json.loads(line).get("path") for line in new if line.strip()]
+
+
+def canon_probe(e, line, headers, raw=None):
+    """Send one request, return (status, code, upstream log, audit paths written by it)."""
+    e.ureset()
+    before = audit_count(e)
+    if raw is not None:
+        st, _, b = e.raw(raw)
+    else:
+        st, _, b = e.raw_req(line, headers)
+    return st, code_of(b), e.ulog(), audit_paths_since(e, before)
+
+
+def canon_refused(e, label, line, headers, codes=None, raw=None, statuses=range(400, 500)):
+    """Refused: a 4xx (a parse error from the HTTP layer counts), nothing at any upstream."""
+    st, code, lg, _ = canon_probe(e, line, headers, raw)
+    ok = st in statuses and not lg and (codes is None or code in codes)
+    return ok, f"[{label}: {st}/{code}/{len(lg)}]"
+
+
+def canon_forwarded_identical(e, label, line, headers, want_path):
+    """Forwarded: the upstream saw exactly `want_path`, and the audit line (what the policy
+    matched) carries the same bytes."""
+    st, _, lg, seen = canon_probe(e, line, headers)
+    got = lg[0]["path"].split("?")[0] if lg else None
+    audit_ok = bool(seen) and seen[-1] == want_path
+    ok = st == 200 and len(lg) == 1 and got == want_path and audit_ok
+    return ok, f"[{label[:30]}: {st} upstream={(got or '')[:40]!r} audit_same={audit_ok}]"
+
+
+def canon_framing(e, label, line, headers):
+    """Framing conflicts that the HTTP layer may settle itself: either refused, or forwarded with
+    one framing header only (it parsed once and decided), never both Content-Length and TE."""
+    st, _, lg, _ = canon_probe(e, line, headers)
+    if not lg:
+        return 400 <= st < 500, f"[{label}: refused {st}]"
+    names = [k for k, _ in lg[0]["headers"]]
+    ok = st == 200 and len(lg) == 1 and names.count("content-length") <= 1 and not (
+        "content-length" in names and "transfer-encoding" in names)
+    return ok, f"[{label}: forwarded {st} cl={names.count('content-length')} te={names.count('transfer-encoding')}]"
+
+
+def canon_run(checks):
+    ok_all, out = True, []
+    for ok, d in checks:
+        ok_all = ok_all and ok
+        out.append(d)
+    return ok_all, " ".join(out)
+
+
+@case("C1-1", "C1", "double-encoded, encoded slash and backslash, NUL: refused as path_ambiguous")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    au = [("Host", e.authority()), ("Authorization", f"Bearer {s}")]
+    paths = ["/v1/%252f", "/v1/%252F", "/v1/%252e%252e/x", "/v1/%255c", "/v1/%2500", "/v1/%25%32%66",
+             "/v1%2fecho", "/v1/%2Fecho", "/v1/a%5cb", "/v1/a%5Cb", "/v1/a%00b", "/v1/a\\b",
+             "/v1/%25%32%46admin", "/v1/%25%32%45%25%32%45/admin", "/v1/%25%35%43admin", "/v1/%2%45",
+             "/v1/%252525252e%252525252e/admin", "/v1/%0a", "/v1/%25%30%30", "/v1/%c0%ae%c0%ae/x",
+             "/v1/%e0%80%af", "/v1/%u002e", "/v1/%ff"]
+    return canon_run([canon_refused(e, p, f"GET {e.ap('up', p)} HTTP/1.1", au, {"path_ambiguous"})
+                      for p in paths])
+
+
+@case("C1-2", "C1", "`;` path parameters: on dot segments refused, on ordinary segments forwarded byte for byte")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    au = [("Host", e.authority()), ("Authorization", f"Bearer {s}")]
+    checks = [canon_refused(e, p, f"GET {e.ap('up', p)} HTTP/1.1", au, {"path_ambiguous"})
+              for p in ["/v1/..;/admin", "/v1/..;x/admin", "/v1/.;/x", "/v1/..;a=b/x",
+                        "/v1/..%3b/admin", "/v1/..%3B/admin", "/v1/.%3b/x", "/v1/.%3b./x",
+                        "/v1/..%3b%2f", "/v1/%2e%2e%3b/x", "/v1/..%253b/admin"]]
+    for p in ["/v1/a;b=c", "/v1/a;b/echo", "/v1/;x/echo", "/v1/a%3bb/echo"]:
+        checks.append(canon_forwarded_identical(e, p, f"GET {e.ap('up', p)} HTTP/1.1", au, p))
+    return canon_run(checks)
+
+
+@case("C1-3", "C1", "Unicode and bytes the forwarder would rewrite are refused; percent-encoded UTF-8 is forwarded unchanged")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    au = [("Host", e.authority()), ("Authorization", f"Bearer {s}")]
+    checks = []
+    for label, p in [("e-acute", "/v1/caf\u00e9"), ("fullwidth dot", "/v1/\uff0e\uff0e/x"),
+                     ("combining", "/v1/e\u0301"), ("brace", "/v1/{x}"), ("quote", '/v1/a"b'),
+                     ("angle", "/v1/a<b>"), ("backtick", "/v1/a`b")]:
+        checks.append(canon_refused(e, label, f"GET {e.ap('up', p)} HTTP/1.1", au, None))
+    for p in ["/v1/caf%C3%A9", "/v1/%41", "/v1/100%25"]:
+        checks.append(canon_forwarded_identical(e, p, f"GET {e.ap('up', p)} HTTP/1.1", au, p))
+    return canon_run(checks)
+
+
+@case("C1-4", "C1", "Host spellings: case, trailing dot, IPv6, decimal/octal/hex IP, punycode, Unicode, empty")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    au = [("Authorization", f"Bearer {s}")]
+    line = f"GET {e.ap('up', '/v1/echo')} HTTP/1.1"
+    p = e.port
+    hosts = [("mixed case", f"LOCALHOST:{p}"), ("trailing dot", f"127.0.0.1.:{p}"),
+             ("IPv6 loopback", f"[::1]:{p}"), ("IPv4-mapped IPv6", f"[::ffff:127.0.0.1]:{p}"),
+             ("decimal IP", f"2130706433:{p}"), ("octal IP", f"0177.0.0.1:{p}"),
+             ("hex IP", f"0x7f.0.0.1:{p}"), ("hex tail IP", f"127.0.0.0x1:{p}"),
+             ("short IP", f"127.1:{p}"), ("punycode", f"xn--e1afmkfd.xn--p1ai:{p}"),
+             ("Unicode", f"b\u00fccher.example:{p}"), ("no port", "127.0.0.1"), ("empty", ""),
+             ("authority plus path", f"127.0.0.1:{p}/x"), ("comma list", f"127.0.0.1:{p},evil.test")]
+    return canon_run([canon_refused(e, label, line, [("Host", h)] + au, {"host_rejected"})
+                      for label, h in hosts])
+
+
+@case("C1-5", "C1", "absolute-form request target vs Host: refused whether it matches or not")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    a = e.authority()
+    au = [("Authorization", f"Bearer {s}")]
+    path = e.ap("up", "/v1/echo")
+    checks = []
+    for label, target, host in [
+            ("http matching", f"http://{a}{path}", a), ("https matching", f"https://{a}{path}", a),
+            ("foreign target", f"http://evil.test{path}", a), ("foreign Host", f"http://{a}{path}", "evil.test"),
+            ("target case", f"http://{a.upper()}{path}", a), ("userinfo", f"http://u@{a}{path}", a)]:
+        checks.append(canon_refused(e, label, f"GET {target} HTTP/1.1", [("Host", host)] + au, {"absolute_form"}))
+    checks.append(canon_refused(e, "authority-form //", f"GET //evil.test{path} HTTP/1.1", [("Host", a)] + au, None))
+    return canon_run(checks)
+
+
+@case("C1-6", "C1", "CRLF in values, obsolete folding, NUL and duplicate headers: refused, nothing upstream")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    a = e.authority()
+    req = e.ap("up", "/v1/echo")
+    base = f"GET {req} HTTP/1.1\r\nHost: {a}\r\n".encode()
+    sur = f"Authorization: Bearer {s}\r\n".encode()
+    checks = []
+    for label, extra in [("bare CR in value", b"X-A: a\rb\r\n"), ("NUL in value", b"X-A: a\x00b\r\n"),
+                         ("obs-fold continuation", b"X-A: a\r\n b\r\n"),
+                         ("obs-fold tab", b"X-A: a\r\n\tb\r\n"),
+                         ("space before colon", b"X-A : a\r\n"),
+                         ("fold on Host", b"Host: x\r\n y\r\n")]:
+        checks.append(canon_refused(e, label, None, None, raw=base + sur + extra + b"\r\n", statuses=range(400, 500)))
+    for label, hs in [("two Authorization", [("Authorization", f"Bearer {s}"), ("Authorization", f"Bearer {s}")]),
+                      ("two Host", [("Host", a), ("Host", a)])]:
+        hh = hs if any(k == "Host" for k, _ in hs) else [("Host", a)] + hs
+        checks.append(canon_refused(e, label, f"GET {req} HTTP/1.1", hh, None))
+    au2 = [("Host", a), ("Authorization", f"Bearer {s}")]
+    checks.append(canon_refused(e, "two different Content-Length", f"GET {req} HTTP/1.1",
+                                au2 + [("Content-Length", "0"), ("Content-Length", "5")], None))
+    for label, hs in [("two equal Content-Length", [("Content-Length", "0"), ("Content-Length", "0")]),
+                      ("CL and TE", [("Content-Length", "0"), ("Transfer-Encoding", "chunked")]),
+                      ("TE twice", [("Transfer-Encoding", "chunked"), ("Transfer-Encoding", "chunked")]),
+                      ("TE list", [("Transfer-Encoding", "gzip, chunked")])]:
+        checks.append(canon_framing(e, label, f"GET {req} HTTP/1.1", au2 + hs))
+    # Bare LF ends a header line for the parser, so what follows is a real header and is seen as
+    # one: the proxy parses once and forwards what it parsed, no second reading is possible.
+    e.ureset()
+    st, _, _ = e.raw(base + sur + b"X-A: a\nX-Injected: 1\r\n\r\n")
+    lg = e.ulog()
+    hs = dict(lg[0]["headers"]) if lg else {}
+    ok = (not lg and 400 <= st < 500) or (st == 200 and hs.get("x-a") == "a" and hs.get("x-injected") == "1")
+    checks.append((ok, f"[bare LF: {st}/{len(lg)} seen={sorted(k for k in hs if k.startswith('x-'))}]"))
+    return canon_run(checks)
+
+
+@case("C1-7", "C1", "caller key path form: empty, reserved characters, repeated key and prefix, over-long segment")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    k = e.keys["agent-1"]
+    au = [("Host", e.authority()), ("Authorization", f"Bearer {s}")]
+    checks = []
+    for label, path in [("empty key", "/ap//up/v1/echo"), ("no key", "/ap/up/v1/echo"),
+                        ("key %2f", f"/ap/{k}%2f/up/v1/echo"), ("key ;", f"/ap/{k};x/up/v1/echo"),
+                        ("key ?", f"/ap/{k}?x/up/v1/echo"), ("key upper", f"/ap/{k.upper()}/up/v1/echo"),
+                        ("key short", f"/ap/{k[:-1]}/up/v1/echo"), ("key long", f"/ap/{k}0/up/v1/echo"),
+                        ("prefix case", f"/AP/{k}/up/v1/echo"), ("double prefix", f"/ap/ap/{k}/up/v1/echo")]:
+        checks.append(canon_refused(e, label, f"GET {path} HTTP/1.1", au, {"caller_rejected", "path_ambiguous"}))
+    # A key-shaped string and the prefix appearing again later are plain path data: matched and
+    # forwarded as is. (A fresh random key, so the audit file holds no real credential.)
+    again = f"/v1/echo/ap/apk_{secrets.token_hex(32)}/up/x"
+    checks.append(canon_forwarded_identical(e, "repeated", f"GET {e.ap('up', again)} HTTP/1.1", au, again))
+    long_ok = "/v1/" + "a" * 4000
+    checks.append(canon_forwarded_identical(e, "4000-byte segment", f"GET {e.ap('up', long_ok)} HTTP/1.1", au, long_ok))
+    checks.append(canon_refused(e, "300000-byte segment", f"GET {e.ap('up', '/v1/' + 'a' * 300000)} HTTP/1.1", au,
+                                None, statuses=range(400, 500)))
+    return canon_run(checks)
+
+
+
+# ================================================================ NF netfilter self-check (issue #20)
+NF_INTERVAL = 1  # --netfilter-interval-secs; a silent checker counts as dead after 2 * 1 + 5 = 7 s
+NF_MAX_AGE = 2 * NF_INTERVAL + 5
+
+
+class FakeCheckers:
+    """Stands in for netcheck and netprobe: writes both status files, one line each, with a tick that
+    changes on every write. `rules` and `probe` are the reason codes to report ("ok" or a failure)."""
+
+    def __init__(self, directory):
+        self.rules_path = os.path.join(directory, "rules-status")
+        self.probe_path = os.path.join(directory, "probe-status")
+        self.rules = "ok"
+        self.probe = "ok"
+        self.rules_alive = False
+        self.probe_alive = False
+        self.n = 0
+        self.stop_flag = threading.Event()
+        self.thread = threading.Thread(target=self.loop, daemon=True)
+        self.thread.start()
+
+    def _write(self, path, reason):
+        self.n += 1
+        state = "ok" if reason == "ok" else "fail"
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(f"tick=fake-{self.n} state={state} reason={reason}\n")
+        os.chmod(tmp, 0o644)  # the proxy refuses a status file that group or world can write
+        os.replace(tmp, path)
+
+    def loop(self):
+        while not self.stop_flag.is_set():
+            if self.rules_alive:
+                self._write(self.rules_path, self.rules)
+            if self.probe_alive:
+                self._write(self.probe_path, self.probe)
+            time.sleep(0.2)
+
+    def start(self, rules=True, probe=True):
+        self.rules_alive, self.probe_alive = rules, probe
+
+    def stop(self):
+        self.stop_flag.set()
+        self.thread.join(2)
+
+    def remove(self):
+        for p in (self.rules_path, self.probe_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+
+def nf_ready(e):
+    """(status, body) of GET /admin/v1/ready on the admin socket."""
+    c = UnixHTTP(e.admin_sock)
+    c.request("GET", "/admin/v1/ready")
+    r = c.getresponse()
+    body = r.read()
+    c.close()
+    return r.status, body
+
+
+def nf_request(e, surrogate):
+    """One request through the agent listener. (status, decision header, code, upstream requests)."""
+    e.ureset()
+    st, hdr, body = e.req("GET", e.ap("up", "/v1/echo"), e.bearer(surrogate))
+    try:
+        code = json.loads(body).get("code") or json.loads(body).get("error")
+    except ValueError:
+        code = None
+    return st, hdr.get("x-ap-decision"), code, len(e.ulog())
+
+
+def nf_wait(e, surrogate, want_served, limit):
+    """Poll once a second until the proxy serves (200) or refuses (503), up to `limit` seconds.
+    Returns the seconds it took, or None when the state did not arrive."""
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        st = nf_request(e, surrogate)[0]
+        if (st == 200) == want_served and (st in (200, 503)):
+            return time.time() - t0
+        time.sleep(0.25)
+    return None
+
+
+def nf_audit(e):
+    """The netfilter audit lines written so far, parsed."""
+    out = []
+    with open(e.audit_file, "rb") as f:
+        for line in f.read().splitlines():
+            try:
+                j = json.loads(line)
+            except ValueError:
+                continue
+            if j.get("event") == "netfilter":
+                out.append(j)
+    return out
+
+
+@case("NF-01", "NF", "no checker status files: not ready, terminal 503 with the decision body, nothing upstream", instance="netfilter")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    st, dec, code, n = nf_request(e, s)
+    rst, rbody = nf_ready(e)
+    ok = (st, dec, code, n) == (503, "unavailable", "netfilter_unverified", 0) and rst == 503
+    return ok, f"request={st}/{dec}/{code} upstream={n} ready={rst} {rbody.decode()}"
+
+
+@case("NF-02", "NF", "both checkers healthy: ready, request is served as before", instance="netfilter")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    e.nf.start()
+    took = nf_wait(e, s, True, 6)
+    st, dec, code, n = nf_request(e, s)
+    rst, _ = nf_ready(e)
+    return took is not None and st == 200 and n == 1 and rst == 200, f"opened_after={took} request={st} upstream={n} ready={rst}"
+
+
+@case("NF-03", "NF", "rules checker reports the rules gone: refused within the interval, audit line, no secret", instance="netfilter")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    e.nf.rules = "ok"
+    e.nf.start()
+    nf_wait(e, s, True, 6)
+    before = audit_count(e)
+    e.nf.rules = "rules_changed"
+    took = nf_wait(e, s, False, 6)
+    st, dec, code, n = nf_request(e, s)
+    rst, rbody = nf_ready(e)
+    lines = [json.dumps(j) for j in nf_audit(e)]
+    failed = [j for j in nf_audit(e) if j.get("state") == "failed" and j.get("reason") == "rules:rules_changed"]
+    blob = open(e.audit_file, "rb").read()
+    leak = any(x.encode() in blob for x in list(e.creds.values()) + [s] + list(e.keys.values()))
+    ok = (took is not None and took <= NF_INTERVAL + 2 and (st, dec, code, n) == (503, "unavailable", "netfilter_unverified", 0)
+          and rst == 503 and len(failed) == 1 and not leak)
+    return ok, f"refused_after={took}s request={st}/{code} upstream={n} ready={rst} failed_lines={len(failed)} leak={leak} audit_lines_added={audit_count(e) - before}"
+
+
+@case("NF-04", "NF", "rules restored: the proxy recovers by itself", instance="netfilter")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    e.nf.rules = "rules_changed"
+    e.nf.start()
+    nf_wait(e, s, False, 6)
+    e.nf.rules = "ok"
+    took = nf_wait(e, s, True, 6)
+    st, dec, code, n = nf_request(e, s)
+    rst, _ = nf_ready(e)
+    return took is not None and st == 200 and n == 1 and rst == 200, f"recovered_after={took}s request={st} ready={rst}"
+
+
+@case("NF-05", "NF", "checker dies (its file stops ticking): refused after the stale limit, recovers when it returns", instance="netfilter")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    e.nf.rules = e.nf.probe = "ok"
+    e.nf.start()
+    nf_wait(e, s, True, 6)
+    # The rules checker dies and leaves its last "ok" line behind. The probe keeps running.
+    e.nf.start(rules=False, probe=True)
+    served_early = nf_request(e, s)[0]
+    took = nf_wait(e, s, False, NF_MAX_AGE + 6)
+    rst, rbody = nf_ready(e)
+    reasons = [j.get("reason") for j in nf_audit(e) if j.get("state") == "failed"]
+    e.nf.start(rules=True, probe=True)
+    back = nf_wait(e, s, True, 6)
+    ok = (served_early == 200 and took is not None and took <= NF_MAX_AGE + 2 and rst == 503
+          and "rules:stale" in reasons and back is not None)
+    return ok, f"served_just_after_death={served_early} refused_after={took}s (limit {NF_MAX_AGE}s) ready={rst} reasons={reasons[-1:]} recovered_after={back}s"
+
+
+@case("NF-06", "NF", "only one checker healthy (probe up, rules checker absent): refused", instance="netfilter")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    e.nf.remove()
+    e.nf.start(rules=False, probe=True)
+    time.sleep(1.5)
+    r1 = nf_request(e, s)
+    e.nf.remove()
+    e.nf.start(rules=True, probe=False)
+    time.sleep(1.5)
+    r2 = nf_request(e, s)
+    ok = r1[0] == 503 and r2[0] == 503 and r1[3] == 0 and r2[3] == 0
+    return ok, f"probe_only={r1[:3]} rules_only={r2[:3]}"
+
+
+@case("NF-07", "NF", "functional probe reports direct egress or DNS open: refused", instance="netfilter")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    res = []
+    e.nf.rules = "ok"
+    for reason in ("egress_open", "dns_open", "loopback_open", "egress_unexpected"):
+        e.nf.probe = "ok"
+        e.nf.start()
+        healthy = nf_wait(e, s, True, 6)
+        e.nf.probe = reason
+        took = nf_wait(e, s, False, 6)
+        res.append((reason, healthy is not None, took is not None, nf_request(e, s)[3]))
+    e.nf.probe = "ok"
+    ok = all(h and t and n == 0 for _, h, t, n in res)
+    return ok, f"(reason, was_healthy, refused, upstream) {res}"
+
+
+@case("NF-08", "NF", "status file deleted, garbage, or with an extra field: refused", instance="netfilter")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    e.nf.rules = e.nf.probe = "ok"
+    out = {}
+    for label, apply in (("no_tick", lambda: open(e.nf.rules_path, "w").write("state=ok\n")),
+                         ("deleted", lambda: os.remove(e.nf.rules_path)),
+                         ("extra_field", lambda: open(e.nf.rules_path, "w").write("tick=x state=ok reason=ok z=1\n")),
+                         ("empty", lambda: open(e.nf.rules_path, "w").write(""))):
+        e.nf.start(rules=True, probe=True)
+        healthy = nf_wait(e, s, True, 6)
+        e.nf.start(rules=False, probe=True)  # the rules checker stops writing, then the file is spoiled
+        time.sleep(0.4)
+        apply()
+        out[label] = (healthy is not None, nf_wait(e, s, False, 4) is not None)
+    e.nf.start(rules=True, probe=True)
+    return all(h and r for h, r in out.values()), f"(was_healthy, refused) {out}"
+
+
+@case("NF-09", "NF", "while closed the session plane and the admin socket stay up (revoke-all still works)", instance="netfilter")
+def _(e):
+    e.nf.rules = "rules_changed"
+    e.nf.start()
+    time.sleep(1.5)
+    st, ch = e.sp("GET", "/v1/hello/challenge")
+    c = UnixHTTP(e.admin_sock)
+    c.request("POST", "/admin/v1/revoke-all")
+    r = c.getresponse()
+    r.read()
+    c.close()
+    e.nf.rules = "ok"
+    return st == 200 and r.status == 200, f"challenge={st} revoke_all={r.status}"
+
+
+@case("NF-11", "NF", "non-regular status file (FIFO, symlink, directory, group-writable, oversized): refused, and the admin socket never stalls", instance="netfilter")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    other = os.path.join(os.path.dirname(e.nf.rules_path), "elsewhere")
+
+    def fifo():
+        os.mkfifo(e.nf.rules_path)
+
+    def symlink():
+        with open(other, "w") as f:
+            f.write("tick=x state=ok reason=ok\n")
+        os.chmod(other, 0o644)
+        os.symlink(other, e.nf.rules_path)
+
+    def directory():
+        os.mkdir(e.nf.rules_path)
+
+    def group_writable():
+        with open(e.nf.rules_path, "w") as f:
+            f.write("tick=gw state=ok reason=ok\n")
+        os.chmod(e.nf.rules_path, 0o664)
+
+    def oversized():
+        with open(e.nf.rules_path, "w") as f:
+            f.write("tick=big state=ok reason=ok\n" + "x" * 4096)
+        os.chmod(e.nf.rules_path, 0o644)
+
+    def clear(path):
+        if os.path.isdir(path) and not os.path.islink(path):
+            os.rmdir(path)
+        elif os.path.lexists(path):
+            os.remove(path)
+
+    out = {}
+    worst_admin = 0.0
+    for label, make in (("fifo", fifo), ("symlink", symlink), ("directory", directory),
+                        ("group_writable", group_writable), ("oversized", oversized)):
+        e.nf.start(rules=True, probe=True)
+        healthy = nf_wait(e, s, True, 6)
+        e.nf.start(rules=False, probe=True)  # the rules checker stops writing, then its path is spoiled
+        time.sleep(0.4)
+        clear(e.nf.rules_path)
+        make()
+        refused = nf_wait(e, s, False, 4) is not None
+        t0 = time.time()
+        rst, _ = nf_ready(e)
+        worst_admin = max(worst_admin, time.time() - t0)
+        out[label] = (healthy is not None, refused, rst == 503)
+        clear(e.nf.rules_path)
+    e.nf.start(rules=True, probe=True)
+    recovered = nf_wait(e, s, True, 6) is not None
+    ok = all(all(v) for v in out.values()) and worst_admin < 1.0 and recovered
+    return ok, f"(was_healthy, refused, not_ready) {out} worst_admin_s={worst_admin:.2f} recovered={recovered}"
+
+
+@case("NF-10", "NF", "no self-check configured: always ready, never gated, no status files needed", instance="netfilter-off")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    before = len(nf_audit(e))  # the audit file is shared with the earlier instance
+    rst, rbody = nf_ready(e)
+    st, dec, code, n = nf_request(e, s)
+    return rst == 200 and st == 200 and n == 1 and len(nf_audit(e)) == before, f"ready={rst} request={st} upstream={n}"
+
+
 # ================================================================ driver
 def run_instance(e, instance, results):
     """Start the processes this instance needs, run its cases in table order, stop them."""
@@ -775,6 +1274,20 @@ def run_instance(e, instance, results):
         cfg = os.path.join(e.work, "config-restart.toml")
         e.write_file(cfg, e.main_text(port=PORT_RESTART))
         e.start_proxy(cfg, PORT_RESTART)
+    elif instance == "netfilter":
+        cfg = os.path.join(e.work, "config-netfilter.toml")
+        e.write_file(cfg, e.main_text(port=PORT_NETFILTER))
+        nfdir = os.path.join(e.work, "netfilter-status")
+        os.makedirs(nfdir, exist_ok=True)
+        e.nf = FakeCheckers(nfdir)
+        e.start_proxy(cfg, PORT_NETFILTER, extra_args=[
+            "--netfilter-rules-status", e.nf.rules_path, "--netfilter-probe-status", e.nf.probe_path,
+            "--netfilter-interval-secs", str(NF_INTERVAL),
+            "--netfilter-rules-uid", str(os.getuid()), "--netfilter-probe-uid", str(os.getuid())])
+    elif instance == "netfilter-off":
+        cfg = os.path.join(e.work, "config-netfilter-off.toml")
+        e.write_file(cfg, e.main_text(port=PORT_NETFILTER))
+        e.start_proxy(cfg, PORT_NETFILTER)
     elif instance == "egress":
         cfg = os.path.join(e.work, "config-egress.toml")
         e.write_file(cfg, e.main_text(egress_allow=("allowed.test:443", f"{EGRESS_NAME}:{PORT_PROBE}")))
@@ -796,6 +1309,9 @@ def run_instance(e, instance, results):
         if instance == "egress":
             e.stop_egress()
             e.probe.close()
+        elif instance == "netfilter":
+            e.nf.stop()
+            e.stop_proxy()
         else:
             e.stop_proxy()
 
@@ -818,7 +1334,7 @@ def main():
     e = Env(bindir, work)
     results = []
     try:
-        for instance in ("main", "lease", "authority", "restart", "egress", "final"):
+        for instance in ("main", "lease", "authority", "restart", "netfilter", "netfilter-off", "egress", "final"):
             if instance == "final":
                 run_instance(e, "final", results)
             else:
@@ -831,11 +1347,13 @@ def main():
     passed = sum(1 for r in results if r["verdict"] == "PASS")
     gate = sum(1 for r in results if r["id"] in GATE_IDS and r["verdict"] == "PASS")
     probe_target = sum(1 for r in results if r["id"] in P1_IDS and r["verdict"] == "PASS")
+    canon = sum(1 for r in results if r["id"] in CANON_IDS and r["verdict"] == "PASS")
+    nfrows = sum(1 for r in results if r["id"] in NF_IDS and r["verdict"] == "PASS")
     if a.json:
         with open(a.json, "w") as f:
             json.dump({"bin": bindir, "results": results, "missing": missing}, f, indent=1)
     print(f"\nrows: {len(results)} run, {len(EXPECTED)} expected, missing={missing or 'none'} extra={extra or 'none'}")
-    print(f"gate: {gate} PASS of {len(GATE_IDS)}; phase 1: {probe_target} PASS of {len(P1_IDS)}")
+    print(f"gate: {gate} PASS of {len(GATE_IDS)}; phase 1: {probe_target} PASS of {len(P1_IDS)}; canonicalization: {canon} PASS of {len(CANON_IDS)}; netfilter self-check: {nfrows} PASS of {len(NF_IDS)}")
     print(f"summary: {passed} PASS of {len(EXPECTED)} rows; work dir {work}")
     return 0 if (passed == len(EXPECTED) and not missing and not extra) else 1
 

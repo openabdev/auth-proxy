@@ -1,0 +1,20 @@
+=== attempt 0 (quoting error in the tamper step: cli.json unchanged, the turn went through the proxy; counted as a spent paid call)
+=== 5a: agent rewrites cli.json to the real hosts
+tamper real: cli.json keys now: {'api.cps.service': 'https://management.us-east-1.kiro.dev', 'api.krs.service': 'https://runtime.us-east-1.kiro.dev', 'api.codewhisperer.service': 'https://q.us-east-1.amazonaws.com', 'api.q.service': 'https://q.us-east-1.amazonaws.com'}
+{"start_ms": 1794268639231, "rc": 1, "wall_s": 43.89, "first_stdout_s": null, "stdout_reads": 0, "span_s": null, "reply_chars": 0, "reply_head": "", "stderr_tail": "Error: Internal error (code -32603): Encountered an error in the response stream: An unknown error occurred: dispatch failure\n"}
+--- new audit lines (expect none): 0
+=== 5b: agent removes the four settings (kiro-cli defaults)
+tamper unset: cli.json keys now: {}
+{"start_ms": 1794268691940, "rc": 1, "wall_s": 44.28, "first_stdout_s": null, "stdout_reads": 0, "span_s": null, "reply_chars": 0, "reply_head": "", "stderr_tail": "Error: Internal error (code -32603): Encountered an error in the response stream: An unknown error occurred: dispatch failure\n"}
+--- new audit lines (expect none): 0
+tamper restore: cli.json keys now: {'api.cps.service': 'http://127.0.0.1:18100/ap/<caller-key>/cps', 'api.krs.service': 'http://127.0.0.1:18100/ap/<caller-key>/krs', 'api.codewhisperer.service': 'http://127.0.0.1:18100/ap/<caller-key>/cw', 'api.q.service': 'http://127.0.0.1:18100/ap/<caller-key>/q'}
+=== 5c: the surrogate sent straight to the real control plane (UID 1001 has egress), vs through the proxy (agent)
+direct, surrogate: 400 {"__type":"com.amazon.kiro.controlplane#ValidationException","message":"1 validation error detected: Value null at 'origin' failed to satisfy constraint: Member must not be null"}
+via proxy, surrogate: 400 {"__type":"com.amazon.kiro.controlplane#ValidationException","message":"1 validation error detected: Value null at 'orig
+--- ListAvailableModels {origin:KIRO_CLI} (control-plane call, not a model turn)
+via proxy, surrogate: 200
+direct to real host, surrogate (as UID 1001, which has egress): 400 {"__type":"com.amazon.kiro.controlplane#AccessDeniedException","message":"Invalid token"}
+=== 5d: real key in anything the agent container can see (counts only)
+agent-container processes scanned: 2, with real key in environ/cmdline: 0
+files in the agent's filesystem view with the real key: 0
+control: files under the proxy's Secret mount with the real key: 1 (expect >= 1)

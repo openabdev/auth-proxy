@@ -1,0 +1,8 @@
+== iptables iptables v1.8.10 (nf_tables)
+-P OUTPUT ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 18190 -m owner --uid-owner 1000 -j REJECT --reject-with tcp-reset
+-A OUTPUT ! -o lo -m owner --uid-owner 1000 -j REJECT --reject-with icmp-port-unreachable
+== ip6tables
+-P OUTPUT ACCEPT
+-A OUTPUT -o lo -p tcp -m tcp --dport 18190 -m owner --uid-owner 1000 -j REJECT --reject-with tcp-reset
+-A OUTPUT ! -o lo -m owner --uid-owner 1000 -j REJECT --reject-with icmp6-port-unreachable

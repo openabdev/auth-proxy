@@ -15,6 +15,9 @@ pub const ENV_CA: &str = "AP_TEST_UPSTREAM_CA";
 /// Comma-separated `host=ip` pairs. Each host resolves to that address. The port comes from the URL.
 pub const ENV_RESOLVE: &str = "AP_TEST_RESOLVE";
 
+/// A request path that makes a passthrough handler panic, to exercise the panic hook.
+pub const PANIC_PATH: &str = "/__ap_test_panic";
+
 /// Startup banner for a feature-enabled binary. It is printed on every start.
 pub const WARNING: &str = "auth-proxy: ***************************************************************
 auth-proxy: WARNING: TEST BUILD (feature matrix-upstream). This is not the release artifact.

@@ -26,6 +26,15 @@ pub enum Code {
     UpstreamUnavailable,
     PolicyUnavailable,
     BrokerUnavailable,
+    // Passthrough routes (Muse gate). The sidecar path never produces these; its statuses here
+    // are placeholders and passthrough answers come from `outcome::passthrough_outcome`.
+    NoGrant,
+    FramingRefused,
+    AuthorizationDuplicate,
+    BodyReadTimeout,
+    ConnectFailed,
+    ProbeParams,
+    CallerKeyAmbiguous,
 }
 
 impl Code {
@@ -53,6 +62,13 @@ impl Code {
             Code::UpstreamUnavailable => "upstream is unavailable",
             Code::PolicyUnavailable => "policy is unavailable",
             Code::BrokerUnavailable => "credential store is unavailable",
+            Code::NoGrant => "no grant allows this request",
+            Code::FramingRefused => "request framing is ambiguous",
+            Code::AuthorizationDuplicate => "more than one Authorization header",
+            Code::BodyReadTimeout => "request body stalled",
+            Code::ConnectFailed => "upstream connection failed",
+            Code::ProbeParams => "probe parameters are not allowed",
+            Code::CallerKeyAmbiguous => "caller key given in more than one place",
         }
     }
 
@@ -62,7 +78,11 @@ impl Code {
             Code::AbsoluteForm
             | Code::HostRejected
             | Code::PathAmbiguous
-            | Code::SurrogateAmbiguous => 400,
+            | Code::SurrogateAmbiguous
+            | Code::FramingRefused
+            | Code::AuthorizationDuplicate
+            | Code::ProbeParams
+            | Code::CallerKeyAmbiguous => 400,
             Code::CallerRejected
             | Code::SurrogateMissing
             | Code::SurrogateMalformed
@@ -72,13 +92,17 @@ impl Code {
             | Code::SurrogateWrongCaller
             | Code::SurrogateWrongRoute
             | Code::PolicyEmpty
-            | Code::PolicyDenied => 403,
+            | Code::PolicyDenied
+            | Code::NoGrant => 403,
             Code::RouteUnknown => 404,
             Code::ConnectRefused => 405,
             Code::BodyTooLarge => 413,
             Code::WebsocketUnsupported => 501,
             Code::UpstreamUnavailable => 502,
-            Code::PolicyUnavailable | Code::BrokerUnavailable => 503,
+            Code::PolicyUnavailable
+            | Code::BrokerUnavailable
+            | Code::BodyReadTimeout
+            | Code::ConnectFailed => 503,
         }
     }
 
@@ -106,6 +130,13 @@ impl Code {
             Code::UpstreamUnavailable => "upstream_unavailable",
             Code::PolicyUnavailable => "policy_unavailable",
             Code::BrokerUnavailable => "broker_unavailable",
+            Code::NoGrant => "no_grant",
+            Code::FramingRefused => "framing_refused",
+            Code::AuthorizationDuplicate => "authorization_duplicate",
+            Code::BodyReadTimeout => "body_read_timeout",
+            Code::ConnectFailed => "connect_failed",
+            Code::ProbeParams => "probe_params",
+            Code::CallerKeyAmbiguous => "caller_key_ambiguous",
         }
     }
 }
@@ -185,6 +216,13 @@ mod tests {
         assert_eq!(Code::UpstreamUnavailable.status(), 502);
         assert_eq!(Code::PolicyUnavailable.status(), 503);
         assert_eq!(Code::BrokerUnavailable.status(), 503);
+        assert_eq!(Code::NoGrant.status(), 403);
+        assert_eq!(Code::FramingRefused.status(), 400);
+        assert_eq!(Code::AuthorizationDuplicate.status(), 400);
+        assert_eq!(Code::ProbeParams.status(), 400);
+        assert_eq!(Code::CallerKeyAmbiguous.status(), 400);
+        assert_eq!(Code::BodyReadTimeout.status(), 503);
+        assert_eq!(Code::ConnectFailed.status(), 503);
     }
 
     #[test]
@@ -211,6 +249,13 @@ mod tests {
             Code::UpstreamUnavailable,
             Code::PolicyUnavailable,
             Code::BrokerUnavailable,
+            Code::NoGrant,
+            Code::FramingRefused,
+            Code::AuthorizationDuplicate,
+            Code::BodyReadTimeout,
+            Code::ConnectFailed,
+            Code::ProbeParams,
+            Code::CallerKeyAmbiguous,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in all {
@@ -221,6 +266,6 @@ mod tests {
             );
             assert!(seen.insert(s), "duplicate {s}");
         }
-        assert_eq!(seen.len(), 21);
+        assert_eq!(seen.len(), 28);
     }
 }

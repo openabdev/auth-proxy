@@ -1,0 +1,434 @@
+//! The passthrough pipeline (design 3.1) for the Muse gate, stage 1.
+//!
+//! In order: refuse CONNECT and Upgrade, canonicalize (origin form, public `Host`, ambiguous
+//! path), refuse ambiguous framing, read the caller key from its header or the `/ap/<caller-key>/` path prefix (exactly one), resolve the route name
+//! in the path to a fixed host, refuse a duplicate `Authorization`, evaluate the grant (anything
+//! not granted, writes included, is 423 `no_grant`), forward with the caller's own
+//! `Authorization` unchanged, and stream the response back. Every gate refusal carries
+//! `X-AP-Decision` and writes one audit line. Nothing request-supplied selects the upstream host.
+
+use std::io;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use ap_broker::registry::sha256_hex;
+use ap_core::audit::{path_only, AuditRec};
+use ap_core::canon;
+use ap_core::config::{Config, Identity};
+use ap_core::error::Code;
+use ap_core::outcome::{render_passthrough, DECISION_HEADER};
+use axum::body::Body;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
+use http::{header, HeaderValue, Method, Request, Response, StatusCode};
+use subtle::ConstantTimeEq;
+
+use crate::audit_sink::AuditSink;
+use crate::evidence::Evidence;
+use crate::forward::{self, BodyFlags};
+use crate::policy_store::PolicyStore;
+
+#[cfg(test)]
+mod tests;
+
+/// Returned instead of a response: the connection is closed with no synthetic decision.
+#[derive(Debug)]
+pub struct ConnAbort;
+
+impl std::fmt::Display for ConnAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("connection aborted after the first upstream byte")
+    }
+}
+
+impl std::error::Error for ConnAbort {}
+
+/// Shared state of the passthrough listener.
+pub struct PtApp {
+    pub(crate) policy: PolicyStore,
+    pub(crate) audit: AuditSink,
+    client: reqwest::Client,
+}
+
+impl PtApp {
+    pub(crate) fn new(
+        policy_path: std::path::PathBuf,
+        cfg: Config,
+        audit: AuditSink,
+        client: reqwest::Client,
+    ) -> Arc<PtApp> {
+        Arc::new(PtApp {
+            policy: PolicyStore::new(policy_path, cfg),
+            audit,
+            client,
+        })
+    }
+}
+
+/// What the audit line knows so far. The caller key and `Authorization` never enter it.
+pub(crate) struct Trail {
+    started: Instant,
+    method: String,
+    identity: String,
+    route: Option<String>,
+    path: String,
+    evidence: Option<Evidence>,
+}
+
+impl Trail {
+    fn new(method: &str) -> Trail {
+        Trail {
+            started: Instant::now(),
+            method: method.to_string(),
+            identity: String::new(),
+            route: None,
+            path: String::new(),
+            evidence: None,
+        }
+    }
+
+    pub(crate) fn rec(&self, decision: &'static str, code: Option<&str>, status: u16) -> AuditRec {
+        AuditRec {
+            identity: self.identity.clone(),
+            session: None,
+            generation: None,
+            route: self.route.clone(),
+            method: self.method.clone(),
+            path: self.path.clone(),
+            aws_target: None,
+            decision,
+            code: code.map(str::to_string),
+            status,
+            duration_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            bytes_sent: None,
+        }
+    }
+
+    fn write_evidence(&self, audit: &AuditSink, status: u16) {
+        if let Some(e) = &self.evidence {
+            let mut e = e.clone();
+            e.status = status;
+            e.route.clone_from(&self.route);
+            e.path.clone_from(&self.path);
+            audit.write_line(&e.to_json_line());
+        }
+    }
+}
+
+impl std::fmt::Debug for Trail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Trail")
+            .field("method", &self.method)
+            .field("identity", &self.identity)
+            .field("route", &self.route)
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+/// A gate refusal: audit line, evidence line, status, `X-AP-Decision` and JSON body.
+pub(crate) fn refuse(app: &PtApp, trail: &Trail, code: Code) -> Response<Body> {
+    let (status, decision, body) = render_passthrough(code);
+    app.audit
+        .write_rec(&trail.rec("deny", Some(code.code_str()), status));
+    trail.write_evidence(&app.audit, status);
+    let mut r = Response::new(Body::from(body));
+    *r.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    r.headers_mut()
+        .insert(DECISION_HEADER, HeaderValue::from_static(decision.as_str()));
+    r
+}
+
+/// A failure after the first upstream request byte: one audit line, then the caller's
+/// connection is closed with no synthetic answer.
+fn abort(app: &PtApp, trail: &Trail, code: &str) -> ConnAbort {
+    app.audit.write_rec(&trail.rec("allow", Some(code), 0));
+    trail.write_evidence(&app.audit, 0);
+    ConnAbort
+}
+
+/// The caller whose key hashes to the presented key. Every identity is compared, so the time
+/// taken does not show which identity matched.
+fn caller_identity<'a>(cfg: &'a Config, caller_key: &str) -> Option<&'a Identity> {
+    let presented = sha256_hex(caller_key);
+    let mut found = None;
+    for id in &cfg.identities {
+        let same: bool = presented
+            .as_bytes()
+            .ct_eq(id.caller_key_sha256.as_bytes())
+            .into();
+        if same && found.is_none() {
+            found = Some(id);
+        }
+    }
+    found
+}
+
+/// Writes the allow line when the response body ends, or when the client drops it.
+struct StreamAudit {
+    app: Arc<PtApp>,
+    trail: Trail,
+    status: u16,
+    reset: bool,
+}
+
+impl Drop for StreamAudit {
+    fn drop(&mut self) {
+        let code = self.reset.then_some("upstream_reset");
+        self.app
+            .audit
+            .write_rec(&self.trail.rec("allow", code, self.status));
+        self.trail.write_evidence(&self.app.audit, self.status);
+    }
+}
+
+fn audited<S>(
+    stream: S,
+    audit: StreamAudit,
+    deadline: Instant,
+    idle: Duration,
+) -> impl Stream<Item = Result<Bytes, io::Error>>
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Send + Unpin + 'static,
+{
+    futures_util::stream::unfold(
+        (Box::pin(stream), audit, false),
+        move |(mut s, mut a, done)| async move {
+            if done {
+                return None;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            let wait = left.min(idle);
+            match tokio::time::timeout(wait, s.next()).await {
+                Ok(Some(Ok(bytes))) => Some((Ok(bytes), (s, a, false))),
+                Ok(Some(Err(e))) => {
+                    a.reset = true;
+                    Some((Err(io::Error::other(e)), (s, a, true)))
+                }
+                Ok(None) => None,
+                Err(_) => {
+                    a.reset = true;
+                    Some((
+                        Err(io::Error::new(io::ErrorKind::TimedOut, "upstream stalled")),
+                        (s, a, true),
+                    ))
+                }
+            }
+        },
+    )
+}
+
+/// Handle one request on the public listener.
+pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body>, ConnAbort> {
+    let (mut parts, body) = req.into_parts();
+    let mut trail = Trail::new(parts.method.as_str());
+
+    // 1. CONNECT and Upgrade.
+    if parts.method == Method::CONNECT {
+        return Ok(refuse(&app, &trail, Code::ConnectRefused));
+    }
+    if parts.headers.contains_key(header::UPGRADE) {
+        return Ok(refuse(&app, &trail, Code::WebsocketUnsupported));
+    }
+
+    // 2. Policy snapshot, which also holds the public authority.
+    let Some(policy) = app.policy.current() else {
+        return Ok(refuse(&app, &trail, Code::PolicyUnavailable));
+    };
+    let Some(pt) = policy.cfg.passthrough.as_ref() else {
+        return Ok(refuse(&app, &trail, Code::PolicyUnavailable));
+    };
+
+    // 3. Canonical request target, host and path.
+    if let Err(code) = canon::check_origin_form(
+        &parts.uri,
+        &parts.headers,
+        parts.version,
+        &pt.public_authority,
+    ) {
+        return Ok(refuse(&app, &trail, code));
+    }
+    if canon::path_ambiguous(parts.uri.path()) {
+        return Ok(refuse(&app, &trail, Code::PathAmbiguous));
+    }
+    // 4. Framing.
+    if canon::framing_refused(&parts.headers, &pt.caller_key_header) {
+        return Ok(refuse(&app, &trail, Code::FramingRefused));
+    }
+
+    // 5. Caller key: from its header OR from a `/ap/<caller-key>/` path prefix, exactly one.
+    // Mark every header value sensitive first so no Debug print of the request or its headers
+    // can show it. The prefix is stripped here: everything after this point sees `eff_path`.
+    let mut header_present = false;
+    if let Ok(name) = http::HeaderName::from_bytes(pt.caller_key_header.as_bytes()) {
+        if let http::header::Entry::Occupied(mut e) = parts.headers.entry(name) {
+            header_present = true;
+            for v in e.iter_mut() {
+                v.set_sensitive(true);
+            }
+        }
+    }
+    let path_form = parts.uri.path().starts_with("/ap/");
+    if header_present && path_form {
+        return Ok(refuse(&app, &trail, Code::CallerKeyAmbiguous));
+    }
+    let (key, eff_path) = if path_form {
+        // `parse_ap_path` validates the prefix. Whatever follows the key, byte for byte, is the
+        // path the rest of the pipeline sees.
+        let path = parts.uri.path();
+        let key = match canon::parse_ap_path(path) {
+            Ok(ap) => ap.caller_key,
+            // The key is well formed but the route segment is empty: authenticate the key
+            // first, so an unknown key is still 401; `/` then names no route.
+            Err(Code::RouteUnknown) => path
+                .strip_prefix("/ap/")
+                .and_then(|r| r.split('/').next())
+                .unwrap_or_default(),
+            Err(code) => return Ok(refuse(&app, &trail, code)),
+        };
+        (
+            key.to_string(),
+            path["/ap/".len() + key.len()..].to_string(),
+        )
+    } else {
+        match canon::caller_key_from_header(&parts.headers, &pt.caller_key_header) {
+            Ok(k) => (k, parts.uri.path().to_string()),
+            Err(code) => return Ok(refuse(&app, &trail, code)),
+        }
+    };
+    let Some(identity) = caller_identity(&policy.cfg, &key) else {
+        return Ok(refuse(&app, &trail, Code::CallerRejected));
+    };
+    drop(key);
+    trail.identity.clone_from(&identity.name);
+    trail.evidence = Some(Evidence::collect(
+        &identity.name,
+        parts.method.as_str(),
+        parts.version,
+        &parts.headers,
+    ));
+
+    #[cfg(feature = "matrix-upstream")]
+    if eff_path == crate::matrix_hooks::PANIC_PATH {
+        let auth = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        panic!("test panic injection {auth}");
+    }
+
+    #[cfg(feature = "stage1-probe")]
+    if policy.cfg.probe.enabled && eff_path.starts_with(crate::probe::PREFIX) {
+        return Ok(crate::probe::handle(&app, &trail, &parts.method, &eff_path, body, pt).await);
+    }
+
+    // 6. Route name in the path, mapped by policy to a fixed host.
+    let (route_name, rel) = match canon::parse_route_path(&eff_path) {
+        Ok(r) => r,
+        Err(code) => return Ok(refuse(&app, &trail, code)),
+    };
+    let Some(route) = policy.snap.route(route_name) else {
+        return Ok(refuse(&app, &trail, Code::RouteUnknown));
+    };
+    trail.route = Some(route.name.clone());
+    trail.path = canon::redact_path(&path_only(&rel));
+
+    // 7. More than one Authorization header is refused: the gate cannot say which one is read.
+    if parts.headers.get_all(header::AUTHORIZATION).iter().count() > 1 {
+        return Ok(refuse(&app, &trail, Code::AuthorizationDuplicate));
+    }
+
+    // 8. Grant. Everything not granted is 423 no_grant.
+    if policy
+        .snap
+        .evaluate(
+            &identity.name,
+            &route.name,
+            parts.method.as_str(),
+            &rel,
+            &[],
+        )
+        .is_err()
+    {
+        return Ok(refuse(&app, &trail, Code::NoGrant));
+    }
+
+    // 9. Declared length over the cap.
+    let max_body = policy.cfg.limits.max_body_bytes;
+    let declared = forward::declared_length(&parts.headers);
+    if declared.is_some_and(|n| n > max_body) {
+        return Ok(refuse(&app, &trail, Code::BodyTooLarge));
+    }
+
+    // 10. Forward. The path goes upstream raw, with the query raw.
+    let headers = forward::passthrough_headers(&parts.headers, route, pt);
+    let rest = match parts.uri.query() {
+        Some(q) => format!("{rel}?{q}"),
+        None => rel.clone(),
+    };
+    let url = forward::upstream_url(route, &rest);
+    let has_body =
+        parts.headers.contains_key(header::TRANSFER_ENCODING) || declared.is_some_and(|n| n > 0);
+    let flags = BodyFlags::default();
+    let mut builder = app
+        .client
+        .request(parts.method.clone(), url)
+        .headers(headers);
+    if has_body {
+        builder = builder.body(forward::guarded_body(
+            body,
+            max_body,
+            Duration::from_secs(pt.body_read_secs),
+            flags.clone(),
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs(pt.request_deadline_secs);
+    let sent = tokio::time::timeout_at(deadline.into(), builder.send()).await;
+    let upstream = match sent {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            let sent_any = flags.sent_any.load(Ordering::SeqCst);
+            if flags.overflow.load(Ordering::SeqCst) {
+                return if sent_any {
+                    Err(abort(&app, &trail, "body_failed_after_send"))
+                } else {
+                    Ok(refuse(&app, &trail, Code::BodyTooLarge))
+                };
+            }
+            if flags.stalled.load(Ordering::SeqCst) {
+                return if sent_any {
+                    Err(abort(&app, &trail, "body_failed_after_send"))
+                } else {
+                    Ok(refuse(&app, &trail, Code::BodyReadTimeout))
+                };
+            }
+            if e.is_connect() {
+                return Ok(refuse(&app, &trail, Code::ConnectFailed));
+            }
+            return Err(abort(&app, &trail, "upstream_reset"));
+        }
+        Err(_) => return Err(abort(&app, &trail, "upstream_reset")),
+    };
+
+    // 11. The response streams back. The allow line is written when the body ends.
+    let status = upstream.status();
+    let out_headers = forward::response_headers(upstream.headers());
+    let audit = StreamAudit {
+        app: Arc::clone(&app),
+        trail,
+        status: status.as_u16(),
+        reset: false,
+    };
+    let idle = Duration::from_secs(pt.upstream_idle_secs);
+    let stream = audited(upstream.bytes_stream(), audit, deadline, idle);
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = status;
+    *response.headers_mut() = out_headers;
+    Ok(response)
+}

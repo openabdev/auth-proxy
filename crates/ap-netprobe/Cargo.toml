@@ -1,0 +1,10 @@
+[package]
+name = "ap-netprobe"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# std only. The binary runs in the pod as the agent UID with no capability, so it sees the same
+# per-UID netfilter rules the agent sees. It reports a boolean to a status file the proxy reads.
+[dependencies]

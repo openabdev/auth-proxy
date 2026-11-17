@@ -13,6 +13,9 @@
 #   6. The runtime UID (ap-runtime-shim) gets ESTABLISHED replies and nothing else. It talks to
 #      the proxy and the agent over Unix sockets, which netfilter does not see, so it needs no route.
 #
+# Writes /run/expected-iptables and /run/expected-ip6tables (the installed OUTPUT chains) for the
+# netcheck container to compare against.
+#
 # Env:
 #   AGENT_UID        UID the rules confine (default 1000)
 #   RUNTIME_UID      UID of the runtime container (default 1002). Must differ from AGENT_UID.
@@ -58,6 +61,11 @@ for T in iptables ip6tables; do
   $T -A OUTPUT -m owner --uid-owner "$RUNTIME_UID" -m conntrack --ctstate ESTABLISHED -j ACCEPT
   $T -A OUTPUT -m owner --uid-owner "$RUNTIME_UID" -j REJECT
 done
+
+# Snapshot of the installed chain, for netcheck.sh (the self-check container). It compares the live
+# chain with these files, so the expected rule set is whatever this script installed.
+iptables -S OUTPUT > /run/expected-iptables
+ip6tables -S OUTPUT > /run/expected-ip6tables
 
 echo "== iptables $(iptables -V)"
 iptables -S OUTPUT

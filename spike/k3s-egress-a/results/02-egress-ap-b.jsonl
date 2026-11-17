@@ -1,0 +1,7 @@
+{"uid": 1000, "target": "tcp:<runtime.us-east-1.kiro.dev-v4>:443", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "tcp:1.1.1.1:443", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "tcp:<github.com-v4>:443", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "udp53:<kube-dns>", "result": "EPERM", "ms": 0}
+{"uid": 1000, "target": "tcp53:<kube-dns>", "result": "ECONNREFUSED", "ms": 0}
+{"uid": 1000, "target": "tcp:127.0.0.1:18100", "result": "ok", "ms": 0}
+{"uid": 1000, "target": "tcp:127.0.0.1:18190", "result": "ok", "ms": 0}

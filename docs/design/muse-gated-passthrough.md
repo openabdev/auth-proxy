@@ -147,7 +147,7 @@ Tailnet identity headers that `tailscale serve` injects are ignored: no decision
   bare LF line ending. The handler therefore cannot refuse these three, and a direct request carrying one is
   forwarded. Stage 1 accepts this because the listener is loopback-only, so a direct request is possible
   only from the proxy host itself, and the real path goes through the owner's `tailscale serve`, which was
-  measured to normalise or terminate all three [M, source: `.agents/tasks/muse-stage1/owner-report.md`].
+  measured to normalise or terminate all three [M, source: `docs/evidence/muse-stage1-front-measurements.md`].
   The fix is a connection-level raw-head scanner (about 100 lines, with a Content-Length and chunked
   body-length tracker so it finds each head on a keep-alive connection). It is the stage 2 candidate and must be decided
   before any listener is exposed beyond the front. It was not built now because a second HTTP parser in

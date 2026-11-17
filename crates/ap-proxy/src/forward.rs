@@ -225,12 +225,27 @@ pub fn guarded_body(body: Body, max: u64, stall: Duration, flags: BodyFlags) -> 
     reqwest::Body::wrap_stream(stream)
 }
 
-/// Copy the upstream response headers for the agent. Hop-by-hop headers are dropped.
-/// `Content-Length` is kept, because the body is streamed without re-framing.
+/// Response-only hop-by-hop fields, in addition to `HOP_HEADERS`.
+const RESPONSE_HOP_HEADERS: &[&str] = &["proxy-authenticate"];
+
+/// Copy the upstream response headers for the agent. Hop-by-hop headers and every field named by an
+/// upstream `Connection` header are dropped. `Content-Length` is kept, because the body is streamed
+/// without re-framing.
 pub fn response_headers(upstream: &HeaderMap) -> HeaderMap {
+    let nominated: Vec<String> = upstream
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
     let mut out = HeaderMap::new();
     for (name, value) in upstream {
         let n = name.as_str();
+        if nominated.iter().any(|t| t == n) || RESPONSE_HOP_HEADERS.contains(&n) {
+            continue;
+        }
         if n == CONTENT_LENGTH.as_str() || !HOP_HEADERS.contains(&n) {
             out.append(name.clone(), value.clone());
         }
@@ -353,6 +368,29 @@ paths = ["/"]
         let out = build(&c, &[("x-api-key", "k"), ("cookie", "a=b")]);
         assert_eq!(out.get("x-api-key").unwrap(), "k");
         assert!(out.get("cookie").is_none());
+    }
+
+    #[test]
+    fn response_drops_hop_headers_and_connection_nominations() {
+        let mut up = HeaderMap::new();
+        for (k, v) in [
+            ("connection", "X-Hop, keep-alive"),
+            ("connection", " x-other "),
+            ("x-hop", "value"),
+            ("x-other", "value"),
+            ("x-kept", "ok"),
+            ("proxy-authenticate", "Basic"),
+            ("content-length", "5"),
+        ] {
+            up.append(
+                HeaderName::from_static(k),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        let out = response_headers(&up);
+        let mut names: Vec<&str> = out.keys().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["content-length", "x-kept"]);
     }
 
     #[test]

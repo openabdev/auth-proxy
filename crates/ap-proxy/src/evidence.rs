@@ -6,7 +6,6 @@
 //! here (docs/runbooks/muse-stage1.md).
 
 use ap_broker::registry::sha256_hex;
-use ap_core::config::Passthrough;
 use http::{header, HeaderMap, Version};
 use serde::Serialize;
 
@@ -33,8 +32,6 @@ pub struct Evidence {
     pub status: u16,
     pub http_version: &'static str,
     pub auth_present: bool,
-    pub caller_key_header_present: bool,
-    pub host_matches_public_authority: bool,
     pub chunked: bool,
     pub compressed: bool,
     pub content_type_class: &'static str,
@@ -54,15 +51,7 @@ impl Evidence {
         method: &str,
         version: Version,
         headers: &HeaderMap,
-        pt: &Passthrough,
     ) -> Evidence {
-        let host_matches = {
-            let mut it = headers.get_all(header::HOST).iter();
-            match (it.next(), it.next()) {
-                (Some(v), None) => v.to_str().is_ok_and(|s| s == pt.public_authority),
-                _ => false,
-            }
-        };
         let chunked = headers.get_all(header::TRANSFER_ENCODING).iter().any(|v| {
             v.to_str()
                 .is_ok_and(|s| s.to_ascii_lowercase().contains("chunked"))
@@ -110,8 +99,6 @@ impl Evidence {
                 _ => "other",
             },
             auth_present: headers.contains_key(header::AUTHORIZATION),
-            caller_key_header_present: headers.contains_key(pt.caller_key_header.as_str()),
-            host_matches_public_authority: host_matches,
             chunked,
             compressed,
             content_type_class,
@@ -132,29 +119,7 @@ impl Evidence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ap_core::config::load;
     use http::HeaderValue;
-
-    fn pt() -> Passthrough {
-        load(
-            r#"version = 1
-[listen]
-proxy = "127.0.0.1:8443"
-[passthrough]
-public_authority = "gate.example.test"
-[[identity]]
-name = "m"
-caller_key_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-[[route]]
-name = "discord"
-host = "discord.com"
-mode = "passthrough"
-"#,
-        )
-        .unwrap()
-        .passthrough
-        .unwrap()
-    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -169,7 +134,7 @@ mode = "passthrough"
 
     #[test]
     fn json_key_set_is_the_fixed_list() {
-        let e = Evidence::collect("m", "GET", Version::HTTP_11, &headers(&[]), &pt());
+        let e = Evidence::collect("m", "GET", Version::HTTP_11, &headers(&[]));
         let v: serde_json::Value = serde_json::from_str(e.to_json_line().trim_end()).unwrap();
         let inner = v["evidence"].as_object().unwrap();
         let mut keys: Vec<&str> = inner.keys().map(String::as_str).collect();
@@ -178,14 +143,12 @@ mode = "passthrough"
             keys,
             vec![
                 "auth_present",
-                "caller_key_header_present",
                 "chunked",
                 "compressed",
                 "content_type_class",
                 "expect_continue",
                 "front_headers_present",
                 "fwd_names_digest",
-                "host_matches_public_authority",
                 "http_version",
                 "identity",
                 "method",
@@ -215,13 +178,13 @@ mode = "passthrough"
             ("host", "gate.example.test"),
             ("content-type", "application/json"),
         ]);
-        let ea = Evidence::collect("m", "POST", Version::HTTP_11, &a, &pt());
-        let eb = Evidence::collect("m", "POST", Version::HTTP_11, &b, &pt());
+        let ea = Evidence::collect("m", "POST", Version::HTTP_11, &a);
+        let eb = Evidence::collect("m", "POST", Version::HTTP_11, &b);
         let line = ea.to_json_line();
         assert!(!line.contains("SENTINEL"), "{line}");
         assert!(!format!("{ea:?}").contains("SENTINEL"));
         assert_eq!(ea.fwd_names_digest, eb.fwd_names_digest);
-        assert!(ea.auth_present && ea.host_matches_public_authority);
+        assert!(ea.auth_present);
         assert_eq!(ea.content_type_class, "json");
         assert_eq!(line.matches('\n').count(), 1);
         assert!(line.ends_with('\n'));
@@ -238,13 +201,12 @@ mode = "passthrough"
             ("tailscale-user-login", "x"),
             ("host", "wrong"),
         ]);
-        let e = Evidence::collect("m", "POST", Version::HTTP_10, &h, &pt());
+        let e = Evidence::collect("m", "POST", Version::HTTP_10, &h);
         assert!(e.chunked && e.compressed && e.expect_continue);
         assert_eq!(e.content_type_class, "multipart");
         assert_eq!(e.http_version, "1.0");
         assert!(e.front_headers_present.x_forwarded && e.front_headers_present.tailscale);
         assert!(!e.front_headers_present.cf);
-        assert!(!e.host_matches_public_authority);
         assert!(!e.auth_present);
     }
 }

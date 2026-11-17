@@ -34,7 +34,7 @@ KEY_HEADER = "x-ap-caller-key"
 
 CASES = []  # (id, row, name, instance, fn)
 EXPECTED = ["PT-01", "PT-02", "PT-03", "PT-04", "PT-05", "PT-06", "PT-07", "PT-08", "PT-09",
-            "PT-10a", "PT-12", "PT-13", "PT-14"]
+            "PT-10a", "PT-12", "PT-13", "PT-14", "PT-15", "PT-16"]
 
 
 def case(cid, row, name, instance="main"):
@@ -194,6 +194,22 @@ def pt01(c):
           and r["headers"].get("x-ap-other") == "kept" and r["body"].startswith(b"upstream-body")
           and len(up) == 1 and up[0]["method"] == "GET" and up[0]["path"] == "/v1/xap")
     return ok, f"status={r['status']} headers={sorted(k for k in r['headers'] if k.startswith('x-ap'))} upstream={len(up)}"
+
+
+@case("PT-15", "design 6", "upstream Connection nominations are dropped from the response (X-Hop and Connection do not reach the caller)")
+def pt15(c):
+    r = c.get("/discord/v1/hop")
+    h = r["headers"]
+    ok = (r["status"] == 200 and r["body"] == b"hop-body" and "x-hop" not in h
+          and "connection" not in h and h.get("x-kept") == "ok")
+    return ok, f"status={r['status']} x-hop={'x-hop' in h} connection={h.get('connection')} x-kept={h.get('x-kept')}"
+
+
+@case("PT-16", "design 6", "upstream Proxy-Authenticate does not reach the caller")
+def pt16(c):
+    r = c.get("/discord/v1/hop")
+    ok = r["status"] == 200 and "proxy-authenticate" not in r["headers"]
+    return ok, f"status={r['status']} proxy-authenticate={'proxy-authenticate' in r['headers']}"
 
 
 @case("PT-02", "acc 2", "POST message create is 423 no_grant with X-AP-Decision: denied, nothing upstream")

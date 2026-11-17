@@ -79,11 +79,15 @@ pub(crate) async fn handle(
         started: Instant::now(),
         done: false,
     };
-    // Read the body (a write is what will be held), bounded in size and per-chunk time.
+    // Read the body (a write is what will be held), bounded in size, per-chunk time and total time.
     let mut stream = body.into_data_stream();
     let mut seen = 0usize;
+    // Total bound on the body read, so a trickling caller cannot hold the slot indefinitely.
+    let deadline = Instant::now() + Duration::from_secs(pt.request_deadline_secs);
     loop {
-        match tokio::time::timeout(Duration::from_secs(pt.body_read_secs), stream.next()).await {
+        let wait = Duration::from_secs(pt.body_read_secs)
+            .min(deadline.saturating_duration_since(Instant::now()));
+        match tokio::time::timeout(wait, stream.next()).await {
             Err(_) => {
                 guard.done = true;
                 return refuse(app, trail, Code::BodyReadTimeout);

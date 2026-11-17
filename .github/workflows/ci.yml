@@ -30,8 +30,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Clippy (stage1-probe)
+        run: cargo clippy -p ap-proxy --all-targets --features stage1-probe -- -D warnings
+
       - name: Unit and integration tests
         run: cargo test --workspace
+
+      - name: Unit tests (stage1-probe)
+        run: cargo test -p ap-proxy --features stage1-probe --lib
 
       - name: Release build (default features; the matrix-upstream feature stays off)
         run: cargo build --release -p ap-proxy -p ap-egress -p ap-runtime-shim

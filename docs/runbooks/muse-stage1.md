@@ -29,12 +29,12 @@ printf '%s' "$key" | shasum -a 256        # put the hex digest in caller_key_sha
 
 Give `$key` to the Muse connector as the value of the `X-AP-Caller-Key` header (the header name is
 configurable with `passthrough.caller_key_header`). The key never goes into the config, a log or a
-commit. Revoke it by deleting the identity from the policy file (hot reload).
+commit. Revoke it by deleting the identity and its grants from the policy file (hot reload). Deleting only the identity leaves grants naming an unknown identity, the file stops validating, and every request gets 503 until it is fixed.
 
 ## 3. Policy
 
 Start from `deploy/muse/pilot-policy.example.toml`. Set `public_authority` to the `Host` the front
-passes to the loopback listener (stage 1 records whether it matches, see section 5). The proxy refuses a
+passes to the loopback listener (a request whose `Host` differs is refused 400 `host_rejected` and audited without an identity). The proxy refuses a
 non-loopback `listen.proxy`; the TLS front (for example `tailscale serve --bg --https=443 http://127.0.0.1:8443`)
 exposes it to the tailnet only. Do not use Funnel.
 
@@ -63,7 +63,7 @@ Whether the connector accepts a path prefix is open question 4.
 
 With a valid caller key, each request writes one `{"evidence":{...}}` line next to the audit line. Fields
 (fixed; no header value, no length, no key, no body): `identity`, `route`, `method`, redacted `path`,
-`status`, `http_version`, `auth_present`, `caller_key_header_present`, `host_matches_public_authority`,
+`status`, `http_version`, `auth_present`,
 `chunked`, `compressed`, `content_type_class`, `expect_continue`, `front_headers_present`
 (`forwarded`, `x_forwarded`, `x_real_ip`, `via`, `tailscale`, `cf`), and `fwd_names_digest` (sha256 over
 sorted header names only; equal digests for two identical connector calls mean the same header names).
@@ -72,7 +72,7 @@ Manual checklist, names only, redacted, written into the design doc afterwards:
 
 - [ ] which header carries the key (confirm the configured name arrives)
 - [ ] `auth_present` for message-read calls
-- [ ] `Host` and path prefix as seen at the loopback listener
+- [ ] path prefix as seen at the loopback listener (a wrong `Host` shows only as a `host_rejected` audit line)
 - [ ] HTTP version at the front
 - [ ] chunked and compressed bodies
 - [ ] other non-secret header names the connector sends (names only)
@@ -83,7 +83,7 @@ Manual checklist, names only, redacted, written into the design doc afterwards:
 ## 6. Hold-tolerance probe (acceptance 10)
 
 Enable `[probe] enabled = true` on the `stage1-probe` build. From the Muse connector, through the real
-front, send `POST /discord/...`-free probe calls to the proxy:
+front, send probe calls directly to the proxy (they are not Discord calls and do not use a route prefix):
 `POST https://<public-host>/__ap_probe/<status>/<secs>` with a small body and the caller key. `status`
 is one of 200, 410, 423, 503 and `secs` one of 10, 30, 60, 120, 300. 410, 423 and 503 return the matching
 `X-AP-Decision`; 200 returns none.

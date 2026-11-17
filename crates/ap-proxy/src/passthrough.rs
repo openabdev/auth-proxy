@@ -284,7 +284,6 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
         parts.method.as_str(),
         parts.version,
         &parts.headers,
-        pt,
     ));
 
     #[cfg(feature = "matrix-upstream")]

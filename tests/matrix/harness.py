@@ -237,6 +237,9 @@ class UpstreamHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/xap":
             return self._send(200, b"upstream-body", extra=[("x-ap-decision", "denied"), ("x-ap-other", "kept")])
+        if path == "/v1/hop":
+            return self._send(200, b"hop-body", extra=[("connection", "X-Hop"), ("x-hop", "value"),
+                                                       ("proxy-authenticate", "Basic realm=up"), ("x-kept", "ok")])
         if path == "/v1/redirect":
             import urllib.parse
             to = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("to", [""])[0]

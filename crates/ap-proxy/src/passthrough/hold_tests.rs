@@ -1,0 +1,1472 @@
+//! The hold path end to end (design stage 2 acceptance 1 to 6, 8, 13 to 18, 20, 23 to 25 and 29),
+//! against a mock TLS upstream that records what it receives.
+
+use std::convert::Infallible;
+use std::io::{self, Write};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::body::Body;
+use bytes::Bytes;
+use futures_util::StreamExt;
+use http::Request;
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+
+use super::pause::Gate;
+use super::*;
+use crate::hold::{ApproveResult, DenyResult, Limits, State};
+use crate::test_support::{
+    buffer_sink, caller_key, client_for, tls_server_config, Scratch, Upstream, HOST,
+};
+use ap_broker::registry::sha256_hex;
+
+const AUTH: &str = "gate.example.test";
+const SENTINEL: &str = "SENTINEL-DISCORD-TOKEN-0001";
+const PATH_TOKEN: &str = "SENTINEL-PATH-TOKEN-0002";
+
+// ---------------------------------------------------------------- mock upstreams
+
+#[derive(Clone, Debug)]
+struct Recorded {
+    method: String,
+    uri: String,
+    headers: Vec<(String, Vec<u8>)>,
+    body: Bytes,
+}
+
+type MockBody = UnsyncBoxBody<Bytes, io::Error>;
+
+fn full(b: &'static str) -> MockBody {
+    Full::new(Bytes::from_static(b.as_bytes()))
+        .map_err(|never: Infallible| match never {})
+        .boxed_unsync()
+}
+
+/// A TLS upstream that records every request it fully receives. The last path segment picks the
+/// behaviour: `teapot` answers 418 with `X-AP-*` headers, `reset-after-read` and
+/// `reset-before-read` drop the connection, `stall` never answers, `stall-body` sends a head and
+/// one chunk and then goes quiet, `trickle` sends a chunk every 300 ms forever.
+struct Mock {
+    up: Upstream,
+    reqs: Arc<Mutex<Vec<Recorded>>>,
+}
+
+impl Mock {
+    async fn start() -> Mock {
+        let (server, ca_der) = tls_server_config(b"http/1.1");
+        let acceptor = TlsAcceptor::from(Arc::new(server));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let reqs: Arc<Mutex<Vec<Recorded>>> = Arc::default();
+        let (h, r) = (Arc::clone(&hits), Arc::clone(&reqs));
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                h.fetch_add(1, Ordering::SeqCst);
+                let acceptor = acceptor.clone();
+                let reqs = Arc::clone(&r);
+                tokio::spawn(async move {
+                    if let Ok(tls) = acceptor.accept(tcp).await {
+                        let svc = service_fn(move |req| serve(req, Arc::clone(&reqs)));
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(tls), svc)
+                            .await;
+                    }
+                });
+            }
+        });
+        Mock {
+            up: Upstream::from_parts(addr, hits, ca_der),
+            reqs,
+        }
+    }
+
+    fn recorded(&self) -> Vec<Recorded> {
+        self.reqs.lock().unwrap().clone()
+    }
+
+    fn hits(&self) -> usize {
+        self.up.hits.load(Ordering::SeqCst)
+    }
+}
+
+async fn serve(
+    req: hyper::Request<Incoming>,
+    reqs: Arc<Mutex<Vec<Recorded>>>,
+) -> Result<hyper::Response<MockBody>, io::Error> {
+    let (parts, body) = req.into_parts();
+    let tail = parts
+        .uri
+        .path()
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if tail == "reset-before-read" {
+        return Err(io::Error::other("reset"));
+    }
+    let body = body
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
+    reqs.lock().unwrap().push(Recorded {
+        method: parts.method.to_string(),
+        uri: parts.uri.to_string(),
+        headers: parts
+            .headers
+            .iter()
+            .map(|(n, v)| (n.as_str().to_string(), v.as_bytes().to_vec()))
+            .collect(),
+        body,
+    });
+    match tail.as_str() {
+        "teapot" => Ok(hyper::Response::builder()
+            .status(418)
+            .header("x-ap-decision", "denied")
+            .header("x-ap-other", "kept")
+            .header("x-plain", "yes")
+            .body(full("short and stout"))
+            .expect("teapot")),
+        "reset-after-read" => Err(io::Error::other("reset")),
+        "stall" => std::future::pending().await,
+        "stall-body" => {
+            let s = futures_util::stream::once(async {
+                Ok::<_, io::Error>(Frame::data(Bytes::from_static(b"a")))
+            })
+            .chain(futures_util::stream::pending());
+            Ok(hyper::Response::new(StreamBody::new(s).boxed_unsync()))
+        }
+        "trickle" => {
+            let s = futures_util::stream::unfold((), |()| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Some((
+                    Ok::<_, io::Error>(Frame::data(Bytes::from_static(b"t"))),
+                    (),
+                ))
+            });
+            Ok(hyper::Response::new(StreamBody::new(s).boxed_unsync()))
+        }
+        _ => Ok(hyper::Response::new(full("ok"))),
+    }
+}
+
+/// A TLS upstream that completes handshakes and counts the request bytes it receives, answering
+/// nothing.
+struct Raw {
+    up: Upstream,
+    accepted: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
+}
+
+impl Raw {
+    async fn start() -> Raw {
+        let (server, ca_der) = tls_server_config(b"http/1.1");
+        let acceptor = TlsAcceptor::from(Arc::new(server));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind raw");
+        let addr = listener.local_addr().expect("raw addr");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let (a, b) = (Arc::clone(&accepted), Arc::clone(&bytes));
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (acceptor, a, b) = (acceptor.clone(), Arc::clone(&a), Arc::clone(&b));
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    a.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = tls.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        b.fetch_add(n, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        Raw {
+            up: Upstream::from_parts(addr, Arc::new(AtomicUsize::new(0)), ca_der),
+            accepted,
+            bytes,
+        }
+    }
+}
+
+// ---------------------------------------------------------------- audit sink that can fail
+
+#[derive(Clone, Default)]
+struct Switch {
+    buf: Arc<Mutex<Vec<u8>>>,
+    fail_all: Arc<AtomicBool>,
+    fail_on: Arc<Mutex<Option<String>>>,
+}
+
+impl Write for Switch {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.fail_all.load(Ordering::SeqCst) {
+            return Err(io::Error::other("sink down"));
+        }
+        if let Some(pat) = self.fail_on.lock().unwrap().as_deref() {
+            if String::from_utf8_lossy(data).contains(pat) {
+                return Err(io::Error::other("sink rejects this line"));
+            }
+        }
+        self.buf.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------- fixture
+
+struct Opts {
+    limits: Limits,
+    /// Extra keys inside `[passthrough]`.
+    extra: String,
+    held_body_max: u64,
+    /// Text appended after the grants.
+    tail: String,
+    port: Option<u16>,
+    sink: Option<Switch>,
+}
+
+impl Default for Opts {
+    fn default() -> Opts {
+        Opts {
+            limits: Limits {
+                hold: Duration::from_secs(30),
+                max_total: 8,
+                max_per_identity: 4,
+                cooldown: Duration::ZERO,
+            },
+            extra: String::new(),
+            held_body_max: 2048,
+            tail: String::new(),
+            port: None,
+            sink: None,
+        }
+    }
+}
+
+struct Ht {
+    app: Arc<PtApp>,
+    key: String,
+    other_key: String,
+    audit: Arc<Mutex<Vec<u8>>>,
+    policy: std::path::PathBuf,
+    _s: Scratch,
+}
+
+impl Ht {
+    async fn new(tag: &str, up: &Upstream) -> Ht {
+        Self::with(tag, up, Opts::default()).await
+    }
+
+    async fn with(tag: &str, up: &Upstream, o: Opts) -> Ht {
+        let s = Scratch::new(tag);
+        let key = caller_key();
+        let other_key = caller_key();
+        let port = o.port.unwrap_or(up.addr.port());
+        let text = format!(
+            r#"version = 1
+
+[listen]
+proxy = "127.0.0.1:8443"
+
+[limits]
+max_body_bytes = 1024
+
+[passthrough]
+public_authority = "{AUTH}"
+body_read_secs = 1
+held_body_max_bytes = {max}
+{extra}
+
+[[identity]]
+name = "muse-pilot"
+caller_key_sha256 = "{sha}"
+
+[[identity]]
+name = "muse-other"
+caller_key_sha256 = "{sha2}"
+
+[[route]]
+name = "discord"
+host = "{HOST}"
+port = {port}
+mode = "passthrough"
+
+[[grant]]
+identity = "muse-pilot"
+route = "discord"
+methods = ["GET"]
+paths = ["/api/", "/me"]
+
+[[grant]]
+identity = "muse-pilot"
+route = "discord"
+methods = ["POST", "PUT"]
+decision = "hold"
+path_patterns = ["/hold/*", "/hold/*/messages", "/webhooks/*/*"]
+
+[[grant]]
+identity = "muse-other"
+route = "discord"
+methods = ["POST"]
+decision = "hold"
+path_patterns = ["/hold/*"]
+{tail}
+"#,
+            max = o.held_body_max,
+            extra = o.extra,
+            tail = o.tail,
+            sha = sha256_hex(&key),
+            sha2 = sha256_hex(&other_key),
+        );
+        let policy = s.path().join("policy.toml");
+        std::fs::write(&policy, &text).unwrap();
+        let cfg = ap_core::config::load(&text).expect("valid policy");
+        let (sink, audit) = match o.sink {
+            Some(sw) => (AuditSink::new(Box::new(sw.clone())), sw.buf),
+            None => buffer_sink(),
+        };
+        let client = client_for(up);
+        let app = PtApp::build(policy.clone(), cfg, sink, client.clone(), client, o.limits);
+        Ht {
+            app,
+            key,
+            other_key,
+            audit,
+            policy,
+            _s: s,
+        }
+    }
+
+    fn builder(&self, key: &str, method: &str, path: &str) -> http::request::Builder {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", AUTH)
+            .header("x-ap-caller-key", key)
+            .header("authorization", format!("Bot {SENTINEL}"))
+    }
+
+    fn post(&self, path: &str, body: &str) -> Request<Body> {
+        self.builder(&self.key, "POST", path)
+            .header("content-type", "application/json")
+            .header("content-length", body.len())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn post_other(&self, path: &str, body: &str) -> Request<Body> {
+        self.builder(&self.other_key, "POST", path)
+            .header("content-type", "application/json")
+            .header("content-length", body.len())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn spawn(
+        &self,
+        req: Request<Body>,
+    ) -> tokio::task::JoinHandle<Result<(http::response::Parts, Bytes), ()>> {
+        let app = Arc::clone(&self.app);
+        tokio::spawn(async move { collect(handle(app, req).await).await })
+    }
+
+    async fn send(&self, req: Request<Body>) -> Result<(http::response::Parts, Bytes), ()> {
+        collect(handle(Arc::clone(&self.app), req).await).await
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.audit.lock().unwrap()).into_owned()
+    }
+
+    fn lines(&self) -> Vec<serde_json::Value> {
+        self.text()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    fn transitions(&self) -> Vec<String> {
+        self.lines()
+            .iter()
+            .filter_map(|v| v["transition"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn count(&self, transition: &str) -> usize {
+        self.transitions()
+            .iter()
+            .filter(|t| *t == transition)
+            .count()
+    }
+
+    fn held_ids(&self) -> Vec<String> {
+        self.lines()
+            .iter()
+            .filter(|v| v["transition"] == "held")
+            .filter_map(|v| v["request_id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// The id of the `n`th (1-based) `held` record, once it exists.
+    async fn held(&self, n: usize) -> String {
+        for _ in 0..250 {
+            let ids = self.held_ids();
+            if ids.len() >= n {
+                return ids[n - 1].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("hold {n} never appeared: {}", self.text());
+    }
+
+    /// Hold `req`, approve it, and return what the caller saw.
+    async fn approved(&self, req: Request<Body>) -> (http::response::Parts, Bytes) {
+        let n = self.held_ids().len() + 1;
+        let h = self.spawn(req);
+        let id = self.held(n).await;
+        assert_eq!(
+            self.app.hold.approve(&id, "alice").await,
+            ApproveResult::Success
+        );
+        h.await.unwrap().unwrap()
+    }
+
+    async fn serve(&self) -> SocketAddr {
+        let l = crate::listener::bind_loopback("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(crate::listener::public::serve_public(
+            l,
+            Arc::clone(&self.app),
+            crate::listener::public::PublicLimits {
+                max_connections: 16,
+                header_read: Duration::from_secs(5),
+            },
+        ));
+        addr
+    }
+
+    fn assert_clean(&self) {
+        let t = self.text();
+        for s in [
+            SENTINEL,
+            PATH_TOKEN,
+            self.key.as_str(),
+            self.other_key.as_str(),
+        ] {
+            assert!(!t.contains(s), "{s} leaked into the audit stream: {t}");
+        }
+    }
+}
+
+async fn collect(
+    r: Result<Response<Body>, ConnAbort>,
+) -> Result<(http::response::Parts, Bytes), ()> {
+    match r {
+        Ok(resp) => {
+            let (p, b) = resp.into_parts();
+            let bytes = b.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            Ok((p, bytes))
+        }
+        Err(_) => Err(()),
+    }
+}
+
+fn decision(p: &http::response::Parts) -> String {
+    p.headers
+        .get("x-ap-decision")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default()
+}
+
+fn code(b: &Bytes) -> String {
+    let v: serde_json::Value = serde_json::from_slice(b).unwrap();
+    v["code"].as_str().unwrap().to_string()
+}
+
+async fn until(what: &str, mut f: impl FnMut() -> bool) {
+    for _ in 0..250 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn header_values<'a>(r: &'a Recorded, name: &str) -> Vec<&'a [u8]> {
+    r.headers
+        .iter()
+        .filter(|(n, _)| n == name)
+        .map(|(_, v)| v.as_slice())
+        .collect()
+}
+
+// ---------------------------------------------------------------- spike: disconnect and milestone
+
+#[tokio::test]
+async fn hyper_drops_the_handler_future_when_the_peer_closes() {
+    let mock = Mock::start().await;
+    let t = Ht::new("spike-drop", &mock.up).await;
+    let addr = t.serve().await;
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "POST /discord/hold/ok HTTP/1.1\r\nHost: {AUTH}\r\nx-ap-caller-key: {}\r\nauthorization: Bot {SENTINEL}\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{{}}",
+        t.key
+    );
+    c.write_all(req.as_bytes()).await.unwrap();
+    let id = t.held(1).await;
+    assert_eq!(t.app.hold.state(&id), Some(State::Pending));
+    drop(c);
+    until("the entry to be abandoned", || {
+        t.app.hold.state(&id) == Some(State::Abandoned)
+    })
+    .await;
+    assert_eq!(t.app.hold.pending_len(), 0);
+    assert_eq!(t.app.hold.approve(&id, "alice").await, ApproveResult::Gone);
+    assert_eq!(t.count("abandoned"), 1);
+    assert_eq!(t.count("abandoned_after_approve"), 0);
+    assert_eq!(mock.hits(), 0);
+    t.assert_clean();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_request_byte_leaves_before_forward_started_and_approve_waits_for_the_first_chunk() {
+    let raw = Raw::start().await;
+    let t = Ht::new("milestones", &raw.up).await;
+    let gate = Gate::new();
+    t.app.pause.set_between_milestones(Arc::clone(&gate));
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    let table = Arc::clone(&t.app.hold);
+    let approve = tokio::spawn(async move { table.approve(&id, "alice").await });
+    tokio::time::timeout(Duration::from_secs(5), gate.arrived())
+        .await
+        .expect("handler reached the gap between the milestones");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Connected, and forward_started is on the record, but not one request byte has arrived.
+    assert_eq!(raw.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(raw.bytes.load(Ordering::SeqCst), 0, "a byte left early");
+    assert_eq!(t.count("forward_started"), 1);
+    assert!(
+        !approve.is_finished(),
+        "approve returned before the first byte"
+    );
+    gate.release();
+    let result = tokio::time::timeout(Duration::from_secs(5), approve)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result, ApproveResult::Success);
+    until("request bytes", || raw.bytes.load(Ordering::SeqCst) > 0).await;
+    h.abort();
+}
+
+// ---------------------------------------------------------------- 1, 2, 3, 13
+
+#[tokio::test]
+async fn nothing_goes_upstream_before_approval_and_exactly_one_request_after() {
+    let mock = Mock::start().await;
+    let t = Ht::new("before-after", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"content":"hi"}"#));
+    let id = t.held(1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(mock.hits(), 0);
+    assert!(mock.recorded().is_empty());
+    assert_eq!(t.app.hold.state(&id), Some(State::Pending));
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Success
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 200);
+    assert_eq!(&b[..], b"ok");
+    assert_eq!(mock.recorded().len(), 1);
+    assert_eq!(
+        t.transitions(),
+        ["held", "approved", "forward_started", "completed"]
+    );
+    t.assert_clean();
+}
+
+#[tokio::test]
+async fn approved_request_arrives_unchanged_and_the_response_is_verbatim() {
+    let mock = Mock::start().await;
+    let t = Ht::new("verbatim", &mock.up).await;
+    let body = r#"{"content":"hello \u00e9","n":[1,2,3]}"#;
+    let req = t
+        .builder(&t.key, "POST", "/discord/hold/teapot?a=1&b=%2Fz")
+        .header("content-type", "application/json; charset=utf-8")
+        .header("accept", "application/json")
+        .header("content-length", body.len())
+        .header("x-dup", "one")
+        .header("x-dup", "two")
+        .header("x-keep", "kept")
+        .header("expect", "100-continue")
+        .header("forwarded", "for=1")
+        .header("x-forwarded-for", "1.2.3.4")
+        .header("via", "1.1 front")
+        .header("cf-ray", "abc")
+        .header("tailscale-user-login", "someone")
+        .header("cookie", "a=b")
+        .header("proxy-authorization", "Basic x")
+        .header("x-api-key", "k")
+        .header("connection", "x-secret-hop")
+        .header("x-secret-hop", "1")
+        .body(Body::from(body))
+        .unwrap();
+    let (p, b) = t.approved(req).await;
+    // The upstream response, status, headers and body, including X-AP-* names.
+    assert_eq!(p.status, 418);
+    assert_eq!(p.headers.get("x-ap-decision").unwrap(), "denied");
+    assert_eq!(p.headers.get("x-ap-other").unwrap(), "kept");
+    assert_eq!(p.headers.get("x-plain").unwrap(), "yes");
+    assert_eq!(&b[..], b"short and stout");
+    // The request: one, with the same method, target, body and headers except the stripped ones.
+    let recs = mock.recorded();
+    assert_eq!(recs.len(), 1);
+    let r = &recs[0];
+    assert_eq!(r.method, "POST");
+    assert!(
+        r.uri.ends_with("/hold/teapot?a=1&b=%2Fz"),
+        "target changed: {}",
+        r.uri
+    );
+    assert_eq!(&r.body[..], body.as_bytes());
+    assert_eq!(
+        header_values(r, "authorization"),
+        [format!("Bot {SENTINEL}").as_bytes()]
+    );
+    assert_eq!(header_values(r, "x-dup"), [&b"one"[..], &b"two"[..]]);
+    assert_eq!(header_values(r, "x-keep"), [&b"kept"[..]]);
+    assert_eq!(
+        header_values(r, "content-type"),
+        [&b"application/json; charset=utf-8"[..]]
+    );
+    assert_eq!(
+        header_values(r, "content-length"),
+        [body.len().to_string().as_bytes()]
+    );
+    for gone in [
+        "x-ap-caller-key",
+        "expect",
+        "forwarded",
+        "x-forwarded-for",
+        "via",
+        "cf-ray",
+        "tailscale-user-login",
+        "cookie",
+        "proxy-authorization",
+        "x-api-key",
+        "x-secret-hop",
+    ] {
+        assert!(header_values(r, gone).is_empty(), "{gone} reached upstream");
+    }
+    t.assert_clean();
+}
+
+#[tokio::test]
+async fn caller_key_is_stripped_in_both_forms() {
+    let mock = Mock::start().await;
+    let t = Ht::new("keystrip", &mock.up).await;
+    let by_header = t.post("/discord/hold/a", r#"{"k":"header"}"#);
+    let (p, _) = t.approved(by_header).await;
+    assert_eq!(p.status, 200);
+    let by_path = Request::builder()
+        .method("POST")
+        .uri(format!("/ap/{}/discord/hold/b", t.key))
+        .header("host", AUTH)
+        .header("authorization", format!("Bot {SENTINEL}"))
+        .header("content-type", "application/json")
+        .header("content-length", "2")
+        .body(Body::from("{}"))
+        .unwrap();
+    let (p, _) = t.approved(by_path).await;
+    assert_eq!(p.status, 200);
+    let recs = mock.recorded();
+    assert_eq!(recs.len(), 2);
+    for r in &recs {
+        assert!(header_values(r, "x-ap-caller-key").is_empty());
+        assert!(
+            !r.uri.contains("/ap/") && !r.uri.contains(&t.key),
+            "{}",
+            r.uri
+        );
+        for (_, v) in &r.headers {
+            assert!(!String::from_utf8_lossy(v).contains(&t.key));
+        }
+    }
+    assert!(recs[1].uri.ends_with("/hold/b"));
+    t.assert_clean();
+}
+
+#[tokio::test]
+async fn an_empty_body_is_still_forwarded_and_confirmed() {
+    let mock = Mock::start().await;
+    let t = Ht::new("empty", &mock.up).await;
+    let (p, _) = t.approved(t.post("/discord/hold/ok", "")).await;
+    assert_eq!(p.status, 200);
+    let recs = mock.recorded();
+    assert_eq!(recs.len(), 1);
+    assert!(recs[0].body.is_empty());
+    // Chunked, because hyper never polls the body of a zero-length request, which would skip
+    // milestone 1.
+    assert_eq!(
+        header_values(&recs[0], "transfer-encoding"),
+        [&b"chunked"[..]]
+    );
+    assert!(header_values(&recs[0], "content-length").is_empty());
+    assert_eq!(
+        t.transitions(),
+        ["held", "approved", "forward_started", "completed"]
+    );
+}
+
+// ---------------------------------------------------------------- 4, 5, 23
+
+#[tokio::test]
+async fn deny_sends_nothing_and_a_cooldown_follows() {
+    let mock = Mock::start().await;
+    let mut o = Opts::default();
+    o.limits.cooldown = Duration::from_secs(30);
+    let t = Ht::with("deny", &mock.up, o).await;
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    assert_eq!(t.app.hold.deny(&id, "alice"), DenyResult::Denied);
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 423);
+    assert_eq!(decision(&p), "denied");
+    assert_eq!(code(&b), "human_denied");
+    assert_eq!(mock.hits(), 0);
+    assert_eq!(t.transitions(), ["held", "denied"]);
+    let denied = t
+        .lines()
+        .into_iter()
+        .find(|v| v["transition"] == "denied")
+        .unwrap();
+    assert_eq!(denied["approver"], "alice");
+    // The slot is free, and the identity is in cooldown.
+    assert_eq!(t.app.hold.pending_len(), 0);
+    let (p, b) = t.send(t.post("/discord/hold/ok", "{}")).await.unwrap();
+    assert_eq!(
+        (p.status.as_u16(), decision(&p), code(&b)),
+        (503, "unavailable".into(), "cooldown".into())
+    );
+    // Approving the denied entry changes nothing.
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::AlreadyDecided
+    );
+    assert_eq!(mock.hits(), 0);
+}
+
+#[tokio::test]
+async fn a_zero_cooldown_lets_the_next_request_be_held_at_once() {
+    let mock = Mock::start().await;
+    let t = Ht::new("nocool", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    t.app.hold.deny(&id, "alice");
+    h.await.unwrap().unwrap();
+    let h2 = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id2 = t.held(2).await;
+    assert_eq!(t.app.hold.state(&id2), Some(State::Pending));
+    t.app.hold.deny(&id2, "alice");
+    h2.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn expiry_answers_410_without_retry_after_and_sends_nothing() {
+    let mock = Mock::start().await;
+    let mut o = Opts::default();
+    o.limits.hold = Duration::from_millis(400);
+    o.limits.cooldown = Duration::from_secs(30);
+    let t = Ht::with("expire", &mock.up, o).await;
+    let start = Instant::now();
+    let (p, b) = t.send(t.post("/discord/hold/ok", "{}")).await.unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(350));
+    assert_eq!(p.status, 410);
+    assert_eq!(decision(&p), "expired");
+    assert_eq!(code(&b), "expired");
+    assert!(p.headers.get("retry-after").is_none());
+    assert_eq!(mock.hits(), 0);
+    assert_eq!(t.transitions(), ["held", "expired"]);
+    let id = t.held(1).await;
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Expired
+    );
+    // An expiry starts the cooldown.
+    let (p, b) = t.send(t.post("/discord/hold/ok", "{}")).await.unwrap();
+    assert_eq!((p.status.as_u16(), code(&b)), (503, "cooldown".into()));
+}
+
+// ---------------------------------------------------------------- 6, 14, 20
+
+#[tokio::test]
+async fn caps_and_unavailable_rows_send_nothing() {
+    let mock = Mock::start().await;
+    let mut o = Opts::default();
+    o.limits.max_per_identity = 1;
+    o.limits.max_total = 2;
+    let t = Ht::with("caps", &mock.up, o).await;
+    let a1 = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    t.held(1).await;
+    // A second distinct request from the same identity: per-identity cap.
+    let (p, b) = t
+        .send(t.post("/discord/hold/ok", r#"{"n":2}"#))
+        .await
+        .unwrap();
+    assert_eq!(
+        (p.status.as_u16(), decision(&p), code(&b)),
+        (503, "unavailable".into(), "identity_cap".into())
+    );
+    // Another identity is accepted.
+    let b1 = t.spawn(t.post_other("/discord/hold/ok", r#"{"n":3}"#));
+    t.held(2).await;
+    assert_eq!(t.app.hold.pending_len(), 2);
+    // Policy file removed: 503 policy_unavailable.
+    std::fs::remove_file(&t.policy).unwrap();
+    let (p, b) = t
+        .send(t.post("/discord/hold/ok", r#"{"n":4}"#))
+        .await
+        .unwrap();
+    assert_eq!(
+        (p.status.as_u16(), decision(&p), code(&b)),
+        (503, "unavailable".into(), "policy_unavailable".into())
+    );
+    // Shutdown answers every Pending entry 503 shutdown.
+    assert_eq!(t.app.hold.drain_pending(), 2);
+    for h in [a1, b1] {
+        let (p, b) = h.await.unwrap().unwrap();
+        assert_eq!(
+            (p.status.as_u16(), decision(&p), code(&b)),
+            (503, "unavailable".into(), "shutdown".into())
+        );
+    }
+    assert_eq!(mock.hits(), 0);
+    t.assert_clean();
+}
+
+#[tokio::test]
+async fn a_full_table_refuses_and_a_reload_drop_answers_503() {
+    let mock = Mock::start().await;
+    let mut o = Opts::default();
+    o.limits.max_total = 2;
+    let t = Ht::with("full", &mock.up, o).await;
+    let a = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let b = t.spawn(t.post("/discord/hold/ok", r#"{"n":2}"#));
+    t.held(2).await;
+    let (p, body) = t
+        .send(t.post_other("/discord/hold/ok", r#"{"n":3}"#))
+        .await
+        .unwrap();
+    assert_eq!(
+        (p.status.as_u16(), decision(&p), code(&body)),
+        (503, "unavailable".into(), "table_full".into())
+    );
+    assert_eq!(t.app.hold.drop_all(), 2);
+    for h in [a, b] {
+        let (p, body) = h.await.unwrap().unwrap();
+        assert_eq!(
+            (p.status.as_u16(), decision(&p), code(&body)),
+            (503, "unavailable".into(), "dropped_on_reload".into())
+        );
+    }
+    assert_eq!(t.count("dropped_on_reload"), 2);
+    assert_eq!(mock.hits(), 0);
+}
+
+#[tokio::test]
+async fn an_identical_retry_supersedes_and_one_approval_makes_one_request() {
+    let mock = Mock::start().await;
+    let t = Ht::new("supersede", &mock.up).await;
+    let first = t.spawn(t.post("/discord/hold/ok", r#"{"same":true}"#));
+    let id1 = t.held(1).await;
+    // Ten rapid identical retries leave one entry.
+    let mut retries = Vec::new();
+    for n in 2..=11 {
+        retries.push(t.spawn(t.post("/discord/hold/ok", r#"{"same":true}"#)));
+        t.held(n).await;
+    }
+    assert_eq!(t.app.hold.pending_len(), 1);
+    let (p, b) = first.await.unwrap().unwrap();
+    assert_eq!(
+        (p.status.as_u16(), decision(&p), code(&b)),
+        (503, "unavailable".into(), "superseded".into())
+    );
+    let newest = t.held(11).await;
+    assert!(matches!(
+        t.app.hold.approve(&id1, "alice").await,
+        ApproveResult::Superseded { newest: n } if n == newest
+    ));
+    // A changed Authorization is a different request with its own entry.
+    let other = t.spawn(
+        Request::builder()
+            .method("POST")
+            .uri("/discord/hold/ok")
+            .header("host", AUTH)
+            .header("x-ap-caller-key", t.key.as_str())
+            .header("authorization", "Bot something-else")
+            .header("content-type", "application/json")
+            .header("content-length", 13)
+            .body(Body::from(r#"{"same":true}"#))
+            .unwrap(),
+    );
+    t.held(12).await;
+    assert_eq!(t.app.hold.pending_len(), 2);
+    assert_eq!(
+        t.app.hold.approve(&newest, "alice").await,
+        ApproveResult::Success
+    );
+    let last = retries.pop().unwrap();
+    assert_eq!(last.await.unwrap().unwrap().0.status, 200);
+    for r in retries {
+        let (p, _) = r.await.unwrap().unwrap();
+        assert_eq!(p.status, 503);
+    }
+    assert_eq!(mock.recorded().len(), 1);
+    assert_eq!(t.count("superseded"), 10);
+    t.app.hold.deny(&t.held(12).await, "alice");
+    other.await.unwrap().unwrap();
+}
+
+// ---------------------------------------------------------------- 8
+
+#[tokio::test]
+async fn disconnect_before_approve_frees_the_slot_and_approve_says_gone() {
+    let mock = Mock::start().await;
+    let t = Ht::new("gone", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    h.abort();
+    until("abandoned", || {
+        t.app.hold.state(&id) == Some(State::Abandoned)
+    })
+    .await;
+    assert_eq!(t.app.hold.pending_len(), 0);
+    assert_eq!(t.app.hold.approve(&id, "alice").await, ApproveResult::Gone);
+    assert_eq!(t.count("abandoned"), 1);
+    assert_eq!(t.count("abandoned_after_approve"), 0);
+    assert_eq!(mock.hits(), 0);
+}
+
+#[tokio::test]
+async fn disconnect_after_approve_before_the_send_sends_nothing() {
+    let mock = Mock::start().await;
+    let t = Ht::new("abandoned-after", &mock.up).await;
+    let gate = Gate::new();
+    t.app.pause.set_after_approve(Arc::clone(&gate));
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    let table = Arc::clone(&t.app.hold);
+    let approve = tokio::spawn(async move { table.approve(&id, "alice").await });
+    gate.arrived().await;
+    h.abort();
+    assert_eq!(approve.await.unwrap(), ApproveResult::ApprovedButAbandoned);
+    until("abandoned_after_approve", || {
+        t.count("abandoned_after_approve") == 1
+    })
+    .await;
+    assert_eq!(t.count("forward_started"), 0);
+    assert_eq!(t.count("abandoned"), 0);
+    assert_eq!(mock.hits(), 0);
+}
+
+// ---------------------------------------------------------------- 15
+
+#[tokio::test]
+async fn body_rules_refuse_before_anything_is_held_or_sent() {
+    let mock = Mock::start().await;
+    let t = Ht::new("rules", &mock.up).await;
+    let big = "x".repeat(3000);
+    let mk = |f: &dyn Fn(http::request::Builder) -> http::request::Builder, body: String| {
+        f(Request::builder()
+            .method("POST")
+            .uri("/discord/hold/ok")
+            .header("host", AUTH)
+            .header("x-ap-caller-key", t.key.as_str())
+            .header("content-length", body.len()))
+        .body(Body::from(body))
+        .unwrap()
+    };
+    let json = |b: http::request::Builder| {
+        b.header("content-type", "application/json")
+            .header("authorization", "Bot t")
+    };
+    let cases: Vec<(&str, Request<Body>, u16, &str)> = vec![
+        ("over cap", mk(&json, big.clone()), 413, "body_too_large"),
+        (
+            "compressed",
+            mk(&|b| json(b).header("content-encoding", "gzip"), "{}".into()),
+            400,
+            "content_encoding",
+        ),
+        (
+            "no authorization",
+            mk(
+                &|b| b.header("content-type", "application/json"),
+                "{}".into(),
+            ),
+            400,
+            "credential_missing",
+        ),
+        (
+            "multipart in cap",
+            mk(
+                &|b| {
+                    b.header("content-type", "multipart/form-data; boundary=x")
+                        .header("authorization", "Bot t")
+                },
+                "--x--".into(),
+            ),
+            400,
+            "content_type",
+        ),
+        (
+            "multipart over cap",
+            mk(
+                &|b| {
+                    b.header("content-type", "multipart/form-data; boundary=x")
+                        .header("authorization", "Bot t")
+                },
+                big.clone(),
+            ),
+            400,
+            "content_type",
+        ),
+        (
+            "no content type",
+            mk(&|b| b.header("authorization", "Bot t"), "{}".into()),
+            400,
+            "content_type",
+        ),
+        (
+            "text/plain",
+            mk(
+                &|b| {
+                    b.header("content-type", "text/plain")
+                        .header("authorization", "Bot t")
+                },
+                "{}".into(),
+            ),
+            400,
+            "content_type",
+        ),
+    ];
+    for (name, req, status, c) in cases {
+        let (p, b) = t.send(req).await.unwrap();
+        assert_eq!(p.status.as_u16(), status, "{name}");
+        assert_eq!(decision(&p), "denied", "{name}");
+        assert_eq!(code(&b), c, "{name}");
+    }
+    // An undeclared (chunked) body over the cap.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(4);
+    tx.send(Ok(Bytes::from(vec![b'x'; 3000]))).await.unwrap();
+    drop(tx);
+    let chunked = Body::from_stream(futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx)));
+    let req = t
+        .builder(&t.key, "POST", "/discord/hold/ok")
+        .header("content-type", "application/json")
+        .header("transfer-encoding", "chunked")
+        .body(chunked)
+        .unwrap();
+    let (p, b) = t.send(req).await.unwrap();
+    assert_eq!(
+        (p.status.as_u16(), code(&b)),
+        (413, "body_too_large".into())
+    );
+    assert_eq!(mock.hits(), 0);
+    assert_eq!(t.app.hold.pending_len(), 0);
+    assert!(t.held_ids().is_empty());
+}
+
+#[tokio::test]
+async fn a_stalled_held_body_is_503_and_not_held() {
+    let mock = Mock::start().await;
+    let t = Ht::new("stall-body", &mock.up).await;
+    let (_tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(4);
+    let stalled = Body::from_stream(futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx)));
+    let req = t
+        .builder(&t.key, "POST", "/discord/hold/ok")
+        .header("content-type", "application/json")
+        .header("transfer-encoding", "chunked")
+        .body(stalled)
+        .unwrap();
+    let (p, b) = t.send(req).await.unwrap();
+    assert_eq!(
+        (p.status.as_u16(), decision(&p), code(&b)),
+        (503, "unavailable".into(), "body_read_timeout".into())
+    );
+    assert!(t.held_ids().is_empty());
+}
+
+// ---------------------------------------------------------------- 17
+
+async fn failed_connect(t: &Ht, mock_hits: &dyn Fn() -> usize) {
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::ConnectFailed
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(
+        (p.status.as_u16(), decision(&p), code(&b)),
+        (503, "unavailable".into(), "connect_failed".into())
+    );
+    assert_eq!(t.transitions(), ["held", "approved", "connect_failed"]);
+    assert_eq!(mock_hits(), 0);
+}
+
+#[tokio::test]
+async fn a_refused_connection_is_connect_failed_with_no_forward_started() {
+    let mock = Mock::start().await;
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let o = Opts {
+        port: Some(dead),
+        ..Opts::default()
+    };
+    let t = Ht::with("refused", &mock.up, o).await;
+    failed_connect(&t, &|| mock.hits()).await;
+}
+
+#[tokio::test]
+async fn a_failed_tls_handshake_is_connect_failed_with_no_forward_started() {
+    // Accepts the TCP connection and closes it, so the handshake fails.
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let a = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((s, _)) = l.accept().await {
+            a.fetch_add(1, Ordering::SeqCst);
+            drop(s);
+        }
+    });
+    let mock = Mock::start().await;
+    let o = Opts {
+        port: Some(port),
+        ..Opts::default()
+    };
+    let t = Ht::with("tls-fail", &mock.up, o).await;
+    failed_connect(&t, &|| 0).await;
+    assert!(accepted.load(Ordering::SeqCst) >= 1);
+}
+
+#[tokio::test]
+async fn a_reset_after_forward_started_closes_the_caller_with_no_completed() {
+    let mock = Mock::start().await;
+    let t = Ht::new("reset", &mock.up).await;
+    for (n, path) in [
+        "/discord/hold/reset-after-read",
+        "/discord/hold/reset-before-read",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let h = t.spawn(t.post(path, "{}"));
+        let id = t.held(n + 1).await;
+        assert_eq!(
+            t.app.hold.approve(&id, "alice").await,
+            ApproveResult::Success
+        );
+        assert!(
+            h.await.unwrap().is_err(),
+            "{path}: connection must close without an answer"
+        );
+    }
+    assert_eq!(t.count("forward_started"), 2);
+    assert_eq!(t.count("completed"), 0);
+}
+
+// ---------------------------------------------------------------- 25
+
+#[tokio::test]
+async fn approved_requests_are_closed_at_the_idle_and_total_deadlines() {
+    let mock = Mock::start().await;
+    let o = Opts {
+        extra: "request_deadline_secs = 2\nupstream_idle_secs = 1".into(),
+        ..Opts::default()
+    };
+    let t = Ht::with("deadlines", &mock.up, o).await;
+
+    // No byte for upstream_idle_secs after the head: the body ends in an error.
+    let start = Instant::now();
+    let n = t.held_ids().len() + 1;
+    let h = t.spawn(t.post("/discord/hold/stall-body", "{}"));
+    let id = t.held(n).await;
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Success
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 200);
+    assert_eq!(&b[..], b"", "body is cut when it errors");
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_millis(1900),
+        "{took:?}"
+    );
+
+    // A trickle never idles, so the total deadline closes it.
+    let start = Instant::now();
+    let n = t.held_ids().len() + 1;
+    let h = t.spawn(t.post("/discord/hold/trickle", "{}"));
+    let id = t.held(n).await;
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Success
+    );
+    h.await.unwrap().unwrap();
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(1800) && took < Duration::from_millis(3200),
+        "{took:?}"
+    );
+
+    // No answer at all: the total deadline, counted from forward_started, closes the caller.
+    let start = Instant::now();
+    let n = t.held_ids().len() + 1;
+    let h = t.spawn(t.post("/discord/hold/stall", "{}"));
+    let id = t.held(n).await;
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Success
+    );
+    assert!(h.await.unwrap().is_err());
+    let took = start.elapsed();
+    assert!(
+        took >= Duration::from_millis(1800) && took < Duration::from_millis(3200),
+        "{took:?}"
+    );
+    // Reset and timeouts after forward_started write no `completed`.
+    assert_eq!(t.count("forward_started"), 3);
+    assert_eq!(t.count("completed"), 0);
+}
+
+// ---------------------------------------------------------------- 29
+
+#[tokio::test]
+async fn a_failing_sink_before_the_hold_refuses_the_write_and_lets_reads_pass() {
+    let mock = Mock::start().await;
+    let sw = Switch::default();
+    let o = Opts {
+        sink: Some(sw.clone()),
+        ..Opts::default()
+    };
+    let t = Ht::with("sink-before", &mock.up, o).await;
+    sw.fail_all.store(true, Ordering::SeqCst);
+    let (p, b) = t.send(t.post("/discord/hold/ok", "{}")).await.unwrap();
+    assert_eq!(
+        (p.status.as_u16(), decision(&p), code(&b)),
+        (503, "unavailable".into(), "audit_unavailable".into())
+    );
+    assert_eq!(t.app.hold.pending_len(), 0);
+    assert_eq!(mock.hits(), 0);
+    // An allowed read still passes with the sink down.
+    let (p, _) = t
+        .send(
+            t.builder(&t.key, "GET", "/discord/api/x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(p.status, 200);
+    // And a refusal for the failure did not start a cooldown.
+    sw.fail_all.store(false, Ordering::SeqCst);
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    t.held(1).await;
+    t.app.hold.drain_pending();
+    h.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_failing_sink_between_approve_and_send_sends_nothing() {
+    let raw = Raw::start().await;
+    let sw = Switch::default();
+    let mut o = Opts {
+        sink: Some(sw.clone()),
+        ..Opts::default()
+    };
+    o.limits.cooldown = Duration::from_secs(30);
+    let t = Ht::with("sink-between", &raw.up, o).await;
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    *sw.fail_on.lock().unwrap() = Some("\"forward_started\"".into());
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::AuditUnavailable
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(
+        (p.status.as_u16(), decision(&p), code(&b)),
+        (503, "unavailable".into(), "audit_unavailable".into())
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        raw.bytes.load(Ordering::SeqCst),
+        0,
+        "request bytes reached the upstream"
+    );
+    assert_eq!(t.count("forward_started"), 0);
+    // A sink failure is not the identity's doing: no cooldown.
+    *sw.fail_on.lock().unwrap() = None;
+    let h2 = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id2 = t.held(2).await;
+    assert_eq!(t.app.hold.state(&id2), Some(State::Pending));
+    t.app.hold.deny(&id2, "alice");
+    h2.await.unwrap().unwrap();
+}
+
+// ---------------------------------------------------------------- 18, 19 (direct), 24
+
+async fn raw_exchange(addr: SocketAddr, head: String, body_len: usize) -> String {
+    let c = TcpStream::connect(addr).await.unwrap();
+    let (mut r, mut w) = c.into_split();
+    let writer = tokio::spawn(async move {
+        w.write_all(head.as_bytes()).await.unwrap();
+        let chunk = vec![b'a'; 16 * 1024];
+        let mut left = body_len;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            if w.write_all(&chunk[..n]).await.is_err() {
+                break;
+            }
+            left -= n;
+        }
+        w
+    });
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), r.read(&mut buf)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.windows(4).any(|w| w == b"\r\n\r\n")
+                    && String::from_utf8_lossy(&out).contains("\"code\"")
+                {
+                    break;
+                }
+            }
+            Ok(Err(_)) => break,
+        }
+    }
+    let _ = writer.await;
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test]
+async fn a_denied_one_mebibyte_post_gets_a_readable_423() {
+    let mock = Mock::start().await;
+    let o = Opts {
+        held_body_max: 1024 * 1024,
+        ..Opts::default()
+    };
+    let t = Ht::with("big-denied", &mock.up, o).await;
+    let addr = t.serve().await;
+    let len = 1024 * 1024;
+    // No grant for this path, and a hold route refused on content type.
+    for (path, ctype, want_status, want_code) in [
+        ("/discord/nogrant/x", "application/json", "423", "no_grant"),
+        ("/discord/hold/ok", "text/plain", "400", "content_type"),
+    ] {
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {AUTH}\r\nx-ap-caller-key: {}\r\nauthorization: Bot t\r\ncontent-type: {ctype}\r\ncontent-length: {len}\r\n\r\n",
+            t.key
+        );
+        let out = raw_exchange(addr, head, len).await;
+        assert!(
+            out.starts_with(&format!("HTTP/1.1 {want_status}")),
+            "{path}: {out:?}"
+        );
+        assert!(out.contains(want_code), "{path}: {out:?}");
+    }
+    assert_eq!(mock.hits(), 0);
+}
+
+#[tokio::test]
+async fn expect_continue_refusals_skip_the_drain() {
+    let mock = Mock::start().await;
+    // The drain would wait `body_read_secs` (1 s in this fixture) for a body that never comes.
+    let t = Ht::new("expect", &mock.up).await;
+    let addr = t.serve().await;
+    let head = format!(
+        "POST /discord/nogrant/x HTTP/1.1\r\nHost: {AUTH}\r\nx-ap-caller-key: {}\r\nauthorization: Bot t\r\ncontent-type: application/json\r\ncontent-length: 1048576\r\nexpect: 100-continue\r\n\r\n",
+        t.key
+    );
+    let start = Instant::now();
+    // No body follows the head: the client waits for `100 Continue`, which never comes.
+    let out = raw_exchange(addr, head, 0).await;
+    assert!(out.starts_with("HTTP/1.1 423"), "{out:?}");
+    assert!(
+        start.elapsed() < Duration::from_millis(800),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[cfg(not(feature = "stage1-probe"))]
+#[tokio::test]
+async fn the_probe_route_does_not_exist_without_the_feature() {
+    let mock = Mock::start().await;
+    let o = Opts {
+        tail: "\n[probe]\nenabled = true\n".into(),
+        ..Opts::default()
+    };
+    let t = Ht::with("no-probe", &mock.up, o).await;
+    let (p, b) = t
+        .send(
+            t.builder(&t.key, "GET", "/__ap_probe/sleep/1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (p.status.as_u16(), decision(&p), code(&b)),
+        (423, "denied".into(), "route_unknown".into())
+    );
+    assert_eq!(mock.hits(), 0);
+}
+
+#[tokio::test]
+async fn webhook_path_tokens_are_redacted_in_every_hold_record() {
+    let mock = Mock::start().await;
+    let t = Ht::new("tokens", &mock.up).await;
+    let path = format!("/discord/webhooks/1/{PATH_TOKEN}");
+    let (p, _) = t.approved(t.post(&path, "{}")).await;
+    assert_eq!(p.status, 200);
+    assert!(
+        mock.recorded()[0].uri.contains(PATH_TOKEN),
+        "the upstream still gets the token"
+    );
+    assert!(t.text().contains("<redacted>"));
+    t.assert_clean();
+}

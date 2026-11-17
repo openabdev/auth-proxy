@@ -11,6 +11,7 @@ pub mod hold;
 pub mod listener;
 #[cfg(feature = "matrix-upstream")]
 pub mod matrix_hooks;
+pub mod notify;
 pub mod passthrough;
 pub mod pipeline;
 mod policy_store;
@@ -229,6 +230,13 @@ async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
             return 1;
         }
     };
+    let held_client = match forward::held_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("auth-proxy: cannot build the upstream client: {e}");
+            return 1;
+        }
+    };
     let listen = cfg.listen.proxy;
     let listener = match listener::bind_loopback(listen).await {
         Ok(l) => l,
@@ -243,7 +251,13 @@ async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
         Some(l) => eprintln!("auth-proxy: panic at {}:{}", l.file(), l.line()),
         None => eprintln!("auth-proxy: panic"),
     }));
-    let app = passthrough::PtApp::new(opts.config.clone(), cfg, AuditSink::stdout(), client);
+    let app = passthrough::PtApp::with_held_client(
+        opts.config.clone(),
+        cfg,
+        AuditSink::stdout(),
+        client,
+        held_client,
+    );
     let limits = listener::public::PublicLimits {
         max_connections: pt.max_connections,
         header_read: std::time::Duration::from_secs(pt.header_read_secs),

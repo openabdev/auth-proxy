@@ -396,11 +396,19 @@ impl Table {
         self.drop_where(|_| true, || Decision::Shutdown)
     }
 
-    /// An approved request asks to start its forward (design 3.7). Shutdown and this claim take
-    /// the same lock, so a request either claims before `drain_pending` and runs to its end, or
-    /// finds the table closed and sends nothing.
-    pub fn claim_start(&self) -> bool {
-        !self.lock().closed
+    /// An approved request asks to start its forward (design 3.7). The closed check and `f`, the
+    /// `forward_started` write, run under the table lock that `drain_pending` takes to close the
+    /// table, so shutdown either comes before the claim (`Ok(false)`, nothing is written) or
+    /// after the whole claim (`Ok(true)`), never between the check and the write. `f` must not
+    /// call back into the table.
+    pub fn claim_start<E>(&self, f: impl FnOnce() -> Result<(), E>) -> Result<bool, E> {
+        let g = self.lock();
+        if g.closed {
+            return Ok(false);
+        }
+        f()?;
+        drop(g);
+        Ok(true)
     }
 
     /// The `Pending` entries in admission order, as the approval API may show them.

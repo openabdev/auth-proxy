@@ -77,6 +77,7 @@ impl Gate {
 pub struct Pause {
     after_approve: Mutex<Option<Arc<Gate>>>,
     between_milestones: Mutex<Option<Arc<Gate>>>,
+    in_claim: Mutex<Option<Arc<Gate>>>,
     after_approve_ms: AtomicU64,
 }
 
@@ -102,6 +103,21 @@ impl Pause {
     pub fn set_between_milestones(&self, gate: Arc<Gate>) {
         if let Ok(mut g) = self.between_milestones.lock() {
             *g = Some(gate);
+        }
+    }
+
+    /// Hold the handler inside the start claim: after the table-closed check, before the
+    /// `forward_started` write. The wait blocks the polling thread and the table lock.
+    pub fn set_in_claim(&self, gate: Arc<Gate>) {
+        if let Ok(mut g) = self.in_claim.lock() {
+            *g = Some(gate);
+        }
+    }
+
+    pub(super) fn in_claim(&self) {
+        let gate = self.in_claim.lock().ok().and_then(|g| g.clone());
+        if let Some(g) = gate {
+            g.pass_blocking();
         }
     }
 

@@ -303,27 +303,37 @@ impl Stream for HeldBody {
         if this.first {
             this.first = false;
             // Shutdown (design 3.7): only a request that claims its start before the drain runs
-            // on. Otherwise nothing is sent and no `forward_started` is written.
-            if !this.app.hold.claim_start() {
-                this.failed = true;
-                this.shutdown.store(true, Ordering::SeqCst);
-                if let Some(c) = take_confirm(&this.confirm) {
-                    c.send(Confirm::Abandoned);
-                }
-                return Poll::Ready(Some(Err(io::Error::other("shutdown"))));
-            }
-            // Milestone 1: the connection exists and no request byte has been flushed. The record
-            // must reach the sink first; if it cannot, the body fails and nothing is sent.
+            // on, and the claim includes the `forward_started` write. Milestone 1: the connection
+            // exists and no request byte has been flushed. The record must reach the sink first;
+            // if it cannot, the body fails and nothing is sent.
             let rec = this
                 .ctx
                 .rec(&this.id, &this.digest, "forward_started", None, None, None);
-            if this.app.audit.try_write_hold(&rec).is_err() {
-                this.failed = true;
-                this.audit_failed.store(true, Ordering::SeqCst);
-                if let Some(c) = take_confirm(&this.confirm) {
-                    c.send(Confirm::AuditUnavailable);
+            let audit = &this.app.audit;
+            let app = &this.app;
+            let claim = app.hold.claim_start(|| {
+                #[cfg(any(test, feature = "matrix-upstream"))]
+                app.pause.in_claim();
+                audit.try_write_hold(&rec)
+            });
+            match claim {
+                Ok(true) => {}
+                Ok(false) => {
+                    this.failed = true;
+                    this.shutdown.store(true, Ordering::SeqCst);
+                    if let Some(c) = take_confirm(&this.confirm) {
+                        c.send(Confirm::Abandoned);
+                    }
+                    return Poll::Ready(Some(Err(io::Error::other("shutdown"))));
                 }
-                return Poll::Ready(Some(Err(io::Error::other("audit write failed"))));
+                Err(_) => {
+                    this.failed = true;
+                    this.audit_failed.store(true, Ordering::SeqCst);
+                    if let Some(c) = take_confirm(&this.confirm) {
+                        c.send(Confirm::AuditUnavailable);
+                    }
+                    return Poll::Ready(Some(Err(io::Error::other("audit write failed"))));
+                }
             }
             this.started.set();
             #[cfg(any(test, feature = "matrix-upstream"))]
@@ -356,14 +366,14 @@ fn json_content_type(h: &HeaderMap) -> bool {
 }
 
 fn identity_encoding(h: &HeaderMap) -> bool {
-    h.get_all(header::CONTENT_ENCODING).iter().all(|v| {
-        v.to_str().is_ok_and(|s| {
-            s.split(',').all(|t| {
-                let t = t.trim();
-                t.is_empty() || t.eq_ignore_ascii_case("identity")
-            })
-        })
-    })
+    let mut it = h.get_all(header::CONTENT_ENCODING).iter();
+    match (it.next(), it.next()) {
+        (None, _) => true,
+        (Some(v), None) => v
+            .to_str()
+            .is_ok_and(|s| s.trim().eq_ignore_ascii_case("identity")),
+        _ => false,
+    }
 }
 
 /// The final answer for a refusal that already has its transition record: evidence line, status,

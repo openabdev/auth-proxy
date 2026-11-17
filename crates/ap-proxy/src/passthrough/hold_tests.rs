@@ -986,6 +986,46 @@ async fn an_identical_retry_supersedes_and_one_approval_makes_one_request() {
     other.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn a_changed_ordinary_header_is_a_distinct_entry_with_its_own_notification() {
+    let mock = Mock::start().await;
+    let n = MockNotifier::new(false);
+    let o = Opts {
+        notifier: Some(Arc::clone(&n)),
+        ..Opts::default()
+    };
+    let t = Ht::with("distinct-header", &mock.up, o).await;
+    let mk = |note: &str| {
+        t.builder(&t.key, "POST", "/discord/hold/ok")
+            .header("content-type", "application/json")
+            .header("content-length", 2)
+            .header("x-note", note)
+            .body(Body::from("{}"))
+            .unwrap()
+    };
+    let a = t.spawn(mk("one"));
+    let id_a = t.held(1).await;
+    let b = t.spawn(mk("two"));
+    let id_b = t.held(2).await;
+    calls_reach(&n, 2).await;
+    assert_ne!(id_a, id_b);
+    assert_eq!(t.app.hold.pending_len(), 2, "no supersede");
+    assert_eq!(t.count("superseded"), 0);
+    // Independent decisions: deny one, approve the other.
+    t.app.hold.deny(&id_a, "alice");
+    let (pa, _) = a.await.unwrap().unwrap();
+    assert_eq!(pa.status, 423);
+    assert_eq!(t.app.hold.state(&id_b), Some(State::Pending));
+    assert_eq!(
+        t.app.hold.approve(&id_b, "alice").await,
+        ApproveResult::Success
+    );
+    let (pb, _) = b.await.unwrap().unwrap();
+    assert_eq!(pb.status, 200);
+    assert_eq!(mock.recorded().len(), 1);
+    assert_eq!(n.calls().len(), 2);
+}
+
 // ---------------------------------------------------------------- 8
 
 #[tokio::test]
@@ -1056,6 +1096,40 @@ async fn shutdown_between_approve_and_the_send_sends_nothing() {
     t.assert_clean();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_racing_the_start_claim_cannot_split_claim_and_forward_started() {
+    let mock = Mock::start().await;
+    let t = Ht::new("shutdown-in-claim", &mock.up).await;
+    let gate = Gate::new();
+    t.app.pause.set_in_claim(Arc::clone(&gate));
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    let table = Arc::clone(&t.app.hold);
+    let approve = tokio::spawn(async move { table.approve(&id, "alice").await });
+    tokio::time::timeout(Duration::from_secs(5), gate.arrived())
+        .await
+        .expect("handler is inside the claim, after the closure check");
+    // The drain starts while the claim is open; it must wait for the claim and its
+    // `forward_started` write rather than run between them.
+    let table = Arc::clone(&t.app.hold);
+    let drain = std::thread::spawn(move || table.drain_pending());
+    // A plain thread sleep: the claim holds the table lock and may pin runtime workers.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!drain.is_finished(), "the drain ran inside the claim");
+    gate.release();
+    let (p, _) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 200);
+    assert_eq!(approve.await.unwrap(), ApproveResult::Success);
+    assert_eq!(drain.join().unwrap(), 0);
+    // The claim won as a whole: forward_started is written before the table closed, and the
+    // request completed.
+    assert_eq!(t.count("forward_started"), 1);
+    assert_eq!(mock.recorded().len(), 1);
+    // After the drain the table is closed: a later claim sends nothing.
+    assert!(!t.app.hold.claim_start(|| Ok::<(), ()>(())).unwrap_or(true));
+    t.assert_clean();
+}
+
 // ---------------------------------------------------------------- 15
 
 #[tokio::test]
@@ -1082,6 +1156,34 @@ async fn body_rules_refuse_before_anything_is_held_or_sent() {
         (
             "compressed",
             mk(&|b| json(b).header("content-encoding", "gzip"), "{}".into()),
+            400,
+            "content_encoding",
+        ),
+        (
+            "empty encoding element",
+            mk(&|b| json(b).header("content-encoding", ","), "{}".into()),
+            400,
+            "content_encoding",
+        ),
+        (
+            "repeated identity",
+            mk(
+                &|b| json(b).header("content-encoding", "identity,,identity"),
+                "{}".into(),
+            ),
+            400,
+            "content_encoding",
+        ),
+        (
+            "duplicate encoding header",
+            mk(
+                &|b| {
+                    json(b)
+                        .header("content-encoding", "identity")
+                        .header("content-encoding", "identity")
+                },
+                "{}".into(),
+            ),
             400,
             "content_encoding",
         ),

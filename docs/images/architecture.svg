@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 796" width="1200" height="796" role="img" aria-labelledby="t d">
+  <title id="t">auth-proxy architecture</title>
+  <desc id="d">An agent process in a pod holds only a caller key and a surrogate credential. Its requests go through auth-proxy, which swaps in the real credential from a proxy-only Secret mount and forwards to model and API providers. A separate CONNECT-only ap-egress handles other egress under an allowlist. The agent registers and revokes surrogates through the runtime over a Unix socket, and the runtime registers them with auth-proxy over a session plane using a signed hello. Per-UID netfilter rules confine the agent to loopback, and auth-proxy refuses to serve while the netcheck and netprobe checks fail. A note below describes the standalone passthrough mode used for Muse.</desc>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/>
+    </marker>
+    <style>
+      .bg{fill:#ffffff}
+      .h1{font:700 30px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#0f172a}
+      .sub{font:400 17px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#475569}
+      .lbl{font:600 18px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#0f172a}
+      .sm{font:400 14px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#334155}
+      .xs{font:500 13px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#475569}
+      .cap{font:600 13px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#1e3a8a}
+      .card{fill:#f8fafc;stroke:#cbd5e1;stroke-width:1.5}
+      .agent{fill:#fef3c7;stroke:#f59e0b;stroke-width:1.5}
+      .ap{fill:#e0e7ff;stroke:#4f46e5;stroke-width:2}
+      .pc{fill:#ecfdf5;stroke:#10b981;stroke-width:1.5}
+      .pod{fill:none;stroke:#94a3b8;stroke-width:2;stroke-dasharray:8 6}
+      .line{stroke:#475569;stroke-width:2;fill:none}
+      .sess{stroke:#2563eb;stroke-width:2.5;fill:none;stroke-dasharray:6 4}
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1200" height="796" rx="18"/>
+  <text class="h1" x="40" y="58">auth-proxy</text>
+  <text class="sub" x="40" y="88">The agent never holds a real credential. The proxy swaps one in on the way out.</text>
+
+  <!-- pod boundary -->
+  <rect class="pod" x="20" y="108" width="765" height="572" rx="22"/>
+  <text class="xs" x="40" y="132">one pod</text>
+
+  <!-- Runtime -->
+  <rect class="card" x="50" y="160" width="230" height="100" rx="12"/>
+  <text class="lbl" x="70" y="192">Runtime</text>
+  <text class="sm" x="70" y="216">ap-runtime-shim, no network</text>
+  <text class="sm" x="70" y="238">holds the hello proof</text>
+
+  <!-- Agent -->
+  <rect class="agent" x="50" y="330" width="230" height="100" rx="12"/>
+  <text class="lbl" x="70" y="362">Agent process</text>
+  <text class="sm" x="70" y="386">holds a caller key + surrogate</text>
+  <text class="sm" x="70" y="408">no real credential</text>
+
+  <!-- auth-proxy -->
+  <rect class="ap" x="440" y="160" width="330" height="240" rx="14"/>
+  <text class="lbl" x="462" y="194">auth-proxy</text>
+  <text class="sm" x="462" y="218">checks caller key + surrogate, then</text>
+  <text class="sm" x="462" y="238">swaps in the real credential</text>
+  <rect class="card" x="462" y="300" width="286" height="76" rx="8"/>
+  <text class="sm" x="478" y="324">broker (in the proxy process)</text>
+  <text class="xs" x="478" y="346">real credentials live in a Secret</text>
+  <text class="xs" x="478" y="364">mounted for the proxy only</text>
+
+  <!-- ap-egress -->
+  <rect class="pc" x="440" y="470" width="330" height="100" rx="12"/>
+  <text class="lbl" x="462" y="502">ap-egress</text>
+  <text class="sm" x="462" y="526">CONNECT only, no credentials</text>
+  <text class="sm" x="462" y="548">destination allowlist</text>
+
+  <!-- Outside -->
+  <rect class="card" x="900" y="190" width="260" height="100" rx="12"/>
+  <text class="lbl" x="920" y="222">Model / API providers</text>
+  <text class="sm" x="920" y="246">receive the real credential</text>
+  <rect class="card" x="900" y="470" width="260" height="100" rx="12"/>
+  <text class="lbl" x="920" y="502">git, registries</text>
+  <text class="sm" x="920" y="526">allowlisted destinations</text>
+
+  <!-- runtime -> auth-proxy (session plane) -->
+  <path class="sess" d="M280,210 L438,210" marker-end="url(#ahb)"/>
+  <text class="cap" x="296" y="194">session plane</text>
+  <text class="cap" x="288" y="234">signed hello, register</text>
+  <!-- agent -> runtime -->
+  <path class="line" d="M165,328 L165,262" marker-end="url(#ah)"/>
+  <text class="cap" x="177" y="290">runtime.sock: register,</text>
+  <text class="cap" x="177" y="308">revoke, status</text>
+  <!-- agent -> auth-proxy -->
+  <path class="line" d="M280,380 L438,380" marker-end="url(#ah)"/>
+  <text class="cap" x="296" y="364">loopback :18080</text>
+  <!-- auth-proxy -> providers -->
+  <path class="line" d="M770,240 L898,240" marker-end="url(#ah)"/>
+  <text class="cap" x="796" y="222">real credential</text>
+  <text class="cap" x="826" y="262">TLS</text>
+  <!-- agent -> egress -->
+  <path class="line" d="M165,430 L165,520 L438,520" marker-end="url(#ah)"/>
+  <text class="cap" x="240" y="508">CONNECT :18081</text>
+  <!-- egress -> git -->
+  <path class="line" d="M770,520 L898,520" marker-end="url(#ah)"/>
+  <text class="cap" x="800" y="508">allowed only</text>
+
+  <!-- netfilter self-check -->
+  <rect class="card" x="50" y="596" width="720" height="82" rx="12"/>
+  <text class="lbl" x="70" y="628">netinit, netcheck, netprobe</text>
+  <text class="sm" x="70" y="650">per-UID iptables keep the agent on loopback 18080 and 18081.</text>
+  <text class="sm" x="70" y="666">The proxy answers 503 while the rules check fails.</text>
+
+  <!-- standalone passthrough note -->
+  <rect class="card" x="20" y="696" width="1160" height="76" rx="12"/>
+  <text class="lbl" x="40" y="724">Standalone passthrough (Muse, stage 1)</text>
+  <text class="sm" x="40" y="748">No runtime, no surrogate. The caller key is a header or a /ap/&lt;key&gt;/&lt;route&gt;/ path prefix. The caller's own Authorization</text>
+  <text class="sm" x="40" y="766">passes through and the gate only allows or denies. Writes get 423 no_grant.</text>
+</svg>

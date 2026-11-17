@@ -3,9 +3,38 @@
 //! The snapshot answers one question: may this identity make this request on this route?
 //! Reloading is the caller's job (ap-proxy stats the file and swaps in a new snapshot).
 
-use crate::config::{Config, Grant, Route};
+use crate::config::{Config, Decision, Grant, Route};
 use crate::error::Code;
 use std::collections::HashMap;
+
+/// What a matching grant does with a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Allow,
+    Hold,
+}
+
+/// Whole-path segment match. A `*` pattern segment matches exactly one non-empty path segment;
+/// every other segment must be equal. The segment counts must match, so a trailing `/` or a
+/// longer path never matches.
+fn pattern_matches(pattern: &str, path: &str) -> bool {
+    let (Some(pat), Some(path)) = (pattern.strip_prefix('/'), path.strip_prefix('/')) else {
+        return false;
+    };
+    let mut p = pat.split('/');
+    let mut s = path.split('/');
+    loop {
+        match (p.next(), s.next()) {
+            (None, None) => return true,
+            (Some(a), Some(b)) => {
+                if b.is_empty() || (a != "*" && a != b) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -34,6 +63,38 @@ impl Snapshot {
     /// The route with this name, if the snapshot has one.
     pub fn route(&self, name: &str) -> Option<&Route> {
         self.routes.get(name)
+    }
+
+    /// Passthrough decision: `Hold` when a hold grant matches (hold beats allow), `Allow` when
+    /// only allow grants match. A grant matches on a `paths` prefix or a `path_patterns` entry
+    /// matched against the whole path. Errors follow `evaluate`: `policy_empty` without grants,
+    /// `policy_denied` when none matches. `evaluate` itself is unchanged.
+    pub fn evaluate_verdict(
+        &self,
+        identity: &str,
+        route: &str,
+        method: &str,
+        path: &str,
+    ) -> Result<Verdict, Code> {
+        let grants = match self.grants.get(identity) {
+            Some(g) if !g.is_empty() => g,
+            _ => return Err(Code::PolicyEmpty),
+        };
+        let mut verdict = None;
+        for g in grants {
+            let hit = g.route == route
+                && g.methods.iter().any(|m| m == method)
+                && (g.paths.iter().any(|p| path.starts_with(p.as_str()))
+                    || g.path_patterns.iter().any(|p| pattern_matches(p, path)));
+            if !hit {
+                continue;
+            }
+            match g.decision {
+                Decision::Hold => return Ok(Verdict::Hold),
+                Decision::Allow => verdict = Some(Verdict::Allow),
+            }
+        }
+        verdict.ok_or(Code::PolicyDenied)
     }
 
     /// Decide whether `identity` may send `method` `path` to `route`.
@@ -184,6 +245,91 @@ mod tests {
         );
         assert_eq!(
             s.evaluate(ID, RT, "POST", "/v10", &[TARGET]),
+            Err(Code::PolicyDenied)
+        );
+    }
+
+    fn pt(grants: &str) -> Snapshot {
+        let text = format!(
+            "version = 1\n[listen]\nproxy = \"127.0.0.1:8443\"\n[passthrough]\npublic_authority = \"gate.example.test\"\n[[identity]]\nname = \"muse\"\ncaller_key_sha256 = \"{IDLE_KEY}\"\n[[route]]\nname = \"discord\"\nhost = \"discord.com\"\nmode = \"passthrough\"\n{grants}"
+        );
+        Snapshot::from_config(&load(&text).expect("valid"))
+    }
+
+    const HOLD: &str = "[[grant]]\nidentity = \"muse\"\nroute = \"discord\"\ndecision = \"hold\"\nmethods = [\"POST\"]\npath_patterns = [\"/api/v10/channels/*/messages\"]\n";
+    const ALLOW: &str = "[[grant]]\nidentity = \"muse\"\nroute = \"discord\"\nmethods = [\"GET\", \"POST\"]\npaths = [\"/api/v10/channels/\"]\n";
+
+    #[test]
+    fn verdict_hold_matches_whole_path_only() {
+        let s = pt(HOLD);
+        let v = |m, p| s.evaluate_verdict("muse", "discord", m, p);
+        assert_eq!(v("POST", "/api/v10/channels/1/messages"), Ok(Verdict::Hold));
+        assert_eq!(
+            v("POST", "/api/v10/channels/1/messages/2/reactions"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            v("POST", "/api/v10/channels/1/messages/"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            v("POST", "/api/v10/channels//messages"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            v("POST", "/api/v10/channels/1/2/messages"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            v("GET", "/api/v10/channels/1/messages"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            s.evaluate_verdict("muse", "other", "POST", "/api/v10/channels/1/messages"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            s.evaluate_verdict("nobody", "discord", "POST", "/api/v10/channels/1/messages"),
+            Err(Code::PolicyEmpty)
+        );
+    }
+
+    #[test]
+    fn verdict_hold_beats_allow_in_either_grant_order() {
+        let path = "/api/v10/channels/1/messages";
+        for text in [format!("{ALLOW}{HOLD}"), format!("{HOLD}{ALLOW}")] {
+            let s = pt(&text);
+            assert_eq!(
+                s.evaluate_verdict("muse", "discord", "POST", path),
+                Ok(Verdict::Hold)
+            );
+            assert_eq!(
+                s.evaluate_verdict("muse", "discord", "GET", path),
+                Ok(Verdict::Allow)
+            );
+            assert_eq!(
+                s.evaluate_verdict(
+                    "muse",
+                    "discord",
+                    "POST",
+                    "/api/v10/channels/1/messages/2/reactions"
+                ),
+                Ok(Verdict::Allow)
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_ignores_path_patterns() {
+        let s = pt(HOLD);
+        assert_eq!(
+            s.evaluate(
+                "muse",
+                "discord",
+                "POST",
+                "/api/v10/channels/1/messages",
+                &[]
+            ),
             Err(Code::PolicyDenied)
         );
     }

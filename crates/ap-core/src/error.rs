@@ -35,6 +35,19 @@ pub enum Code {
     ConnectFailed,
     ProbeParams,
     CallerKeyAmbiguous,
+    // Held passthrough routes (stage 2).
+    HumanDenied,
+    Expired,
+    ContentType,
+    ContentEncoding,
+    CredentialMissing,
+    TableFull,
+    IdentityCap,
+    Cooldown,
+    Superseded,
+    Shutdown,
+    DroppedOnReload,
+    AuditUnavailable,
 }
 
 impl Code {
@@ -69,6 +82,18 @@ impl Code {
             Code::ConnectFailed => "upstream connection failed",
             Code::ProbeParams => "probe parameters are not allowed",
             Code::CallerKeyAmbiguous => "caller key given in more than one place",
+            Code::HumanDenied => "a person denied this request",
+            Code::Expired => "no decision arrived in time",
+            Code::ContentType => "content type is not allowed on this route",
+            Code::ContentEncoding => "content encoding is not allowed on this route",
+            Code::CredentialMissing => "no Authorization header on a held route",
+            Code::TableFull => "too many requests are waiting for approval",
+            Code::IdentityCap => "too many requests from this caller are waiting for approval",
+            Code::Cooldown => "this caller is in a cooldown after a denial",
+            Code::Superseded => "a newer identical request replaced this one",
+            Code::Shutdown => "the gate is shutting down",
+            Code::DroppedOnReload => "policy changed while the request was waiting",
+            Code::AuditUnavailable => "the audit log is unavailable",
         }
     }
 
@@ -82,7 +107,10 @@ impl Code {
             | Code::FramingRefused
             | Code::AuthorizationDuplicate
             | Code::ProbeParams
-            | Code::CallerKeyAmbiguous => 400,
+            | Code::CallerKeyAmbiguous
+            | Code::ContentType
+            | Code::ContentEncoding
+            | Code::CredentialMissing => 400,
             Code::CallerRejected
             | Code::SurrogateMissing
             | Code::SurrogateMalformed
@@ -93,16 +121,25 @@ impl Code {
             | Code::SurrogateWrongRoute
             | Code::PolicyEmpty
             | Code::PolicyDenied
-            | Code::NoGrant => 403,
+            | Code::NoGrant
+            | Code::HumanDenied => 403,
             Code::RouteUnknown => 404,
             Code::ConnectRefused => 405,
+            Code::Expired => 410,
             Code::BodyTooLarge => 413,
             Code::WebsocketUnsupported => 501,
             Code::UpstreamUnavailable => 502,
             Code::PolicyUnavailable
             | Code::BrokerUnavailable
             | Code::BodyReadTimeout
-            | Code::ConnectFailed => 503,
+            | Code::ConnectFailed
+            | Code::TableFull
+            | Code::IdentityCap
+            | Code::Cooldown
+            | Code::Superseded
+            | Code::Shutdown
+            | Code::DroppedOnReload
+            | Code::AuditUnavailable => 503,
         }
     }
 
@@ -137,6 +174,18 @@ impl Code {
             Code::ConnectFailed => "connect_failed",
             Code::ProbeParams => "probe_params",
             Code::CallerKeyAmbiguous => "caller_key_ambiguous",
+            Code::HumanDenied => "human_denied",
+            Code::Expired => "expired",
+            Code::ContentType => "content_type",
+            Code::ContentEncoding => "content_encoding",
+            Code::CredentialMissing => "credential_missing",
+            Code::TableFull => "table_full",
+            Code::IdentityCap => "identity_cap",
+            Code::Cooldown => "cooldown",
+            Code::Superseded => "superseded",
+            Code::Shutdown => "shutdown",
+            Code::DroppedOnReload => "dropped_on_reload",
+            Code::AuditUnavailable => "audit_unavailable",
         }
     }
 }
@@ -256,6 +305,18 @@ mod tests {
             Code::ConnectFailed,
             Code::ProbeParams,
             Code::CallerKeyAmbiguous,
+            Code::HumanDenied,
+            Code::Expired,
+            Code::ContentType,
+            Code::ContentEncoding,
+            Code::CredentialMissing,
+            Code::TableFull,
+            Code::IdentityCap,
+            Code::Cooldown,
+            Code::Superseded,
+            Code::Shutdown,
+            Code::DroppedOnReload,
+            Code::AuditUnavailable,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in all {
@@ -266,6 +327,6 @@ mod tests {
             );
             assert!(seen.insert(s), "duplicate {s}");
         }
-        assert_eq!(seen.len(), 28);
+        assert_eq!(seen.len(), 40);
     }
 }

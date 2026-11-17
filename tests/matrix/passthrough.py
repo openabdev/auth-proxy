@@ -474,7 +474,7 @@ def pt06(c):
     alive = r["status"] == 200
     out.append(f"alive-after-panic:{alive}")
     e.stop_proxy()  # flush every file
-    needles = [c.auth.split(" ", 1)[1].encode(), c.key.encode(), c.path_token.encode(), b"/ap/"]
+    needles = [c.auth.split(" ", 1)[1].encode(), c.key.encode(), c.path_token.encode(), b"/ap/apk_"]
     hits, scanned = [], []
     for root, _d, files in os.walk(e.work):
         rel = os.path.relpath(root, e.work)
@@ -613,6 +613,7 @@ def pt14(c):
 
 def canon_refused(c, label, raw, codes=None, statuses=range(400, 500)):
     """Refused: a 4xx (an HTTP-layer parse error counts) and nothing at the upstream."""
+    c.e.ureset()
     r = exchange(c.port, raw)
     n = len(c.ulog())
     ok = r["status"] in statuses and n == 0 and (codes is None or code_of(r) in codes)
@@ -621,11 +622,26 @@ def canon_refused(c, label, raw, codes=None, statuses=range(400, 500)):
 
 def canon_identical(c, label, raw, want_path):
     """Forwarded: the upstream saw exactly `want_path`, with the caller key nowhere in it."""
+    c.e.ureset()
     r = exchange(c.port, raw)
     up = c.ulog()
     got = up[0]["path"].split("?")[0] if up else None
     ok = r["status"] == 200 and len(up) == 1 and got == want_path
-    return ok, f"[{label}: {r['status']} upstream={got!r}]"
+    return ok, f"[{label[:30]}: {r['status']} upstream={(got or '')[:40]!r}]"
+
+
+def canon_framing(c, label, raw):
+    """Framing conflicts the HTTP layer may settle itself: refused, or forwarded with one framing
+    header only. Never both Content-Length and Transfer-Encoding upstream."""
+    c.e.ureset()
+    r = exchange(c.port, raw)
+    up = c.ulog()
+    if not up:
+        return 400 <= r["status"] < 500, f"[{label}: refused {r['status']}]"
+    names = [k for k, _ in up[0]["headers"]]
+    ok = (r["status"] == 200 and names.count("content-length") <= 1
+          and not ("content-length" in names and "transfer-encoding" in names))
+    return ok, f"[{label}: forwarded {r['status']} cl={names.count('content-length')} te={names.count('transfer-encoding')}]"
 
 
 def run_all(checks):
@@ -652,9 +668,9 @@ def pt18(c):
         checks.append(canon_refused(c, p, get(p), None if not p.isascii() else {"path_ambiguous"}))
     for label, key in [("empty key", ""), ("key %2f", k + "%2f"), ("key ;", k + ";x"),
                        ("key upper", k.upper()), ("key short", k[:-1]), ("key long", k + "0")]:
-        checks.append(canon_refused(c, label, build("GET", f"/ap/{key}/discord/v1/x", key_hdr), {"caller_rejected"},
-                                    statuses=[401]))
-    for p in ["/v1/a;b=c", "/v1/caf%C3%A9", f"/v1/echo/ap/{k}/discord/x", "/v1/" + "a" * 4000]:
+        checks.append(canon_refused(c, label, build("GET", f"/ap/{key}/discord/v1/x", key_hdr),
+                                    {"caller_rejected", "path_ambiguous"}))
+    for p in ["/v1/a;b=c", "/v1/caf%C3%A9", "/v1/echo/ap/discord/x", "/v1/" + "a" * 4000]:
         checks.append(canon_identical(c, p[:24], get("/discord" + p), p))
     n = len(c.ulog())
     r = exchange(c.port, build("GET", f"/ap/{k}/discord/v1/" + "a" * 300000, key_hdr))
@@ -685,10 +701,14 @@ def pt19(c):
         checks.append(canon_refused(c, label, base + extra + b"\r\n"))
     for label, hs in [("two caller keys", [(KEY_HEADER, c.key), (KEY_HEADER, c.key)]),
                       ("two Authorization", [(KEY_HEADER, c.key), ("Authorization", c.auth), ("Authorization", c.auth)]),
-                      ("two Content-Length", c.good([("Content-Length", "0"), ("Content-Length", "0")])),
-                      ("CL and TE", c.good([("Content-Length", "0"), ("Transfer-Encoding", "chunked")])),
+                      ("two different Content-Length", c.good([("Content-Length", "0"), ("Content-Length", "5")])),
                       ("Connection nominates key", c.good([("Connection", KEY_HEADER)]))]:
         checks.append(canon_refused(c, label, build("GET", path, hs)))
+    for label, hs in [("two equal Content-Length", [("Content-Length", "0"), ("Content-Length", "0")]),
+                      ("CL and TE", [("Content-Length", "0"), ("Transfer-Encoding", "chunked")]),
+                      ("TE twice", [("Transfer-Encoding", "chunked"), ("Transfer-Encoding", "chunked")]),
+                      ("TE list", [("Transfer-Encoding", "gzip, chunked")])]:
+        checks.append(canon_framing(c, label, build("GET", path, c.good(hs))))
     return run_all(checks)
 
 

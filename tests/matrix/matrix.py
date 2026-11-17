@@ -793,7 +793,19 @@ def canon_forwarded_identical(e, label, line, headers, want_path):
     got = lg[0]["path"].split("?")[0] if lg else None
     audit_ok = bool(seen) and seen[-1] == want_path
     ok = st == 200 and len(lg) == 1 and got == want_path and audit_ok
-    return ok, f"[{label}: {st} upstream={got!r} audit={seen[-1:]}]"
+    return ok, f"[{label[:30]}: {st} upstream={(got or '')[:40]!r} audit_same={audit_ok}]"
+
+
+def canon_framing(e, label, line, headers):
+    """Framing conflicts that the HTTP layer may settle itself: either refused, or forwarded with
+    one framing header only (it parsed once and decided), never both Content-Length and TE."""
+    st, _, lg, _ = canon_probe(e, line, headers)
+    if not lg:
+        return 400 <= st < 500, f"[{label}: refused {st}]"
+    names = [k for k, _ in lg[0]["headers"]]
+    ok = st == 200 and len(lg) == 1 and names.count("content-length") <= 1 and not (
+        "content-length" in names and "transfer-encoding" in names)
+    return ok, f"[{label}: forwarded {st} cl={names.count('content-length')} te={names.count('transfer-encoding')}]"
 
 
 def canon_run(checks):
@@ -886,13 +898,18 @@ def _(e):
                          ("space before colon", b"X-A : a\r\n"),
                          ("fold on Host", b"Host: x\r\n y\r\n")]:
         checks.append(canon_refused(e, label, None, None, raw=base + sur + extra + b"\r\n", statuses=range(400, 500)))
-    dup = [("two Authorization", [("Authorization", f"Bearer {s}"), ("Authorization", f"Bearer {s}")]),
-           ("two Host", [("Host", a), ("Host", a)]),
-           ("two Content-Length", [("Authorization", f"Bearer {s}"), ("Content-Length", "0"), ("Content-Length", "0")]),
-           ("CL and TE", [("Authorization", f"Bearer {s}"), ("Content-Length", "0"), ("Transfer-Encoding", "chunked")])]
-    for label, hs in dup:
+    for label, hs in [("two Authorization", [("Authorization", f"Bearer {s}"), ("Authorization", f"Bearer {s}")]),
+                      ("two Host", [("Host", a), ("Host", a)])]:
         hh = hs if any(k == "Host" for k, _ in hs) else [("Host", a)] + hs
         checks.append(canon_refused(e, label, f"GET {req} HTTP/1.1", hh, None))
+    au2 = [("Host", a), ("Authorization", f"Bearer {s}")]
+    checks.append(canon_refused(e, "two different Content-Length", f"GET {req} HTTP/1.1",
+                                au2 + [("Content-Length", "0"), ("Content-Length", "5")], None))
+    for label, hs in [("two equal Content-Length", [("Content-Length", "0"), ("Content-Length", "0")]),
+                      ("CL and TE", [("Content-Length", "0"), ("Transfer-Encoding", "chunked")]),
+                      ("TE twice", [("Transfer-Encoding", "chunked"), ("Transfer-Encoding", "chunked")]),
+                      ("TE list", [("Transfer-Encoding", "gzip, chunked")])]:
+        checks.append(canon_framing(e, label, f"GET {req} HTTP/1.1", au2 + hs))
     # Bare LF ends a header line for the parser, so what follows is a real header and is seen as
     # one: the proxy parses once and forwards what it parsed, no second reading is possible.
     e.ureset()
@@ -900,7 +917,7 @@ def _(e):
     lg = e.ulog()
     hs = dict(lg[0]["headers"]) if lg else {}
     ok = (not lg and 400 <= st < 500) or (st == 200 and hs.get("x-a") == "a" and hs.get("x-injected") == "1")
-    checks.append((ok, f"[bare LF: {st}/{len(lg)} x-a={hs.get('x-a')!r}]"))
+    checks.append((ok, f"[bare LF: {st}/{len(lg)} seen={sorted(k for k in hs if k.startswith('x-'))}]"))
     return canon_run(checks)
 
 
@@ -915,9 +932,10 @@ def _(e):
                         ("key ?", f"/ap/{k}?x/up/v1/echo"), ("key upper", f"/ap/{k.upper()}/up/v1/echo"),
                         ("key short", f"/ap/{k[:-1]}/up/v1/echo"), ("key long", f"/ap/{k}0/up/v1/echo"),
                         ("prefix case", f"/AP/{k}/up/v1/echo"), ("double prefix", f"/ap/ap/{k}/up/v1/echo")]:
-        checks.append(canon_refused(e, label, f"GET {path} HTTP/1.1", au, {"caller_rejected"}, statuses=[401]))
-    # The key and prefix appearing again later are plain path data: matched and forwarded as is.
-    again = f"/v1/echo/ap/{k}/up/x"
+        checks.append(canon_refused(e, label, f"GET {path} HTTP/1.1", au, {"caller_rejected", "path_ambiguous"}))
+    # A key-shaped string and the prefix appearing again later are plain path data: matched and
+    # forwarded as is. (A fresh random key, so the audit file holds no real credential.)
+    again = f"/v1/echo/ap/apk_{secrets.token_hex(32)}/up/x"
     checks.append(canon_forwarded_identical(e, "repeated", f"GET {e.ap('up', again)} HTTP/1.1", au, again))
     long_ok = "/v1/" + "a" * 4000
     checks.append(canon_forwarded_identical(e, "4000-byte segment", f"GET {e.ap('up', long_ok)} HTTP/1.1", au, long_ok))

@@ -38,11 +38,14 @@ pub fn canonical_host(h: &str) -> Result<(), &'static str> {
             return Err("bad label (userinfo, port, trailing dot or non-LDH)");
         }
     }
-    // An all-numeric last label is an IPv4 spelling the IpAddr parser misses (127.1, 0x7f.0.0.1).
-    if labels
-        .last()
-        .is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()))
-    {
+    // A last label that is all digits, or `0x` and hex digits, is an IPv4 spelling the IpAddr
+    // parser misses (127.1, 0x7f.0.0.1, 127.0.0.0x1). The WHATWG URL parser, and inet_aton
+    // behind getaddrinfo, read every one of them as an address. Uppercase `0X` never gets here.
+    if labels.last().is_some_and(|l| {
+        l.bytes().all(|b| b.is_ascii_digit())
+            || l.strip_prefix("0x")
+                .is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+    }) {
         return Err("numeric TLD (IPv4 spelling)");
     }
     Ok(())
@@ -94,9 +97,12 @@ pub fn check_origin_form(
 
 /// True when the raw, still-encoded path could be read two ways.
 ///
-/// Flags `..` and `.` segments, empty interior segments (`//`), `%2e` and `%2f`
-/// in any case, `%5c`, `%00`, backslash, and `%25` followed by `2e` or `2f`
-/// (double encoding).
+/// Flags `..` and `.` segments (also with a `;` parameter, as in `..;x`, which a servlet
+/// container reads as `..`), empty interior segments (`//`), `%2e` and `%2f` in any case, `%5c`,
+/// `%00`, backslash, double encoding of any of those (`%252f`, `%255c`, `%2500`, `%25%32%66`, up
+/// to three layers), and bytes the forwarder would percent-encode (non-ASCII, controls, space,
+/// DEL, `"`, `<`, `>`, backtick, `{`, `}`), because for those the path that was matched would
+/// not be the path that is sent.
 pub fn path_ambiguous(p: &str) -> bool {
     let lower = p.to_ascii_lowercase();
     if ["%2e", "%2f", "%5c", "%00"]
@@ -106,16 +112,57 @@ pub fn path_ambiguous(p: &str) -> bool {
     {
         return true;
     }
+    if p.bytes()
+        .any(|b| b <= 0x20 || b >= 0x7f || b"\"<>`{}".contains(&b))
+    {
+        return true;
+    }
     if lower.match_indices("%25").any(|(i, _)| {
         let rest = &lower[i + 3..];
         rest.starts_with("2e") || rest.starts_with("2f")
-    }) {
+    }) || encodes_separator_in_layers(lower.as_bytes())
+    {
         return true;
     }
     let segs: Vec<&str> = p.split('/').skip(1).collect();
-    segs.iter()
-        .enumerate()
-        .any(|(i, s)| *s == "." || *s == ".." || (s.is_empty() && i + 1 != segs.len()))
+    segs.iter().enumerate().any(|(i, s)| {
+        let name = s.split(';').next().unwrap_or_default();
+        name == "." || name == ".." || (s.is_empty() && i + 1 != segs.len())
+    })
+}
+
+/// True when percent-decoding `lower` (already ASCII-lowercased) one to three times exposes
+/// `%2e`, `%2f`, `%5c` or `%00`: a second or third decoder would then read a dot, slash,
+/// backslash or NUL that the first layer hid.
+fn encodes_separator_in_layers(lower: &[u8]) -> bool {
+    let mut cur = lower.to_vec();
+    for _ in 0..3 {
+        let mut out = Vec::with_capacity(cur.len());
+        let mut i = 0;
+        while i < cur.len() {
+            let hex = |b: u8| (b as char).to_digit(16);
+            if cur[i] == b'%' && i + 2 < cur.len() {
+                if let (Some(h), Some(l)) = (hex(cur[i + 1]), hex(cur[i + 2])) {
+                    out.push(u8::try_from(h * 16 + l).unwrap_or(b'%'));
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(cur[i].to_ascii_lowercase());
+            i += 1;
+        }
+        if [&b"%2e"[..], b"%2f", b"%5c", b"%00"]
+            .iter()
+            .any(|s| out.windows(s.len()).any(|w| w == *s))
+        {
+            return true;
+        }
+        if !out.contains(&b'%') {
+            return false;
+        }
+        cur = out;
+    }
+    false
 }
 
 /// The parts of a `/ap/<caller-key>/<route>/<rest>` path.

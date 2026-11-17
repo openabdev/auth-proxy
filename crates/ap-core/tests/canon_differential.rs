@@ -28,7 +28,7 @@ impl Rng {
     }
 }
 
-const SEED: u64 = 0x19_C0FF_EE_5EED;
+const SEED: u64 = 0x19C0_FFEE_5EED;
 const KEY: &str = "apk_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 const PATH_ATOMS: &[&str] = &[

@@ -67,7 +67,8 @@ pub fn check_path_against_parsers(p: &str) {
     let Ok(uri) = Uri::from_str(p) else { return };
     // The pipeline matches `uri.path()`, never the raw target.
     let path = uri.path();
-    if path_ambiguous(path) {
+    // Every route starts with `/ap/` or `/<route>`; `*` and an empty path never reach a route.
+    if !path.starts_with('/') || path_ambiguous(path) {
         return;
     }
     let Ok(url) = url::Url::parse(&format!("https://example.test{path}")) else {

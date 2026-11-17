@@ -54,7 +54,7 @@ async fn matched_path_is_the_forwarded_path() {
     let up = start_upstream().await;
     let f = Fixture::new("canon-diff", &up);
     let surrogate = register_session(&f.app, IDENTITY, "sess-1", 1);
-    let mut r = Rng(0x19_C0FF_EE_5EED);
+    let mut r = Rng(0x19C0_FFEE_5EED);
     let (mut forwarded, mut refused, mut unparsed) = (0, 0, 0);
     let mut mismatches: Vec<String> = Vec::new();
 

@@ -27,6 +27,90 @@ fn ambiguous_all(class: &str, paths: &[&str]) {
 }
 
 #[test]
+fn percent_encoded_unreserved_characters_are_refused() {
+    // RFC 3986 2.3: `%41` and `A` are the same resource. Policy matches the raw bytes and the
+    // forwarder sends them, so the spelling must not be a choice the caller gets to make.
+    for p in [
+        "/v1/%41",
+        "/v1/%61",
+        "/v1/%30",
+        "/v1/%39",
+        "/v1/%2D",
+        "/v1/%2d",
+        "/v1/%5F",
+        "/v1/%5f",
+        "/v1/%7E",
+        "/v1/%7e",
+        "/v1/%6D",
+        "/v1/%6d",
+        "/v1/%4D",
+        "/%761/x",
+        "/v1/x%79",
+        "/v1/%2541",
+        "/v1/%25256D",
+        "/v1/%2%36D",
+    ] {
+        assert!(
+            path_ambiguous_passthrough(p),
+            "escaped unreserved: {p:?} must be refused"
+        );
+        // The sidecar pipeline has no hold verdict and keeps accepting these (matrix row C1-3).
+        assert!(!path_ambiguous(p), "{p:?}");
+    }
+    // Escapes of bytes that are not unreserved stay data and pass.
+    for p in [
+        "/v1/%20",
+        "/v1/%21",
+        "/v1/%3B",
+        "/v1/%40",
+        "/v1/100%25",
+        "/v1/%25",
+    ] {
+        assert!(!path_ambiguous_passthrough(p), "{p:?} must pass");
+    }
+}
+
+#[test]
+fn caller_key_repeated_in_a_path_or_query_is_found_in_every_spelling() {
+    use ap_core::canon::echoes_caller_key;
+    let key = format!("apk_{}", "ab12".repeat(16));
+    let enc = |s: &str| -> String { s.bytes().map(|b| format!("%{b:02x}")).collect() };
+    let upper = key.to_uppercase();
+    let other = format!("apk_{}", "cd34".repeat(16));
+    let forms = [
+        format!("/hold/{key}"),
+        format!("/hold/{upper}"),
+        format!("/hold/{}", &key["apk_".len()..]),
+        format!("/hold/{}", enc(&key)),
+        format!("/hold/{}", enc(&key).to_uppercase()),
+        format!("/hold/%61pk_{}", &key["apk_".len()..]),
+        format!("/hold/{}", enc(&enc(&key))),
+        format!("/hold/{}", enc(&enc(&enc(&key)))),
+        format!("/hold/x{key}y"),
+        format!("a={key}"),
+        format!("a=b&c={}", enc(&key)),
+        format!("/hold/{other}"),
+        format!("/hold/{}", enc(&other)),
+    ];
+    for f in &forms {
+        assert!(echoes_caller_key(f, &key), "{f:?} must be found");
+    }
+    for f in [
+        "/hold/1/messages",
+        "/hold/apk_",
+        "/hold/apk_short",
+        "a=b&c=d",
+        "/hold/ab12ab12",
+        "/hold/%41%42%20",
+    ] {
+        assert!(!echoes_caller_key(f, &key), "{f:?} must not be found");
+    }
+    // Still decodable after the layer limit: fail closed.
+    let deep = format!("/%{}41", "25".repeat(12));
+    assert!(echoes_caller_key(&deep, &key));
+}
+
+#[test]
 fn path_encoding_classes_are_refused() {
     ambiguous_all(
         "double percent-encoding",

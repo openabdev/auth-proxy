@@ -1831,30 +1831,56 @@ async fn canonicalization_attack_forms_are_refused_before_a_hold_exists() {
         ..Opts::default()
     };
     let t = Ht::with("canon-hold", &mock.up, o).await;
-    // (label, request path, Host override, expected code)
+    // (label, request path). Every path would match a hold pattern if the canonical-form check
+    // let it through, so a bypass is held (the request waits) and not merely `no_grant`.
     let paths: &[(&str, &str)] = &[
         ("layered %252f", "/discord/hold/%252f"),
         ("layered %255c", "/discord/hold/%255c"),
-        ("layered %25252e", "/discord/hold/%252525252e/x"),
-        ("layered dot-dot", "/discord/hold/%25%32%45%25%32%45/x"),
+        ("layered %25252e", "/discord/hold/%252525252e/messages"),
+        (
+            "layered dot-dot",
+            "/discord/hold/%25%32%45%25%32%45/messages",
+        ),
         ("layered %2500", "/discord/hold/%2500"),
-        ("..%3b", "/discord/hold/..%3b/x"),
-        (".%3B mixed case", "/discord/hold/.%3B/x"),
-        ("..%253b layered", "/discord/hold/..%253b/x"),
-        ("mixed-case %2E%2e", "/discord/hold/%2E%2e/x"),
-        ("mixed-case %2F", "/discord/hold%2Fx"),
+        ("..%3b", "/discord/hold/..%3b/messages"),
+        (".%3B mixed case", "/discord/hold/.%3B/messages"),
+        ("..%253b layered", "/discord/hold/..%253b/messages"),
+        ("mixed-case %2E%2e", "/discord/hold/%2E%2e/messages"),
+        ("mixed-case %2F", "/discord/hold/1%2Fmessages"),
         ("mixed-case %5C", "/discord/hold/%5Cx"),
-        ("semicolon dot-dot", "/discord/hold/..;/x"),
-        ("overlong utf8", "/discord/hold/%c0%ae/x"),
+        ("semicolon dot-dot", "/discord/hold/..;/messages"),
+        ("overlong utf8", "/discord/hold/%c0%ae/messages"),
         ("%u escape", "/discord/hold/%u002e"),
+        (
+            "escaped unreserved, lower hex",
+            "/discord/hold/1/%6dessages",
+        ),
+        (
+            "escaped unreserved, upper hex",
+            "/discord/hold/1/%4Dessages",
+        ),
+        (
+            "escaped unreserved in a wildcard segment",
+            "/discord/hold/%4D",
+        ),
+        ("escaped hyphen", "/discord/hold/a%2Db/messages"),
+        ("escaped tilde", "/discord/hold/%7E/messages"),
+        ("layered escaped unreserved", "/discord/hold/1/%256Dessages"),
     ];
-    let mut forms: Vec<(String, String, Option<&str>)> = Vec::new();
+    // (label, request path, Host override, expected code)
+    let mut forms: Vec<(String, String, Option<&str>, &str)> = Vec::new();
     for (label, p) in paths {
-        forms.push((format!("header form: {label}"), (*p).to_string(), None));
+        forms.push((
+            format!("header form: {label}"),
+            (*p).to_string(),
+            None,
+            "path_ambiguous",
+        ));
         forms.push((
             format!("path form: {label}"),
             format!("/ap/{}{}", t.key, p),
             None,
+            "path_ambiguous",
         ));
     }
     for host in [
@@ -1867,35 +1893,37 @@ async fn canonicalization_attack_forms_are_refused_before_a_hold_exists() {
             format!("hex-tail IP host {host}"),
             "/discord/hold/ok".to_string(),
             Some(host),
+            "host_rejected",
         ));
     }
-    for (label, path, host) in &forms {
-        let mut b = t
-            .builder(&t.key, "POST", path)
+    for (label, path, host, want) in &forms {
+        // Path-form requests carry no key header, so the refusal can only come from the path.
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(path.as_str())
+            .header("host", AUTH)
+            .header("authorization", format!("Bot {SENTINEL}"))
             .header("content-type", "application/json")
             .header("content-length", 2);
-        if let Some(h) = host {
-            b = b.header("host", *h);
+        if !path.starts_with("/ap/") {
+            b = b.header("x-ap-caller-key", t.key.as_str());
         }
         let mut req = b.body(Body::from("{}")).unwrap();
         if let Some(h) = host {
-            // `builder` already set the public host; the attack Host must be the only one.
+            // The attack Host must be the only one.
             let hv = req.headers_mut();
             hv.remove("host");
             hv.insert("host", http::HeaderValue::from_str(h).unwrap());
         }
         let res = tokio::time::timeout(Duration::from_secs(3), t.send(req)).await;
-        let (parts, _body) = match res {
+        let (parts, body) = match res {
             Ok(Ok(r)) => r,
             // A refusal that closes the connection without a response is also not a hold.
             Ok(Err(())) => continue,
             Err(_) => panic!("{label}: the request waited, it was held or hung"),
         };
-        assert!(
-            (400..500).contains(&parts.status.as_u16()),
-            "{label}: status {}",
-            parts.status
-        );
+        assert_eq!(parts.status, 400, "{label}: status {}", parts.status);
+        assert_eq!(code(&body), *want, "{label}");
         assert_ne!(decision(&parts), "held", "{label}");
         assert_eq!(t.app.hold.pending_len(), 0, "{label}: hold table not empty");
     }
@@ -1921,4 +1949,169 @@ async fn canonicalization_attack_forms_are_refused_before_a_hold_exists() {
         up[0].uri, "/hold/ok",
         "forwarded path equals the matched path"
     );
+}
+
+/// The authenticated caller key repeated inside the route path or the query is refused before the
+/// Trail has a path, before a hold exists and before the upstream is called, on the hold route and
+/// on the allow route, in the header form and the path form, in every spelling. The key reaches
+/// no audit line, no notification, no response body and no upstream request.
+#[tokio::test]
+async fn caller_key_repeated_in_the_path_or_query_is_refused_before_anything_is_built() {
+    let mock = Mock::start().await;
+    let n = MockNotifier::new(false);
+    let o = Opts {
+        notifier: Some(Arc::clone(&n)),
+        ..Opts::default()
+    };
+    let t = Ht::with("key-echo", &mock.up, o).await;
+    let k = t.key.clone();
+    let digits = k.strip_prefix("apk_").unwrap().to_string();
+    let enc = |s: &str| -> String { s.bytes().map(|b| format!("%{b:02x}")).collect() };
+    // (label, method, route-relative path with query)
+    let rels: Vec<(String, &str, String)> = vec![
+        ("hold, exact".into(), "POST", format!("/discord/hold/{k}")),
+        (
+            "hold, upper case".into(),
+            "POST",
+            format!("/discord/hold/{}", k.to_uppercase()),
+        ),
+        (
+            "hold, digits only".into(),
+            "POST",
+            format!("/discord/hold/{digits}"),
+        ),
+        (
+            "hold, last segment of a deeper pattern".into(),
+            "POST",
+            format!("/discord/hold/1/{k}"),
+        ),
+        (
+            "hold, percent-encoded".into(),
+            "POST",
+            format!("/discord/hold/{}", enc(&k)),
+        ),
+        (
+            "hold, encoded prefix only".into(),
+            "POST",
+            format!("/discord/hold/%61pk_{digits}"),
+        ),
+        (
+            "hold, doubly encoded".into(),
+            "POST",
+            format!("/discord/hold/{}", enc(&enc(&k))),
+        ),
+        (
+            "hold, in the query".into(),
+            "POST",
+            format!("/discord/hold/ok?a={k}"),
+        ),
+        (
+            "hold, encoded in the query".into(),
+            "POST",
+            format!("/discord/hold/ok?a={}", enc(&k)),
+        ),
+        (
+            "hold, mixed case encoded in the query".into(),
+            "POST",
+            format!("/discord/hold/ok?a=%61PK%5f{}", digits.to_uppercase()),
+        ),
+        (
+            "hold, doubly encoded in the query".into(),
+            "POST",
+            format!("/discord/hold/ok?a={}", enc(&enc(&k))),
+        ),
+        ("allow, exact".into(), "GET", format!("/discord/api/{k}")),
+        (
+            "allow, encoded".into(),
+            "GET",
+            format!("/discord/api/{}", enc(&k)),
+        ),
+        (
+            "allow, in the query".into(),
+            "GET",
+            format!("/discord/api/x?token={k}"),
+        ),
+        (
+            "allow, encoded in the query".into(),
+            "GET",
+            format!("/discord/api/x?token={}", enc(&digits)),
+        ),
+    ];
+    for (label, method, rel) in &rels {
+        for path_form in [false, true] {
+            let (uri, header_key) = if path_form {
+                (format!("/ap/{k}{rel}"), false)
+            } else {
+                (rel.clone(), true)
+            };
+            let mut b = Request::builder()
+                .method(*method)
+                .uri(uri.as_str())
+                .header("host", AUTH)
+                .header("authorization", format!("Bot {SENTINEL}"));
+            if header_key {
+                b = b.header("x-ap-caller-key", k.as_str());
+            }
+            let req = if *method == "POST" {
+                b.header("content-type", "application/json")
+                    .header("content-length", 2)
+                    .body(Body::from("{}"))
+                    .unwrap()
+            } else {
+                b.body(Body::empty()).unwrap()
+            };
+            let form = if path_form {
+                "path form"
+            } else {
+                "header form"
+            };
+            let res = tokio::time::timeout(Duration::from_secs(3), t.send(req)).await;
+            let (parts, body) = match res {
+                Ok(Ok(r)) => r,
+                Ok(Err(())) => continue,
+                Err(_) => panic!("{form}: {label}: the request waited, it was held or hung"),
+            };
+            assert_eq!(parts.status, 400, "{form}: {label}");
+            let c = code(&body);
+            // An encoded copy inside the path is refused earlier, as an ambiguous path.
+            assert!(
+                c == "caller_key_ambiguous" || c == "path_ambiguous",
+                "{form}: {label}: code {c}"
+            );
+            let text = String::from_utf8_lossy(&body).to_lowercase();
+            assert!(!text.contains(&digits), "{form}: {label}: key in the body");
+            assert_eq!(t.app.hold.pending_len(), 0, "{form}: {label}");
+        }
+    }
+    // The plain forms (not encoded) must be named by the key-echo code specifically.
+    for rel in [format!("/discord/hold/{k}"), format!("/discord/api/{k}")] {
+        let method = if rel.contains("hold") { "POST" } else { "GET" };
+        let req = t
+            .builder(&t.key, method, &rel)
+            .header("content-length", 0)
+            .body(Body::empty())
+            .unwrap();
+        let (parts, body) = t.send(req).await.unwrap();
+        assert_eq!(parts.status, 400);
+        assert_eq!(code(&body), "caller_key_ambiguous", "{rel}");
+    }
+    assert_eq!(t.count("held"), 0, "a hold was recorded: {}", t.text());
+    assert_eq!(t.count("forward_started"), 0);
+    assert!(n.calls().is_empty(), "a notification was sent");
+    assert_eq!(mock.recorded().len(), 0, "the upstream saw a request");
+    t.assert_clean();
+    let lower = t.text().to_lowercase();
+    assert!(!lower.contains(&digits), "key digits in the audit: {lower}");
+    assert!(!lower.contains(&enc(&digits)), "encoded key in the audit");
+    // The same caller still holds and forwards a clean request.
+    let ok = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    calls_reach(&n, 1).await;
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Success
+    );
+    let (parts, _) = ok.await.unwrap().unwrap();
+    assert_eq!(parts.status, 200);
+    assert_eq!(mock.recorded()[0].uri, "/hold/ok");
 }

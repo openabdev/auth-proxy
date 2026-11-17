@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Rows registered in `tests/matrix/passthrough.py` that run on the build under test.
-const ROWS: usize = 27;
+const ROWS: usize = 29;
 
 /// Extra rows that run when `AP_MATRIX_NOPROBE_BIN` names a directory holding an `auth-proxy` built
 /// without `stage1-probe` (CI builds one into `target/noprobe`).

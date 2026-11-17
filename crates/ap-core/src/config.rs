@@ -879,6 +879,36 @@ impl Config {
         if self.grants.len() > MAX_GRANTS {
             return Err(invalid(format!("at most {MAX_GRANTS} grants are allowed")));
         }
+        // A hold pattern must not share a request with an allow grant of the same identity,
+        // route and method. Hold wins when both match, but a spelling of the held resource that
+        // the pattern does not claim (a trailing `/`, a path parameter) would still reach the
+        // allow grant, so the overlap is refused instead of relied on.
+        for h in self.grants.iter().filter(|g| g.decision == Decision::Hold) {
+            for a in self.grants.iter().filter(|g| {
+                g.decision == Decision::Allow
+                    && g.identity == h.identity
+                    && g.route == h.route
+                    && g.methods.iter().any(|m| h.methods.contains(m))
+            }) {
+                for hp in &h.path_patterns {
+                    let clash = a
+                        .paths
+                        .iter()
+                        .find(|p| crate::policy::prefix_overlaps_pattern(p, hp))
+                        .or_else(|| {
+                            a.path_patterns
+                                .iter()
+                                .find(|p| crate::policy::patterns_overlap(p, hp))
+                        });
+                    if let Some(ap) = clash {
+                        return Err(invalid(format!(
+                            "grant for identity {:?} on route {:?}: allow path {:?} overlaps hold pattern {:?} for the same method; an allow grant must not cover a held resource",
+                            a.identity, a.route, ap, hp
+                        )));
+                    }
+                }
+            }
+        }
         for g in &self.grants {
             if !identity_names.contains(g.identity.as_str()) {
                 return Err(invalid(format!(

@@ -416,7 +416,7 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
     ) {
         return Ok(refuse(&app, &trail, code));
     }
-    if canon::path_ambiguous(parts.uri.path()) {
+    if canon::path_ambiguous_passthrough(parts.uri.path()) {
         return Ok(refuse(&app, &trail, Code::PathAmbiguous));
     }
     // 4. Framing.
@@ -467,6 +467,14 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
     let Some(identity) = caller_identity(&policy.cfg, &key) else {
         return Ok(refuse(&app, &trail, Code::CallerRejected));
     };
+    // The key authenticates the request and goes no further. A route-relative path or query that
+    // carries it again, in any percent-encoded spelling, would be matched, held, shown to the
+    // approver, audited and sent upstream: refused here, before the Trail has a path.
+    let key_echoed = canon::echoes_caller_key(&eff_path, &key)
+        || parts
+            .uri
+            .query()
+            .is_some_and(|q| canon::echoes_caller_key(q, &key));
     drop(key);
     trail.identity.clone_from(&identity.name);
     trail.evidence = Some(Evidence::collect(
@@ -475,6 +483,16 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
         parts.version,
         &parts.headers,
     ));
+
+    // Every refusal from here on has an authenticated caller, so a body still in flight is
+    // drained (bounded) before the answer.
+    let max_body = policy.cfg.limits.max_body_bytes;
+    let declared = forward::declared_length(&parts.headers);
+    let drain = Drain::new(&parts.headers, declared, pt);
+
+    if key_echoed {
+        return Ok(refuse_unread(&app, &trail, Code::CallerKeyAmbiguous, body, &drain).await);
+    }
 
     #[cfg(feature = "matrix-upstream")]
     if eff_path == crate::matrix_hooks::PANIC_PATH {
@@ -490,12 +508,6 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
     if policy.cfg.probe.enabled && eff_path.starts_with(crate::probe::PREFIX) {
         return Ok(crate::probe::handle(&app, &trail, &parts.method, &eff_path, body, pt).await);
     }
-
-    // Every refusal from here on has an authenticated caller, so a body still in flight is
-    // drained (bounded) before the answer.
-    let max_body = policy.cfg.limits.max_body_bytes;
-    let declared = forward::declared_length(&parts.headers);
-    let drain = Drain::new(&parts.headers, declared, pt);
 
     // 6. Route name in the path, mapped by policy to a fixed host.
     let (route_name, rel) = match canon::parse_route_path(&eff_path) {

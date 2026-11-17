@@ -29,7 +29,13 @@ builds in production. `auth-proxy` exits 2 on an invalid policy, and a restart f
 | `cooldown_secs` | 60 (0 disables, max 3600) | after a deny or expiry, new holds from that identity get 503 `cooldown` |
 
 A hold grant uses `decision = "hold"` and `path_patterns` (a segment is a literal or `*`), never prefix
-`paths`, and only on a passthrough route. Hold wins over allow when both match. The held body must be
+`paths`, and only on a passthrough route. Hold wins over allow when both match, but policy load refuses an
+allow grant (prefix or pattern) of the same identity, route and method that overlaps a hold pattern, so an
+overlap is never relied on: the trailing-slash spelling of a held path is not a hold match and would otherwise
+reach the allow grant. A percent-escape of an unreserved character (`A-Z a-z 0-9 - . _ ~`, for example
+`%6D` for `m`) in the path is refused as `path_ambiguous` on the passthrough listener (the sidecar keeps accepting them),
+so the path that policy matches is the path that is sent. The query is not matched by policy, is forwarded byte for byte and is not subject to this rule. A route
+path or query that repeats the caller's own key, in any spelling, is refused as `caller_key_ambiguous`. The held body must be
 `application/json`, uncompressed, and the request must carry `Authorization`.
 
 `[approval]` (required when any grant holds): `listen` (loopback only, a port other than `listen.proxy`),

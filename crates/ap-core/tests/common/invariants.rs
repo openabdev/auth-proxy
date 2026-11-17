@@ -11,7 +11,8 @@
 
 use ap_core::canon::{
     caller_key_from_header, canonical_host, check_origin_form, framing_refused, is_caller_key,
-    parse_ap_path, parse_route_path, path_ambiguous, surrogate_from_headers,
+    parse_ap_path, parse_route_path, path_ambiguous, path_ambiguous_passthrough,
+    surrogate_from_headers,
 };
 use ap_core::error::Code;
 use http::{HeaderMap, HeaderName, HeaderValue, Uri, Version};
@@ -83,6 +84,8 @@ pub fn check_path_against_parsers(p: &str) {
 
 /// Everything about a request path that must hold for any string.
 pub fn check_path(p: &str) {
+    check_gate("POST", p);
+    check_gate("PUT", p);
     check_ap_path(p);
     check_decode_oracle(p);
     check_path_against_parsers(p);
@@ -223,15 +226,23 @@ pub fn check_origin(target: &str, hosts: &[Vec<u8>], http2: bool, expected: &str
 /// `path_ambiguous` must refuse; the reverse is not asserted because the production rule also
 /// refuses bytes the forwarder would re-encode, `%u` escapes and invalid UTF-8.
 pub fn check_decode_oracle(p: &str) {
-    if oracle_must_refuse(p) {
+    if oracle_must_refuse(p, false) {
         assert!(
             path_ambiguous(p),
             "decode oracle demands refusal but path_ambiguous accepted {p:?}"
         );
     }
+    if oracle_must_refuse(p, true) {
+        assert!(
+            path_ambiguous_passthrough(p),
+            "decode oracle demands refusal but path_ambiguous_passthrough accepted {p:?}"
+        );
+    }
 }
 
-fn oracle_must_refuse(p: &str) -> bool {
+/// `strict` adds the passthrough rule: an unreserved byte spelled as an escape names the same
+/// resource as its plain form (RFC 3986 6.2.2.2), so match form and forward form would differ.
+fn oracle_must_refuse(p: &str, strict: bool) -> bool {
     // (byte, depth that produced it; 0 = literal)
     let mut layer: Vec<(u8, usize)> = p.bytes().map(|b| (b, 0)).collect();
     for depth in 1..=4 {
@@ -251,7 +262,12 @@ fn oracle_must_refuse(p: &str) -> bool {
                 .flatten();
             match esc {
                 Some(b) => {
-                    if matches!(b, 0 | b'.' | b'/' | b'\\') || b < 0x20 || b == 0x7f {
+                    if matches!(b, 0 | b'.' | b'/' | b'\\')
+                        || b < 0x20
+                        || b == 0x7f
+                        || (strict
+                            && (b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'~')))
+                    {
                         return true;
                     }
                     if b == b';' && depth >= 2 {
@@ -286,4 +302,237 @@ fn has_dot_segment(layer: &[(u8, usize)]) -> bool {
     text.split('/')
         .skip(1)
         .any(|seg| matches!(seg.split(';').next(), Some(".") | Some("..")))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hold-gate oracle
+//
+// An RFC 3986 normaliser that shares no code with `canon.rs` or `policy.rs` computes the "same
+// resource" form of a request path. If that form matches a hold pattern, the gate (the path
+// canonicalization refusal, then the policy verdict) must hold the request or refuse it. It must
+// never forward it unheld. Two policies are checked: the shipped shape, where the loader keeps
+// allow grants disjoint from hold patterns, and an engine-only shape where an allow prefix `/`
+// covers everything, which isolates what the matcher and canonicalization guarantee by
+// themselves.
+// ---------------------------------------------------------------------------------------------
+
+use ap_core::config::{load, Decision};
+use ap_core::policy::{Snapshot, Verdict};
+use std::sync::OnceLock;
+
+const HOLD_PATTERNS: &[&str] = &[
+    "/hold/*/messages",
+    "/api/v10/channels/*/messages",
+    "/*/pin",
+    "/hold/pin/last",
+    "/webhooks/*/*",
+];
+
+const GATE_KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+fn gate_policy_text() -> String {
+    let pats: Vec<String> = HOLD_PATTERNS.iter().map(|p| format!("\"{p}\"")).collect();
+    format!(
+        "version = 1\n[listen]\nproxy = \"127.0.0.1:8443\"\n[passthrough]\npublic_authority = \"gate.example.test\"\n\
+         [[identity]]\nname = \"muse\"\ncaller_key_sha256 = \"{GATE_KEY}\"\n\
+         [[route]]\nname = \"discord\"\nhost = \"discord.com\"\nmode = \"passthrough\"\n\
+         [[grant]]\nidentity = \"muse\"\nroute = \"discord\"\ndecision = \"hold\"\nmethods = [\"POST\", \"PUT\"]\npath_patterns = [{}]\n\
+         [[grant]]\nidentity = \"muse\"\nroute = \"discord\"\nmethods = [\"GET\"]\npaths = [\"/\"]\n\
+         [[grant]]\nidentity = \"muse\"\nroute = \"discord\"\nmethods = [\"POST\", \"PUT\"]\npaths = [\"/other/x/\"]\n",
+        pats.join(", ")
+    )
+}
+
+/// (shipped shape, engine-only shape with an allow prefix `/` over the held methods).
+fn gate_policies() -> &'static (Snapshot, Snapshot) {
+    static P: OnceLock<(Snapshot, Snapshot)> = OnceLock::new();
+    P.get_or_init(|| {
+        let mut cfg = load(&gate_policy_text()).expect("gate policy loads");
+        let shipped = Snapshot::from_config(&cfg);
+        for g in cfg
+            .grants
+            .iter_mut()
+            .filter(|g| g.decision == Decision::Allow)
+        {
+            g.methods = vec!["GET".into(), "POST".into(), "PUT".into()];
+            g.paths = vec!["/".into()];
+        }
+        (shipped, Snapshot::from_config(&cfg))
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Gate {
+    Refused,
+    Held,
+    Allowed,
+    Denied,
+}
+
+fn gate(snap: &Snapshot, method: &str, path: &str) -> Gate {
+    if path_ambiguous_passthrough(path) {
+        return Gate::Refused;
+    }
+    match snap.evaluate_verdict("muse", "discord", method, path) {
+        Ok(Verdict::Hold) => Gate::Held,
+        Ok(Verdict::Allow) => Gate::Allowed,
+        Err(_) => Gate::Denied,
+    }
+}
+
+/// RFC 3986 normaliser, written from the RFC alone: decode escapes of unreserved characters
+/// (and `%25`, so layered spellings collapse the way a double-decoding hop would read them) to
+/// a fixed point, upper-case the hex of the escapes that remain, remove dot segments, collapse
+/// empty segments and drop a trailing slash. Returns the path segments.
+pub fn rfc3986_segments(path: &str) -> Vec<String> {
+    fn escape_at(b: &[u8], i: usize) -> Option<u8> {
+        let h = |j: usize| b.get(j).and_then(|c| (*c as char).to_digit(16));
+        if b.get(i) != Some(&b'%') {
+            return None;
+        }
+        Some((h(i + 1)? * 16 + h(i + 2)?) as u8)
+    }
+    let mut cur: Vec<u8> = path.bytes().collect();
+    for _ in 0..16 {
+        let mut out = Vec::with_capacity(cur.len());
+        let mut i = 0;
+        let mut changed = false;
+        while i < cur.len() {
+            match escape_at(&cur, i) {
+                Some(b)
+                    if b.is_ascii_alphanumeric()
+                        || matches!(b, b'-' | b'.' | b'_' | b'~' | b'%') =>
+                {
+                    out.push(b);
+                    i += 3;
+                    changed = true;
+                }
+                _ => {
+                    out.push(cur[i]);
+                    i += 1;
+                }
+            }
+        }
+        cur = out;
+        if !changed {
+            break;
+        }
+    }
+    // Upper-case the hex digits of the escapes that are left.
+    let mut i = 0;
+    while i < cur.len() {
+        if escape_at(&cur, i).is_some() {
+            cur[i + 1] = cur[i + 1].to_ascii_uppercase();
+            cur[i + 2] = cur[i + 2].to_ascii_uppercase();
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let text = String::from_utf8_lossy(&cur).into_owned();
+    // remove_dot_segments over the segments, empties collapsed.
+    let mut out: Vec<String> = Vec::new();
+    for seg in text.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s.to_string()),
+        }
+    }
+    out
+}
+
+/// True when the normalised form of `path` is a whole-path match for one of the hold patterns.
+pub fn oracle_matches_hold(path: &str) -> bool {
+    let segs = rfc3986_segments(path);
+    HOLD_PATTERNS.iter().any(|pat| {
+        let ps: Vec<&str> = pat.trim_start_matches('/').split('/').collect();
+        ps.len() == segs.len() && ps.iter().zip(&segs).all(|(p, s)| *p == "*" || p == s)
+    })
+}
+
+/// The verdict of the shipped-shape policy, for tests that count outcomes.
+pub fn gate_shipped(method: &str, path: &str) -> Gate {
+    gate(&gate_policies().0, method, path)
+}
+
+/// A request whose same-resource form is held must be held or refused, under both policies.
+pub fn check_gate(method: &str, path: &str) {
+    if !path.starts_with('/') || !oracle_matches_hold(path) {
+        return;
+    }
+    let (shipped, engine_only) = gate_policies();
+    for (name, snap) in [("shipped", shipped), ("engine-only", engine_only)] {
+        let g = gate(snap, method, path);
+        assert_ne!(
+            g,
+            Gate::Allowed,
+            "{name} policy forwards {method} {path:?} unheld (normalised: {:?})",
+            rfc3986_segments(path)
+        );
+    }
+}
+
+/// Build a request aimed at a hold pattern from a stream of choices. `pick(n)` returns a value
+/// below `n`. Used by the deterministic test (seeded generator) and by the fuzz target (input
+/// bytes), so both explore the same space: every pattern, literal and wildcard segments, the
+/// first and last position, each unreserved character written as an escape in either hex case,
+/// layered escapes, dot and empty segments, and a trailing slash.
+pub fn hold_probe(pick: &mut dyn FnMut(usize) -> usize) -> (&'static str, String) {
+    const FILL: &[&str] = &["1", "42", "abc", "Z9", "x-y", "a.b", "a_b", "t~", "m", "M"];
+    let method = ["POST", "PUT"][pick(2)];
+    let pat = HOLD_PATTERNS[pick(HOLD_PATTERNS.len())];
+    // One probe in three is spelled plainly, so the run also reaches the `Held` outcome.
+    let plain = pick(3) == 0;
+    let mut path = String::new();
+    for seg in pat.trim_start_matches('/').split('/') {
+        path.push_str(if plain {
+            "/"
+        } else {
+            ["/", "/", "/", "//", "/./", "/x/../"][pick(6)]
+        });
+        let text = if seg == "*" {
+            FILL[pick(FILL.len())]
+        } else {
+            seg
+        };
+        for ch in text.chars() {
+            // 0..=3: plain; otherwise an escape in one of four spellings.
+            match if plain { 0 } else { pick(8) } {
+                0..=3 => path.push(ch),
+                n => {
+                    let hex = if n % 2 == 0 {
+                        format!("{:02X}", ch as u32)
+                    } else {
+                        format!("{:02x}", ch as u32)
+                    };
+                    let esc = format!("%{hex}");
+                    match pick(6) {
+                        0 => path.push_str(&esc.replace('%', "%25")),
+                        1 => path.push_str(&esc.replace('%', "%2525")),
+                        2 => path.push_str(&format!("%{:02x}{}", b'%', hex)),
+                        _ => path.push_str(&esc),
+                    }
+                }
+            }
+        }
+    }
+    if pick(4) == 0 {
+        path.push('/');
+    }
+    (method, path)
+}
+
+/// Fuzz entry: shape the input bytes into a hold probe and run the oracle on it.
+pub fn check_gate_bytes(data: &[u8]) {
+    let mut i = 0;
+    let mut pick = |n: usize| {
+        let b = data.get(i).copied().unwrap_or(0) as usize;
+        i += 1;
+        b % n
+    };
+    let (method, path) = hold_probe(&mut pick);
+    check_gate(method, &path);
 }

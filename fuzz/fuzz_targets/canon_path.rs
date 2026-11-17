@@ -9,4 +9,6 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     invariants::check_path(&String::from_utf8_lossy(data));
+    // Shape the same bytes into a request aimed at a hold pattern and run the RFC 3986 oracle.
+    invariants::check_gate_bytes(data);
 });

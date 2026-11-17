@@ -8,7 +8,7 @@ DIR holds an `auth-proxy` built with `--features matrix-upstream,stage1-probe`. 
 --noprobe-bin DIR holds one built with `--features matrix-upstream` only, from a separate target
 dir, so default-feature behaviour is proven; it adds the rows that need a build without the probe
 route. Without it those rows are not run, and the expected-row count shrinks with them (it is
-never padded). Rows PT-20..PT-27 (and PT-29) are stage 2: they drive the real approval listener over HTTP
+never padded). Rows PT-20..PT-27 (and PT-29..PT-31) are stage 2: they drive the real approval listener over HTTP
 (Basic auth, CSRF token), kill -9 and SIGTERM the process, and rewrite the policy. Each row asserts the
 client-visible outcome AND what the mock upstream received. The upstream is the harness mock, so
 nothing real is involved; every sentinel is random per run.
@@ -44,7 +44,7 @@ KEY_HEADER = "x-ap-caller-key"
 CASES = []  # (id, row, name, instance, fn)
 EXPECTED = ["PT-01", "PT-02", "PT-03", "PT-04", "PT-05", "PT-06", "PT-07", "PT-08", "PT-09",
             "PT-10a", "PT-12", "PT-13", "PT-14", "PT-15", "PT-16", "PT-17", "PT-18", "PT-19",
-            "PT-20", "PT-21", "PT-22", "PT-23", "PT-24", "PT-25", "PT-26", "PT-27", "PT-29"]
+            "PT-20", "PT-21", "PT-22", "PT-23", "PT-24", "PT-25", "PT-26", "PT-27", "PT-29", "PT-30", "PT-31"]
 # Rows that need a build without the probe route (--noprobe-bin).
 EXPECTED_NOPROBE = ["PT-28", "PT-12n", "PT-13n"]
 
@@ -1088,6 +1088,85 @@ def pt29(c):
     return ok, (f"page_statuses={sts} wrong_pw={bad.status} in_responses={len(in_responses)} files_with_sentinel={hits} "
                 f"panic_line={b'panic at' in log} pending_after_panic={still} approve={ast}/{res} "
                 f"caller={caller and caller['status']}")
+
+
+@case("PT-30", "acc 6", "the caller key repeated in the route path or the query is refused before any hold, audit line or upstream request, on the hold and allow routes, in both key forms", "hold")
+def pt30(c):
+    c.start_hold()
+    k = c.key
+    digits = k[len("apk_"):]
+    enc = "".join(f"%{b:02x}" for b in k.encode())
+    body = b"{}"
+    post_hs = [("Authorization", c.auth), ("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+
+    def forms(method, rel):
+        if method == "POST":
+            return [("header", build(method, rel, [(KEY_HEADER, k)] + post_hs, body)),
+                    ("path", build(method, f"/ap/{k}{rel}", post_hs, body))]
+        return [("header", build(method, rel, [(KEY_HEADER, k), ("Authorization", c.auth)])),
+                ("path", build(method, f"/ap/{k}{rel}", [("Authorization", c.auth)]))]
+
+    rels = [("POST", f"/discord/v1/xap?a={k}"), ("POST", f"/discord/v1/xap?a={enc}"),
+            ("POST", f"/discord/v1/xap?a=%61PK%5F{digits.upper()}"), ("POST", f"/discord/v1/xap?a={enc.replace('%', '%25')}"),
+            ("POST", f"/discord/v1/{k}"), ("POST", f"/discord/v1/{k.upper()}"), ("POST", f"/discord/v1/{digits}"),
+            ("GET", f"/discord/v1/{k}"), ("GET", f"/discord/v1/x?t={k}"), ("GET", f"/discord/v1/x?t={enc}"),
+            ("GET", f"/discord/v1/{enc}")]
+    checks = []
+    for method, rel in rels:
+        for label, raw in forms(method, rel):
+            # An encoded copy inside the path is refused earlier, as an ambiguous path.
+            checks.append(canon_refused(c, f"{method} {label} {rel[:26]}", raw, {"caller_key_ambiguous", "path_ambiguous"}))
+    plain = canon_refused(c, "plain", forms("POST", f"/discord/v1/{k}")[0][1], {"caller_key_ambiguous"})
+    pending = len(c.pending())
+    e = c.e
+    e.stop_proxy()
+    needles = [digits.encode(), digits.upper().encode(), enc[len("%61%70%6b%5f"):].encode()]
+    hits = []
+    for root, _d, files in os.walk(e.work):
+        rel_dir = os.path.relpath(root, e.work)
+        if rel_dir == "secrets" or rel_dir.startswith("secrets" + os.sep):
+            continue
+        for fn in files:
+            if fn.startswith("config"):
+                continue  # the policy file holds the key's hash only; skip configs to be safe
+            try:
+                data = open(os.path.join(root, fn), "rb").read()
+            except OSError:
+                continue
+            if any(n in data for n in needles):
+                hits.append(fn)
+    ok, d = run_all(checks)
+    return ok and plain[0] and pending == 0 and not hits, f"{d} {plain[1]} pending={pending} files_with_key={hits}"
+
+
+@case("PT-31", "acc 1,3", "a percent-encoded unreserved character in the path is refused on the hold route and the allow route: the form matched is the form sent", "hold")
+def pt31(c):
+    c.start_hold()
+    k = c.key
+    body = b"{}"
+    post_hs = [("Authorization", c.auth), ("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+    checks = []
+    held = ["/discord/v1/%78ap", "/discord/v1/%58ap", "/discord/v1/x%61p", "/discord/v1/xa%70", "/discord/v1/xa%50",
+            "/discord/v1/%73se", "/discord/v1/ss%65", "/discord/v1/%2578ap", "/discord/v1/%252578ap", "/discord/v1/%7Exap",
+            "/discord/v1/x%2Dp", "/discord/v1/x%2dp", "/discord/v1/x%5Fp", "/%64iscord/v1/xap"]
+    for p in held:
+        checks.append(canon_refused(c, "hold hdr " + p[-12:], build("POST", p, [(KEY_HEADER, k)] + post_hs, body), {"path_ambiguous", "route_unknown"}))
+        checks.append(canon_refused(c, "hold path " + p[-12:], build("POST", f"/ap/{k}{p}", post_hs, body), {"path_ambiguous", "route_unknown"}))
+    for p in ["/discord/v1/%61bc", "/discord/v1/ab%43", "/discord/v1/a%2Db", "/discord/v1/a%7Eb", "/discord/v1/%2561bc"]:
+        checks.append(canon_refused(c, "allow hdr " + p[-12:], build("GET", p, [(KEY_HEADER, k), ("Authorization", c.auth)]), {"path_ambiguous"}))
+        checks.append(canon_refused(c, "allow path " + p[-12:], build("GET", f"/ap/{k}{p}", [("Authorization", c.auth)]), {"path_ambiguous"}))
+    # The trailing-slash spelling of the held resource is never forwarded unheld either.
+    checks.append(canon_refused(c, "trailing slash", build("POST", "/discord/v1/xap/", [(KEY_HEADER, k)] + post_hs, body), {"no_grant"}))
+    pending = len(c.pending())
+    # The plain spelling is held, then denied to clean up.
+    raw, _ = c.held_req(31)
+    t = Caller(c.port, raw)
+    rid = only(c, c.wait_pending(1))
+    c.decide(rid, "deny") if rid else None
+    r = t.result()
+    ok, d = run_all(checks)
+    return (ok and pending == 0 and rid is not None and r is not None and r["status"] == 423 and len(c.ulog()) == 0,
+            f"{d} pending_before_plain={pending} plain_held={rid is not None} plain_denied={r and r['status']}")
 
 
 CASES.append(("PT-12n", "acc 28", "framing conflicts on a build without the probe route", "np-main", pt12))

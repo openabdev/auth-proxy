@@ -220,6 +220,12 @@ journal, error bodies and panic message never contain the `/ap/<key>` prefix or 
 is the stripped, redacted route-relative path), and the matrix scans every output for it. Anything in front of
 the gate that logs URLs would still see it, and the key is unsafe wherever such a log is kept.
 
+The key is also refused anywhere else in the request target. A route-relative path or a query string that carries
+the authenticated key again, in any percent-encoded spelling or letter case (found by the same layered decoding
+as path canonicalization, fail-closed when the layers do not end), is `caller_key_ambiguous` before the Trail has a
+path, before a hold exists and before the upstream is called, so the key never reaches the audit stream, the
+approval page or Discord.
+
 ### 3.3 Policy: a third verdict, and segment patterns
 
 Phase 1 policy answers allow or deny. A grant is `{identity, credential, route, methods, paths}` with
@@ -228,6 +234,14 @@ prefix matching on `paths` [I policy.rs `evaluate`; config.rs `Grant`]. Two chan
 1. **Verdict.** A grant gains `decision = "allow" | "hold"`. A passthrough grant has no `credential`
    (today `credential` is a required field [I config.rs `Grant`]). If more than one grant matches, `hold`
    beats `allow` (the stricter wins). No match is deny, as today.
+   Policy load refuses an `allow` grant (a prefix or a pattern) of the same identity, route and method that
+   overlaps a `hold` pattern, so the rule is not relied on: a spelling of a held resource that the pattern does
+   not claim, such as a trailing `/`, would otherwise reach the allow grant. The matcher also answers a
+   trailing-slash spelling of a held path with `no_grant`, whatever allow grants exist. The path that policy
+   matches is byte-identical to the path that is sent and shown: a percent-escape of an RFC 3986 unreserved
+   character (`A-Z a-z 0-9 - . _ ~`) is refused as `path_ambiguous` on the passthrough listener, in every decode
+   layer, so two spellings of one resource can never get different verdicts. The sidecar has no hold verdict and
+   keeps accepting those escapes (matrix row C1-3). The query is not matched, and is sent as received.
 2. **Exact segment patterns for writes.** Prefix matching cannot say "`POST /channels/{id}/messages` and
    nothing under it". A prefix `/api/v10/channels/` would also match `POST /api/v10/channels/1/messages/2/reactions`
    and every other POST below it. Add `path_patterns`, where each segment is a literal or `*` (exactly

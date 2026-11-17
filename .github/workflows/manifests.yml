@@ -1,0 +1,36 @@
+name: manifests
+
+# Lightweight check for the Kubernetes manifests. The default `ci` workflow is manual only and
+# builds the Rust workspace; this one needs only python3 and PyYAML, runs on a GitHub-hosted
+# runner, reads no secrets and never builds Rust. It runs the static validator and its mutation
+# tests whenever a pull request touches deploy/k8s or this file.
+on:
+  pull_request:
+    paths:
+      - deploy/k8s/**
+      - .github/workflows/manifests.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manifests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install PyYAML
+        run: python3 -m pip install --user pyyaml
+
+      - name: Kubernetes manifest validator
+        run: python3 deploy/k8s/validate_manifests.py
+
+      - name: Validator mutation tests
+        run: python3 deploy/k8s/test_validate_manifests.py

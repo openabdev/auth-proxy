@@ -14,18 +14,25 @@ Each of the four kiro-cli services points at one route. The base URL is
 
 | cli.json key | Route (path segment) |
 |---|---|
-| `api.cps.service` | `kiro-cps` |
-| `api.krs.service` | `kiro-krs` |
+| `api.cps.service` | `kiro-cps` (host `management.us-east-1.kiro.dev`) |
+| `api.krs.service` | `kiro-krs` (host `runtime.us-east-1.kiro.dev`) |
 | `api.codewhisperer.service` | `kiro-cw` |
 | `api.q.service` | `kiro-q` |
 
 Each entry also sets `"region": "us-east-1"`. The file is an object of the form
 `{"api.cps.service": {"endpoint": "...", "region": "us-east-1"}, ...}`.
 
-**The shipped identity file defines one route only.** `deploy/k8s/identity-configmap.yaml` defines
-`kiro-krs` and its grant. Before the other three services work, add the `kiro-cps`, `kiro-cw` and
-`kiro-q` routes, with a credential grant for each, to `identity.toml`. Until then the proxy answers
-those routes with `404 route_unknown`.
+**The shipped identity file defines two routes.** `deploy/k8s/identity-configmap.yaml` defines
+`kiro-krs` and `kiro-cps`, each with a grant. Before `api.codewhisperer.service` and `api.q.service`
+work, add the `kiro-cw` and `kiro-q` routes, with a credential grant for each, to `identity.toml`.
+Until then the proxy answers those routes with `404 route_unknown`.
+
+**Not measured for `kiro-cps`.** The host `management.us-east-1.kiro.dev` was observed by DNS/SNI
+only (kiro-cli 3.3.0, no real request, no real credential). Whether the cps service needs the
+`tokentype` header and what its error body looks like are unmeasured. The route uses
+`pass_headers = ["tokentype"]` and `error_shape = "aws"` because `kiro-krs` does; both are
+assumptions until a real first response is checked. kiro-cli also probes `management.*` hosts in
+other regions, which the shipped route does not cover.
 
 The proxy listens on plain `http://` on loopback, which kiro-cli accepts. The hop from the agent to
 the proxy never leaves the pod.
@@ -83,5 +90,9 @@ of these two options:
 
 ## 6. Checks before you rely on this recipe
 
-- Confirm that kiro-cli sends `X-Amz-Target` before any grant uses `aws_targets`.
+- kiro-cli 3.3.0 sends one `X-Amz-Target` per call [M, `docs/evidence/xamz-target.md`]. Re-check
+  after a kiro-cli upgrade. Other targets exist on `cps` (`GetProfile`, `ListAvailableModels`) and
+  `codewhisperer` (`SendTelemetryEvent`), seen only against a local capture listener. A grant on
+  those routes needs its own `aws_targets` list or none. No shipped policy uses `aws_targets` for
+  them.
 - Run the Phase 1 Kubernetes test, which applies the combined rule set in one pod.

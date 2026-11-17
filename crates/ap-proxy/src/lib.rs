@@ -33,6 +33,8 @@ use audit_sink::AuditSink;
 use pipeline::App;
 
 #[cfg(test)]
+mod canon_diff_tests;
+#[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod tests;

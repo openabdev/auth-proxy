@@ -1,0 +1,46 @@
+[package]
+name = "auth-proxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Not a member of the root workspace: `cargo build --workspace` never sees this crate, and the
+# nightly-only libFuzzer dependency stays out of the default build.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ap-core = { path = "../crates/ap-core" }
+http = "1"
+url = "2"
+
+[[bin]]
+name = "canon_path"
+path = "fuzz_targets/canon_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canon_host"
+path = "fuzz_targets/canon_host.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canon_origin"
+path = "fuzz_targets/canon_origin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canon_headers"
+path = "fuzz_targets/canon_headers.rs"
+test = false
+doc = false
+bench = false

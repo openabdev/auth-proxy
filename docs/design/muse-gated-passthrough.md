@@ -924,25 +924,28 @@ Open questions 1 to 4 are stage 1 blockers.
 
 1. **Muse's tolerance for a held connection (open point d).** How long will the Muse custom connector wait
    for a response: its client timeout, any platform gateway timeout, and whether it retries on timeout
-   or on a dropped connection? This is unknown [A]. The PoC makes `hold_secs` configurable (default
-   120, range 5 to 600) and stage 1 item 10 measures it. Until measured, treat 120 s as a guess. **Answered [M]:** held connections of 10 to 300 s completed end to end through the Muse helper and the front (helper timeout raised per helper); the default 30 s helper timeout cuts a 30 s hold. See `docs/evidence/muse-stage1.md`. The TLS
-   front's own idle timeout also bounds the window, and whether `tailscale serve` cuts a long idle
-   connection is unmeasured [A] and measured in stage 1.
+   or on a dropped connection? The PoC makes `hold_secs` configurable (default 120, range 5 to 600).
+   **Answered, combined result:** gate side [M], the gate held and completed probes of 10, 30, 60, 120 and
+   300 s through the TLS front (no cut up to 300 s); helper side [M-reported], the Muse helper received
+   each completed response end to end with its timeout raised above the hold, and the default 30 s helper
+   timeout gave up on a 30 s hold. Hard condition: the default 30 s helper timeout is not enough, so the
+   helper timeout for gated routes must exceed `hold_secs`. Still unmeasured: any ceiling above 300 s, and
+   the platform-internal swap logs. The 120 s default for `hold_secs` is within the observed range, only
+   with the raised helper timeout. See `docs/evidence/muse-stage1.md`.
 2. **Caller-key header name.** Answered [M-reported]: the current helper cannot add a custom request header,
    and the registered credential is injected as `Authorization`, which cannot be the caller key. The gate
    therefore also accepts the key in the path prefix (section 3.2). Still open: whether a future connector can
    set `X-AP-Caller-Key`.
-3. **How does Muse reach the gate, and who terminates TLS?** (Reachability answered: see `docs/evidence/muse-stage1.md`.) Decided: `tailscale serve` on the owner's
-   own node, proxy loopback-only (section 4.2). Still to confirm in stage 1: can Muse's egress reach that
-   address, given the ACL restriction to Muse's node?
+3. **How does Muse reach the gate, and who terminates TLS?** Decided: `tailscale serve` on the owner's
+   own node, proxy loopback-only (section 4.2). **Answered [M-reported]:** the gate host was reachable
+   from the Muse side over the private network. The ACL restriction to Muse's node was an owner action and
+   is not verified by us; ACL isolation (stage 1 item 11) is unmeasured. See `docs/evidence/muse-stage1.md`.
 4. **Base URL shape.** The PoC uses path-prefix routing, `/discord/api/v10/...`. Muse will register a separate
-   connector, `oab-auth-proxy`, with its own base URL for this host [owner decision]. Whether that base URL may
-   carry a path prefix such as `/ap/<caller-key>` is to be confirmed by the first measurement round, which uses a
-   dummy credential only. **Answered [M-reported]:** placement `/ap/{}` works. See `docs/evidence/muse-stage1.md`.
-5. **Status codes for the terminal errors.** The proposed 423, 410 and 503 are untested against Muse
-   [A]. The helper shows the agent `HTTP <code>: <body>` and does not retry [M-reported], so the body is what the
-   agent reads (section 3.5). **Answered [M-reported]:** the agent saw the status, body and `X-AP-Decision` for 503, 410 and 423 and did not retry. See `docs/evidence/muse-stage1.md`.
-6. **Retry behaviour.** (Answered [M-reported] for 423, 410, 503 and `no_grant`: no retry; see `docs/evidence/muse-stage1.md`.) After an `expired` or `denied`, does Muse's agent retry automatically? If so each
+   connector, `oab-auth-proxy`, with its own base URL for this host [owner decision]. **Answered [M-reported]:**
+   the base URL carries the caller key as a path prefix, placement `/ap/{}`, measured with a dummy credential only. See `docs/evidence/muse-stage1.md`.
+5. **Status codes for the terminal errors.** The proposed 423, 410 and 503 were observed against Muse (below). The helper shows the agent `HTTP <code>: <body>` and does not retry [M-reported], so the body is what the
+   agent reads (section 3.5). **Answered [M-reported]:** the agent saw the status, body and `X-AP-Decision` for 503, 410 and 423 and did not retry. Stage 2 specific behaviour (a real held then approved or denied flow) is still unmeasured. See `docs/evidence/muse-stage1.md`.
+6. **Retry behaviour.** (Answered [M-reported] for the 423, 410 and 503 probes and a real 423 `no_grant` write: no retry; see `docs/evidence/muse-stage1.md`.) After an `expired` or `denied`, does Muse's agent retry automatically? If so each
    retry is another phone prompt; dedupe, the per-identity cap and the default 60 s cooldown bound this.
 7. **Approver channel.** Answered in the review comments: Basic auth plus a per-page CSRF token for the PoC,
    WebAuthn later, and the approval API stays client-agnostic (a requirement). Which notifier the hook

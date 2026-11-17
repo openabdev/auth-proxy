@@ -1,7 +1,7 @@
 # Muse stage 1: measurement results
 
 Records the stage 1 measurements of the Muse gated passthrough (design: `docs/design/muse-gated-passthrough.md`).
-Redacted: no hostnames, addresses, logins, URLs or keys. `<gate-host>:<port>` is the TLS front of the gate.
+Redacted: no hostnames, addresses, logins, URLs or keys.
 Companion file for the front and framing checks: `docs/evidence/muse-stage1-front-measurements.md`.
 
 Tags: **[M]** measured on our gate (audit and evidence log on the gate host). **[M-reported]** reported by the
@@ -9,7 +9,7 @@ Muse side, not observed by us.
 
 ## Scope and versions
 
-- Stage 1 merged to `main` as `2f61f5f` (PR #17). The deployed binary was built from the same commit.
+- Stage 1 merged to `main` as `2f61f5f` (PR #17). The deployed binary was built from the PR #17 head, whose source tree is identical to merge commit `2f61f5f`.
 - Measurements ran on 2026-11-16 and 2026-11-17.
 - Upstream was Discord with a dummy credential. The real Discord token was never used.
 
@@ -69,7 +69,7 @@ Through the real Muse helper and the owner's private-network TLS front:
 ### Scope of the swap [M-reported]
 
 - Any path under `/ap/` on the registered host is swapped. An unknown route returns 423 `route_unknown`
-  (caller accepted).
+  (caller accepted; [M] the gate log also records this).
 - The helper refuses every other host in 0.000 s before any network call (discord.com, example.com, another
   private-network host).
 
@@ -77,6 +77,12 @@ Through the real Muse helper and the owner's private-network TLS front:
 
 - [M-reported] Header names are identical across repeated identical requests.
 - [M] The gate's forwarded-names digest was identical across repeats.
+
+### Reachability (open question 3)
+
+- [M-reported] The gate host was reachable from the Muse side over the private network.
+- [M] Requests from the pilot identity appear in the gate audit log, so they reached the gate through the front.
+- Not claimed: the ACL restriction to Muse's node was an owner action and is not verified by us.
 
 ### Framing gap
 
@@ -86,12 +92,17 @@ Unchanged: documented, not built.
 
 - Platform-internal swap logs, and what the platform logs after the swap. Cannot be observed from our side.
 - Whether any ceiling exists above 300 s.
+- ACL isolation (design stage 1 item 11): not measured. Whether only the public port is reachable from the Muse
+  node, with SSH and other ports failing, is unconfirmed.
+- Client disconnect during a hold, direct and through the front, and Muse's reaction to a dropped connection
+  (design stage 1 item 10, last part): not measured.
 - Behaviour once the old direct-to-Discord connection is removed.
 
 ## Conclusions
 
-- The stage 2 stop rule (measured window shorter than a realistic human approval) did **not** trigger. A held
-  connection up to 300 s works end to end.
+- The stage 2 stop rule (measured window shorter than a realistic human approval) did **not** trigger. Combined
+  result: the gate held and completed probes up to 300 s [M]; the Muse helper received them end to end, with its
+  timeout raised to 330 s for the 300 s probe [M-reported].
 - Hard condition for stage 2: the connector's helper timeout for gated routes must exceed the hold window. The
   default 30 s is not enough.
 - The gate constrains the agent only if the connector for the gate host is the agent's only route to Discord.

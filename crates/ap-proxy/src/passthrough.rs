@@ -1,7 +1,7 @@
 //! The passthrough pipeline (design 3.1) for the Muse gate, stage 1.
 //!
 //! In order: refuse CONNECT and Upgrade, canonicalize (origin form, public `Host`, ambiguous
-//! path), refuse ambiguous framing, read the caller key from its header, resolve the route name
+//! path), refuse ambiguous framing, read the caller key from its header or the `/ap/<caller-key>/` path prefix (exactly one), resolve the route name
 //! in the path to a fixed host, refuse a duplicate `Authorization`, evaluate the grant (anything
 //! not granted, writes included, is 423 `no_grant`), forward with the caller's own
 //! `Authorization` unchanged, and stream the response back. Every gate refusal carries
@@ -261,18 +261,45 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
         return Ok(refuse(&app, &trail, Code::FramingRefused));
     }
 
-    // 5. Caller key from its header. Mark every value sensitive first so no Debug print of the
-    // request or its headers can show it.
+    // 5. Caller key: from its header OR from a `/ap/<caller-key>/` path prefix, exactly one.
+    // Mark every header value sensitive first so no Debug print of the request or its headers
+    // can show it. The prefix is stripped here: everything after this point sees `eff_path`.
+    let mut header_present = false;
     if let Ok(name) = http::HeaderName::from_bytes(pt.caller_key_header.as_bytes()) {
         if let http::header::Entry::Occupied(mut e) = parts.headers.entry(name) {
+            header_present = true;
             for v in e.iter_mut() {
                 v.set_sensitive(true);
             }
         }
     }
-    let key = match canon::caller_key_from_header(&parts.headers, &pt.caller_key_header) {
-        Ok(k) => k,
-        Err(code) => return Ok(refuse(&app, &trail, code)),
+    let path_form = parts.uri.path().starts_with("/ap/");
+    if header_present && path_form {
+        return Ok(refuse(&app, &trail, Code::CallerKeyAmbiguous));
+    }
+    let (key, eff_path) = if path_form {
+        // `parse_ap_path` validates the prefix. Whatever follows the key, byte for byte, is the
+        // path the rest of the pipeline sees.
+        let path = parts.uri.path();
+        let key = match canon::parse_ap_path(path) {
+            Ok(ap) => ap.caller_key,
+            // The key is well formed but the route segment is empty: authenticate the key
+            // first, so an unknown key is still 401; `/` then names no route.
+            Err(Code::RouteUnknown) => path
+                .strip_prefix("/ap/")
+                .and_then(|r| r.split('/').next())
+                .unwrap_or_default(),
+            Err(code) => return Ok(refuse(&app, &trail, code)),
+        };
+        (
+            key.to_string(),
+            path["/ap/".len() + key.len()..].to_string(),
+        )
+    } else {
+        match canon::caller_key_from_header(&parts.headers, &pt.caller_key_header) {
+            Ok(k) => (k, parts.uri.path().to_string()),
+            Err(code) => return Ok(refuse(&app, &trail, code)),
+        }
     };
     let Some(identity) = caller_identity(&policy.cfg, &key) else {
         return Ok(refuse(&app, &trail, Code::CallerRejected));
@@ -287,7 +314,7 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
     ));
 
     #[cfg(feature = "matrix-upstream")]
-    if parts.uri.path() == crate::matrix_hooks::PANIC_PATH {
+    if eff_path == crate::matrix_hooks::PANIC_PATH {
         let auth = parts
             .headers
             .get(header::AUTHORIZATION)
@@ -297,14 +324,12 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
     }
 
     #[cfg(feature = "stage1-probe")]
-    if policy.cfg.probe.enabled && parts.uri.path().starts_with(crate::probe::PREFIX) {
-        return Ok(
-            crate::probe::handle(&app, &trail, &parts.method, parts.uri.path(), body, pt).await,
-        );
+    if policy.cfg.probe.enabled && eff_path.starts_with(crate::probe::PREFIX) {
+        return Ok(crate::probe::handle(&app, &trail, &parts.method, &eff_path, body, pt).await);
     }
 
     // 6. Route name in the path, mapped by policy to a fixed host.
-    let (route_name, rel) = match canon::parse_route_path(parts.uri.path()) {
+    let (route_name, rel) = match canon::parse_route_path(&eff_path) {
         Ok(r) => r,
         Err(code) => return Ok(refuse(&app, &trail, code)),
     };

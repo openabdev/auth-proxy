@@ -39,7 +39,8 @@ pub fn passthrough_outcome(code: Code) -> (u16, Decision) {
         | Code::PathAmbiguous
         | Code::FramingRefused
         | Code::AuthorizationDuplicate
-        | Code::ProbeParams => (400, Decision::Denied),
+        | Code::ProbeParams
+        | Code::CallerKeyAmbiguous => (400, Decision::Denied),
         Code::ConnectRefused => (405, Decision::Denied),
         Code::WebsocketUnsupported => (501, Decision::Denied),
         Code::BodyTooLarge => (413, Decision::Denied),
@@ -106,6 +107,12 @@ mod tests {
             ),
             (Code::ConnectFailed, 503, "unavailable", "connect_failed"),
             (Code::ProbeParams, 400, "denied", "probe_params"),
+            (
+                Code::CallerKeyAmbiguous,
+                400,
+                "denied",
+                "caller_key_ambiguous",
+            ),
         ];
         for (code, status, decision, name) in rows {
             let (s, d, body) = render_passthrough(code);

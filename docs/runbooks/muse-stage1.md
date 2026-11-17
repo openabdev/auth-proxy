@@ -27,8 +27,15 @@ key="apk_$(openssl rand -hex 32)"
 printf '%s' "$key" | shasum -a 256        # put the hex digest in caller_key_sha256
 ```
 
-Give `$key` to the Muse connector as the value of the `X-AP-Caller-Key` header (the header name is
-configurable with `passthrough.caller_key_header`). The key never goes into the config, a log or a
+Give `$key` to the Muse connector in one of two ways, never both (both is 400 `caller_key_ambiguous`):
+
+- the `X-AP-Caller-Key` header (name configurable with `passthrough.caller_key_header`), or
+- a path prefix on the base URL, `https://<public-host>/ap/<key>/discord/...`, for a connector that cannot add a
+  header. The prefix is stripped before routing and forwarding.
+
+Do not use the registered credential (`Authorization`) as the key: on a passthrough route it is the upstream
+credential and is forwarded unchanged. The path form puts the key in the URL, so keep any URL-logging layer
+in front of the gate out of the path, or treat its logs as secret. The key never goes into the config, a log or a
 commit. Revoke it by deleting the identity and its grants from the policy file (hot reload). Deleting only the identity leaves grants naming an unknown identity, the file stops validating, and every request gets 503 until it is fixed.
 
 ## 3. Policy
@@ -46,7 +53,8 @@ auth-proxy --config /etc/auth-proxy/policy.toml
 
 No expiry store, session socket, admin socket or secret root is needed or read for a passthrough-only config.
 
-Muse base URL: `https://<public-host>/discord` (the Discord path after `/discord` goes upstream unchanged).
+Muse base URL: `https://<public-host>/discord` with the header, or `https://<public-host>/ap/<key>/discord` with the
+path form (the Discord path after `/discord` goes upstream unchanged).
 Whether the connector accepts a path prefix is open question 4.
 
 ## 4. Gate behaviour to expect
@@ -57,7 +65,11 @@ Whether the connector accepts a path prefix is open question 4.
 | any other method or path (including `POST /api/v10/channels/{id}/messages`) | 423, `X-AP-Decision: denied`, `no_grant` |
 | unknown route name | 423 `route_unknown` |
 | missing, duplicate or malformed caller key | 401, `X-AP-Decision: rejected` |
+| caller key in both the header and the path prefix | 400 `caller_key_ambiguous` |
 | ambiguous path, bad `Host`, framing conflict, duplicate `Authorization` | 400 |
+
+Every refusal also carries `{"ap_decision":"<decision>","code":"<code>"}` as its body, because Muse's helper drops
+response headers and shows the agent only `HTTP <code>: <body>`.
 
 ## 5. Evidence collection
 
@@ -84,7 +96,7 @@ Manual checklist, names only, redacted, written into the design doc afterwards:
 
 Enable `[probe] enabled = true` on the `stage1-probe` build. From the Muse connector, through the real
 front, send probe calls directly to the proxy (they are not Discord calls and do not use a route prefix):
-`POST https://<public-host>/__ap_probe/<status>/<secs>` with a small body and the caller key. `status`
+`POST https://<public-host>/__ap_probe/<status>/<secs>` (or `/ap/<key>/__ap_probe/<status>/<secs>`) with a small body and the caller key. `status`
 is one of 200, 410, 423, 503 and `secs` one of 10, 30, 60, 120, 300. 410, 423 and 503 return the matching
 `X-AP-Decision`; 200 returns none.
 
@@ -96,6 +108,10 @@ Record for each run:
   `{"probe":{"event":"client_gone",...}}` line when it does, `completed` when the answer was sent
   (measure both direct to the loopback listener and through the front)
 - Muse's reaction to each status, to its own timeout, to a dropped connection, and its retry behaviour
+
+Muse's current helper has a 30 s socket timeout for JSON requests [M-reported], so `secs` of 60 and above
+cannot complete through it unless Muse raises the timeout for this connector. Treat 30 s as the ceiling for the
+stage 2 hold window until that is measured.
 
 **Stop rule:** if the connection is cut well below a usable `hold_secs`, or disconnects never reach the
 proxy and Muse retries without bound, stop and rethink the design instead of building stage 2.

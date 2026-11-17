@@ -592,3 +592,455 @@ mod probe_tests {
         assert!(t.audit_text().contains("\"event\":\"client_gone\""));
     }
 }
+
+// ---- caller key in the path (`/ap/<caller-key>/<route>/<rest>`) ----
+
+impl Pt {
+    /// A request carrying the caller key in the path prefix and no caller-key header.
+    fn preq(&self, method: &str, path: &str) -> http::request::Builder {
+        Request::builder()
+            .method(method)
+            .uri(format!("/ap/{}{path}", self.key))
+            .header("host", AUTH)
+            .header("authorization", format!("Bot {SENTINEL}"))
+    }
+}
+
+/// Exact body, header and content type of a gate refusal.
+fn assert_refusal(
+    name: &str,
+    p: &http::response::Parts,
+    b: &Bytes,
+    status: u16,
+    dec: &str,
+    c: &str,
+) {
+    assert_eq!(p.status.as_u16(), status, "{name}");
+    assert_eq!(decision(p), dec, "{name}");
+    assert_eq!(
+        p.headers.get("content-type").unwrap(),
+        "application/json",
+        "{name}"
+    );
+    let want = format!("{{\"ap_decision\":\"{dec}\",\"code\":\"{c}\"}}");
+    assert_eq!(std::str::from_utf8(b).unwrap(), want, "{name}");
+}
+
+#[tokio::test]
+async fn path_key_is_stripped_routed_and_forwarded() {
+    let t = Pt::new("pkey").await;
+    let (p, b) = t
+        .send(
+            t.preq("GET", "/discord/api/echo2?x=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(p.status, 200);
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    let path = v["path"].as_str().unwrap();
+    assert!(path.ends_with("/api/echo2?x=1"), "{path}");
+    assert!(!path.contains("/ap/") && !path.contains(&t.key), "{path}");
+    let auth = v["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h[0] == "authorization")
+        .unwrap();
+    assert_eq!(auth[1], format!("Bot {SENTINEL}"));
+    assert!(!v.to_string().contains(&t.key));
+    let text = t.audit_text();
+    assert!(text.contains("\"path\":\"/api/echo2\""), "{text}");
+    assert!(!text.contains(&t.key) && !text.contains("/ap/"), "{text}");
+}
+
+#[tokio::test]
+async fn both_sources_are_ambiguous_even_when_each_is_valid() {
+    let t = Pt::new("both").await;
+    let r = t
+        .preq("GET", "/discord/api/x")
+        .header("x-ap-caller-key", t.key.as_str())
+        .body(Body::empty())
+        .unwrap();
+    let (p, b) = t.send(r).await.unwrap();
+    assert_refusal("both", &p, &b, 400, "denied", "caller_key_ambiguous");
+    // Also when the header is not a valid key: still exactly-one-source, not a 401.
+    let r = t
+        .preq("GET", "/discord/api/x")
+        .header("x-ap-caller-key", "apk_bad")
+        .body(Body::empty())
+        .unwrap();
+    let (p, b) = t.send(r).await.unwrap();
+    assert_refusal("both bad", &p, &b, 400, "denied", "caller_key_ambiguous");
+    assert_eq!(t.hits(), 0);
+    assert!(!t.audit_text().contains(&t.key));
+}
+
+#[tokio::test]
+async fn path_key_failures_are_401_and_leak_nothing() {
+    let t = Pt::new("pbad").await;
+    let other = caller_key();
+    let upper = t.key.to_ascii_uppercase();
+    let cases = [
+        ("unknown", format!("/ap/{other}/discord/api/x")),
+        ("short", "/ap/apk_short/discord/api/x".to_string()),
+        ("uppercase", format!("/ap/{upper}/discord/api/x")),
+        ("no route", "/ap/apk_short/".to_string()),
+        ("key only", format!("/ap/{other}")),
+    ];
+    for (name, path) in cases {
+        let r = Request::builder()
+            .uri(path)
+            .header("host", AUTH)
+            .body(Body::empty())
+            .unwrap();
+        let (p, b) = t.send(r).await.unwrap();
+        assert_refusal(name, &p, &b, 401, "rejected", "caller_rejected");
+        assert!(!String::from_utf8_lossy(&b).contains("apk_"), "{name}");
+    }
+    // A valid key with no route is refused after authentication, as route_unknown.
+    for path in [format!("/ap/{}/", t.key), format!("/ap/{}", t.key)] {
+        let r = Request::builder()
+            .uri(path.clone())
+            .header("host", AUTH)
+            .body(Body::empty())
+            .unwrap();
+        let (p, b) = t.send(r).await.unwrap();
+        if path.ends_with('/') {
+            assert_refusal("no route", &p, &b, 423, "denied", "route_unknown");
+        } else {
+            assert_eq!(p.status, 401);
+        }
+    }
+    assert_eq!(t.hits(), 0);
+    let text = t.audit_text();
+    for k in [t.key.as_str(), other.as_str(), "/ap/"] {
+        assert!(!text.contains(k), "{k} leaked: {text}");
+    }
+}
+
+#[tokio::test]
+async fn path_form_keeps_the_other_checks() {
+    let t = Pt::new("pchecks").await;
+    for (path, c) in [
+        ("/discord/api/../x", "path_ambiguous"),
+        ("/discord/api/%2e%2e/x", "path_ambiguous"),
+        ("/nope/api/x", "route_unknown"),
+    ] {
+        let (p, b) = t
+            .send(t.preq("GET", path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(code(&b), c, "{path}");
+        assert_eq!(decision(&p), "denied");
+    }
+    let (p, b) = t
+        .send(
+            t.preq("POST", "/discord/api/v10/channels/1/messages")
+                .header("content-length", "2")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_refusal("write", &p, &b, 423, "denied", "no_grant");
+    assert_eq!(t.hits(), 0);
+    assert!(!t.audit_text().contains(&t.key));
+}
+
+#[tokio::test]
+async fn no_path_key_in_audit_for_any_outcome() {
+    let t = Pt::new("psentinel").await;
+    let hook = format!("/discord/api/v10/webhooks/1/{PATH_TOKEN}/github");
+    let _ = t
+        .send(t.preq("GET", &hook).body(Body::empty()).unwrap())
+        .await;
+    let _ = t
+        .send(
+            t.preq("GET", "/discord/api/echo2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let _ = t
+        .send(
+            t.preq("POST", "/discord/up/echo2")
+                .header("content-length", "5000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let _ = t
+        .send(
+            t.preq("GET", "/discord/api/../x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let _ = t
+        .send(
+            t.preq("GET", "/discord/api/x")
+                .header("x-ap-caller-key", t.key.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let (tx, body) = chan_body();
+    let r = t
+        .preq("POST", "/discord/up/echo2")
+        .header("transfer-encoding", "chunked")
+        .body(body)
+        .unwrap();
+    let _ = t.send(r).await;
+    drop(tx);
+    let text = t.audit_text();
+    assert!(!text.is_empty());
+    for s in [SENTINEL, PATH_TOKEN, t.key.as_str(), "/ap/"] {
+        assert!(!text.contains(s), "{s} leaked: {text}");
+    }
+    assert!(text.contains("\"evidence\""));
+}
+
+#[tokio::test]
+async fn path_form_connect_failed_and_policy_unavailable_leak_nothing() {
+    let t = Pt::new("pdown").await;
+    let policy = t._s.path().join("policy.toml");
+    let text = std::fs::read_to_string(&policy).unwrap();
+    std::fs::write(
+        &policy,
+        text.replace(&format!("port = {}", t.up.addr.port()), "port = 9"),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (p, b) = t
+        .send(t.preq("GET", "/discord/api/x").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_refusal("connect", &p, &b, 503, "unavailable", "connect_failed");
+    std::fs::remove_file(&policy).unwrap();
+    let (p, b) = t
+        .send(t.preq("GET", "/discord/api/x").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_refusal("policy", &p, &b, 503, "unavailable", "policy_unavailable");
+    let text = t.audit_text();
+    assert!(!text.contains(&t.key) && !text.contains("/ap/"), "{text}");
+}
+
+/// Every refusal row of the outcome table (design 3.5), in both caller-key forms: status,
+/// `X-AP-Decision` header and the exact fixed JSON body.
+#[tokio::test]
+async fn every_refusal_row_carries_the_decision_in_header_and_body() {
+    let t = Pt::new("rows").await;
+    let key = t.key.clone();
+    let other = caller_key();
+    // (name, form, request, status, decision, code); form 'h' = header, 'p' = path prefix.
+    let mut cases: Vec<(String, Request<Body>, u16, &str, &str)> = Vec::new();
+    for form in ['h', 'p'] {
+        let mk = |method: &str, path: &str| -> http::request::Builder {
+            if form == 'h' {
+                t.req(method, path)
+            } else {
+                t.preq(method, path)
+            }
+        };
+        let n = |s: &str| format!("{s} [{form}]");
+        cases.push((
+            n("401 unknown key"),
+            if form == 'h' {
+                Request::builder()
+                    .uri("/discord/api/x")
+                    .header("host", AUTH)
+                    .header("x-ap-caller-key", other.as_str())
+                    .body(Body::empty())
+                    .unwrap()
+            } else {
+                Request::builder()
+                    .uri(format!("/ap/{other}/discord/api/x"))
+                    .header("host", AUTH)
+                    .body(Body::empty())
+                    .unwrap()
+            },
+            401,
+            "rejected",
+            "caller_rejected",
+        ));
+        cases.push((
+            n("400 path"),
+            mk("GET", "/discord/api/../x").body(Body::empty()).unwrap(),
+            400,
+            "denied",
+            "path_ambiguous",
+        ));
+        cases.push((
+            n("400 authorization dup"),
+            mk("GET", "/discord/api/x")
+                .header("authorization", "b")
+                .body(Body::empty())
+                .unwrap(),
+            400,
+            "denied",
+            "authorization_duplicate",
+        ));
+        cases.push((
+            n("400 framing"),
+            mk("GET", "/discord/api/x")
+                .header("content-length", "2")
+                .header("transfer-encoding", "chunked")
+                .body(Body::empty())
+                .unwrap(),
+            400,
+            "denied",
+            "framing_refused",
+        ));
+        cases.push((
+            n("501 upgrade"),
+            mk("GET", "/discord/api/x")
+                .header("upgrade", "websocket")
+                .body(Body::empty())
+                .unwrap(),
+            501,
+            "denied",
+            "websocket_unsupported",
+        ));
+        cases.push((
+            n("413 declared"),
+            mk("POST", "/discord/up/echo2")
+                .header("content-length", "5000")
+                .body(Body::empty())
+                .unwrap(),
+            413,
+            "denied",
+            "body_too_large",
+        ));
+        cases.push((
+            n("423 no grant"),
+            mk("DELETE", "/discord/api/x").body(Body::empty()).unwrap(),
+            423,
+            "denied",
+            "no_grant",
+        ));
+        cases.push((
+            n("423 route"),
+            mk("GET", "/nope/api/x").body(Body::empty()).unwrap(),
+            423,
+            "denied",
+            "route_unknown",
+        ));
+    }
+    cases.push((
+        "400 both sources".to_string(),
+        t.preq("GET", "/discord/api/x")
+            .header("x-ap-caller-key", key.as_str())
+            .body(Body::empty())
+            .unwrap(),
+        400,
+        "denied",
+        "caller_key_ambiguous",
+    ));
+    cases.push((
+        "400 host".to_string(),
+        Request::builder()
+            .uri("/discord/api/x")
+            .header("host", "evil.test")
+            .header("x-ap-caller-key", key.as_str())
+            .body(Body::empty())
+            .unwrap(),
+        400,
+        "denied",
+        "host_rejected",
+    ));
+    cases.push((
+        "405 connect".to_string(),
+        Request::builder()
+            .method("CONNECT")
+            .uri("/discord/api/x")
+            .header("host", AUTH)
+            .body(Body::empty())
+            .unwrap(),
+        405,
+        "denied",
+        "connect_refused",
+    ));
+    for (name, req, status, dec, c) in cases {
+        let (p, b) = t.send(req).await.unwrap();
+        assert_refusal(&name, &p, &b, status, dec, c);
+        let text = String::from_utf8_lossy(&b);
+        assert!(!text.contains("apk_") && !text.contains(SENTINEL), "{name}");
+    }
+    assert_eq!(t.hits(), 0);
+    let text = t.audit_text();
+    for k in [key.as_str(), other.as_str(), "/ap/"] {
+        assert!(!text.contains(k), "{k} leaked: {text}");
+    }
+
+    // 503 body_read_timeout, in both forms.
+    for form in ['h', 'p'] {
+        let (tx, body) = chan_body();
+        let b = if form == 'h' {
+            t.req("POST", "/discord/up/echo2")
+        } else {
+            t.preq("POST", "/discord/up/echo2")
+        };
+        let r = b.header("transfer-encoding", "chunked").body(body).unwrap();
+        let (p, b) = t.send(r).await.unwrap();
+        assert_refusal("503 stall", &p, &b, 503, "unavailable", "body_read_timeout");
+        drop(tx);
+    }
+}
+
+#[cfg(feature = "stage1-probe")]
+mod probe_path_tests {
+    use super::*;
+
+    async fn probe_p(t: &Pt, path: &str) -> (http::response::Parts, Bytes) {
+        let r = t
+            .preq("POST", path)
+            .header("content-length", "2")
+            .body(Body::from("{}"))
+            .unwrap();
+        t.send(r).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn probe_works_under_the_path_form_and_410_body_carries_the_decision() {
+        let t = Pt::new("probe-path").await;
+        for (status, dec) in [
+            (200, ""),
+            (410, "expired"),
+            (423, "denied"),
+            (503, "unavailable"),
+        ] {
+            let (p, b) = probe_p(&t, &format!("/__ap_probe/{status}/1")).await;
+            assert_eq!(p.status.as_u16(), status);
+            assert_eq!(decision(&p), dec);
+            if status != 200 {
+                assert_refusal("probe", &p, &b, status, dec, "probe");
+            }
+        }
+        let (p, b) = probe_p(&t, "/__ap_probe/200/7").await;
+        assert_refusal("probe bad", &p, &b, 400, "denied", "probe_params");
+        let r = Request::builder()
+            .method("POST")
+            .uri(format!("/ap/{}/__ap_probe/200/1", caller_key()))
+            .header("host", AUTH)
+            .header("content-length", "2")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (p, b) = t.send(r).await.unwrap();
+        assert_refusal("probe unknown", &p, &b, 401, "rejected", "caller_rejected");
+        let r = t
+            .preq("POST", "/__ap_probe/200/1")
+            .header("x-ap-caller-key", t.key.as_str())
+            .header("content-length", "2")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (p, b) = t.send(r).await.unwrap();
+        assert_refusal("probe both", &p, &b, 400, "denied", "caller_key_ambiguous");
+        let text = t.audit_text();
+        assert!(text.contains("\"event\":\"completed\""));
+        assert!(!text.contains(&t.key) && !text.contains("/ap/"), "{text}");
+        assert_eq!(t.hits(), 0);
+    }
+}

@@ -34,7 +34,7 @@ KEY_HEADER = "x-ap-caller-key"
 
 CASES = []  # (id, row, name, instance, fn)
 EXPECTED = ["PT-01", "PT-02", "PT-03", "PT-04", "PT-05", "PT-06", "PT-07", "PT-08", "PT-09",
-            "PT-10a", "PT-12", "PT-13", "PT-14", "PT-15", "PT-16"]
+            "PT-10a", "PT-12", "PT-13", "PT-14", "PT-15", "PT-16", "PT-17"]
 
 
 def case(cid, row, name, instance="main"):
@@ -178,11 +178,20 @@ def code_of(r):
         return None
 
 
+def body_decision(r):
+    """The decision carried in the JSON body (Muse's helper drops response headers)."""
+    try:
+        return json.loads(r["body"]).get("ap_decision")
+    except ValueError:
+        return None
+
+
 def refused(c, r, status, decision, code, n_up=0):
     n = len(c.ulog())
     ok = (r["status"] == status and r["headers"].get("x-ap-decision") == decision
-          and code_of(r) == code and n == n_up)
-    return ok, f"status={r['status']} decision={r['headers'].get('x-ap-decision')} code={code_of(r)} upstream={n}"
+          and code_of(r) == code and body_decision(r) == decision and n == n_up)
+    return ok, (f"status={r['status']} decision={r['headers'].get('x-ap-decision')} "
+                f"body_decision={body_decision(r)} code={code_of(r)} upstream={n}")
 
 
 # ------------------------------------------------------------------ rows (instance "main")
@@ -210,6 +219,45 @@ def pt16(c):
     r = c.get("/discord/v1/hop")
     ok = r["status"] == 200 and "proxy-authenticate" not in r["headers"]
     return ok, f"status={r['status']} proxy-authenticate={'proxy-authenticate' in r['headers']}"
+
+
+@case("PT-17", "design 3.1", "caller key in the /ap/<key>/ path prefix: stripped before forwarding, exactly one source, probe works")
+def pt17(c):
+    out, ok = [], True
+    r = exchange(c.port, build("GET", f"/ap/{c.key}/discord/v1/echo?q=1", c.good(key=False)))
+    up = c.ulog()
+    names = [k for k, _ in up[0]["headers"]] if up else []
+    path = up[0]["path"] if up else ""
+    good = (r["status"] == 200 and len(up) == 1 and path == "/v1/echo?q=1" and KEY_HEADER not in names
+            and c.key not in json.dumps(up))
+    ok &= good
+    out.append(f"allow:{r['status']} upstream_path={path}")
+    n = len(up)
+    r = exchange(c.port, build("GET", f"/ap/{c.key}/discord/v1/x", c.good()))
+    good, d = refused(c, r, 400, "denied", "caller_key_ambiguous", n_up=n)
+    ok &= good
+    out.append(f"both:{d}")
+    for name, path in (("unknown", f"/ap/apk_{secrets.token_hex(32)}/discord/v1/x"), ("malformed", "/ap/apk_bad/discord/v1/x")):
+        r = exchange(c.port, build("GET", path, c.good(key=False)))
+        good, d = refused(c, r, 401, "rejected", "caller_rejected", n_up=n)
+        ok &= good
+        out.append(f"{name}:{d}")
+    r = exchange(c.port, build("POST", f"/ap/{c.key}/discord/v1/channels/1/messages",
+                               c.good([("Content-Length", "2")], key=False), b"{}"))
+    good, d = refused(c, r, 423, "denied", "no_grant", n_up=n)
+    ok &= good
+    out.append(f"write:{d}")
+    hs = c.good([("Content-Length", "2")], key=False)
+    r = exchange(c.port, build("POST", f"/ap/{c.key}/__ap_probe/423/10", hs, b"{}"), timeout=20)
+    good = (r["status"] == 423 and r["headers"].get("x-ap-decision") == "denied"
+            and body_decision(r) == "denied")
+    ok &= good
+    out.append(f"probe:{r['status']}")
+    r = exchange(c.port, build("POST", f"/ap/{c.key}/__ap_probe/200/7", hs, b"{}"))
+    good, d = refused(c, r, 400, "denied", "probe_params", n_up=n)
+    ok &= good
+    out.append(f"probe-bad:{d}")
+    return ok, " | ".join(out)
 
 
 @case("PT-02", "acc 2", "POST message create is 423 no_grant with X-AP-Decision: denied, nothing upstream")
@@ -359,7 +407,8 @@ def pt10(c):
     want = {200: None, 410: "expired", 423: "denied", 503: "unavailable"}
     for st, dec in want.items():
         r = res[st]
-        good = r["status"] == st and r["headers"].get("x-ap-decision") == dec and "retry-after" not in r["headers"]
+        good = (r["status"] == st and r["headers"].get("x-ap-decision") == dec
+                and body_decision(r) == dec and "retry-after" not in r["headers"])
         ok &= good
         out.append(f"{st}:{'ok' if good else 'BAD'}")
     r = exchange(c.port, build("POST", "/__ap_probe/200/10", [("Content-Length", "2")], body))
@@ -396,6 +445,16 @@ def pt06(c):
         ("malformed", build("GET", "/discord/v1/x", [(KEY_HEADER, "apk_bad"), ("Authorization", c.auth)])),
         ("panic", build("GET", "/__ap_test_panic", c.good())),
         ("webhook-read", build("GET", hook, c.good())),
+        # The same outcomes with the caller key in the path prefix (no header).
+        ("p-allow", build("GET", f"/ap/{c.key}/discord/v1/echo", c.good(key=False))),
+        ("p-deny-write", build("POST", f"/ap/{c.key}{hook}", c.good([("Content-Length", "2")], key=False), b"{}")),
+        ("p-413", build("POST", f"/ap/{c.key}/discord/v1/upload/x", c.good([("Content-Length", "99999")], key=False))),
+        ("p-path-ambiguous", build("GET", f"/ap/{c.key}/discord/v1/../x", c.good(key=False))),
+        ("p-unknown-key", build("GET", f"/ap/apk_{secrets.token_hex(32)}/discord/v1/x", c.good(key=False))),
+        ("p-malformed-key", build("GET", "/ap/apk_bad/discord/v1/x", c.good(key=False))),
+        ("p-both", build("GET", f"/ap/{c.key}/discord/v1/x", c.good())),
+        ("p-no-route", build("GET", f"/ap/{c.key}/", c.good(key=False))),
+        ("p-panic", build("GET", f"/ap/{c.key}/__ap_test_panic", c.good(key=False))),
     ]
     out = []
     for name, raw in steps:
@@ -408,12 +467,14 @@ def pt06(c):
     e.write_file(cfg, text.replace("port = 18443", "port = 9"))
     r = exchange(c.port, build("GET", "/discord/v1/x", c.good()))
     out.append(f"upstream-down:{r['status']}")
+    r = exchange(c.port, build("GET", f"/ap/{c.key}/discord/v1/x", c.good(key=False)))
+    out.append(f"p-upstream-down:{r['status']}")
     e.write_file(cfg, text)
     r = exchange(c.port, build("GET", "/discord/v1/echo", c.good()))
     alive = r["status"] == 200
     out.append(f"alive-after-panic:{alive}")
     e.stop_proxy()  # flush every file
-    needles = [c.auth.split(" ", 1)[1].encode(), c.key.encode(), c.path_token.encode()]
+    needles = [c.auth.split(" ", 1)[1].encode(), c.key.encode(), c.path_token.encode(), b"/ap/"]
     hits, scanned = [], []
     for root, _d, files in os.walk(e.work):
         rel = os.path.relpath(root, e.work)
@@ -428,7 +489,7 @@ def pt06(c):
             scanned.append(os.path.relpath(p, e.work))
             if any(n in data for n in needles):
                 hits.append(os.path.relpath(p, e.work))
-    log = open(os.path.join(e.work, f"proxy-{c.port}.log"), "rb").read()
+    log = open(os.path.join(e.work, f"proxy-{c.port}.log"), "rb").read()  # stdout and stderr of the proxy
     panicked = b"panic at" in log
     audit_has = os.path.exists(e.audit_file) and b"<redacted>" in open(e.audit_file, "rb").read()
     ok = not hits and alive and panicked and audit_has

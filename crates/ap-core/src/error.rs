@@ -34,6 +34,7 @@ pub enum Code {
     BodyReadTimeout,
     ConnectFailed,
     ProbeParams,
+    CallerKeyAmbiguous,
 }
 
 impl Code {
@@ -67,6 +68,7 @@ impl Code {
             Code::BodyReadTimeout => "request body stalled",
             Code::ConnectFailed => "upstream connection failed",
             Code::ProbeParams => "probe parameters are not allowed",
+            Code::CallerKeyAmbiguous => "caller key given in more than one place",
         }
     }
 
@@ -79,7 +81,8 @@ impl Code {
             | Code::SurrogateAmbiguous
             | Code::FramingRefused
             | Code::AuthorizationDuplicate
-            | Code::ProbeParams => 400,
+            | Code::ProbeParams
+            | Code::CallerKeyAmbiguous => 400,
             Code::CallerRejected
             | Code::SurrogateMissing
             | Code::SurrogateMalformed
@@ -133,6 +136,7 @@ impl Code {
             Code::BodyReadTimeout => "body_read_timeout",
             Code::ConnectFailed => "connect_failed",
             Code::ProbeParams => "probe_params",
+            Code::CallerKeyAmbiguous => "caller_key_ambiguous",
         }
     }
 }
@@ -216,6 +220,7 @@ mod tests {
         assert_eq!(Code::FramingRefused.status(), 400);
         assert_eq!(Code::AuthorizationDuplicate.status(), 400);
         assert_eq!(Code::ProbeParams.status(), 400);
+        assert_eq!(Code::CallerKeyAmbiguous.status(), 400);
         assert_eq!(Code::BodyReadTimeout.status(), 503);
         assert_eq!(Code::ConnectFailed.status(), 503);
     }
@@ -250,6 +255,7 @@ mod tests {
             Code::BodyReadTimeout,
             Code::ConnectFailed,
             Code::ProbeParams,
+            Code::CallerKeyAmbiguous,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in all {
@@ -260,6 +266,6 @@ mod tests {
             );
             assert!(seen.insert(s), "duplicate {s}");
         }
-        assert_eq!(seen.len(), 27);
+        assert_eq!(seen.len(), 28);
     }
 }

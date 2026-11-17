@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Rows registered in `tests/matrix/passthrough.py`.
-const ROWS: usize = 15;
+const ROWS: usize = 16;
 
 /// Directory holding the built binary. `CARGO_BIN_EXE_auth-proxy` is set by cargo for this package's
 /// binaries, so it holds up when cargo keeps test executables in a separate build directory.

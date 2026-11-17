@@ -1,6 +1,6 @@
 # auth-proxy
 
-![auth-proxy architecture: the agent holds only a surrogate; auth-proxy swaps in the real credential; ap-egress handles allowlisted CONNECT egress; the runtime registers surrogate hashes over the session plane.](docs/images/architecture.svg)
+![auth-proxy architecture: the agent holds only a surrogate; auth-proxy swaps in the real credential; ap-egress handles allowlisted CONNECT egress; the agent registers surrogates through the runtime, which registers them with the proxy over the session plane; per-UID netfilter rules and a self-check confine the agent. Standalone passthrough mode is described in a note in the image.](docs/images/architecture.svg)
 
 ## How it works
 

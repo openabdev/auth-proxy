@@ -44,7 +44,7 @@ KEY_HEADER = "x-ap-caller-key"
 CASES = []  # (id, row, name, instance, fn)
 EXPECTED = ["PT-01", "PT-02", "PT-03", "PT-04", "PT-05", "PT-06", "PT-07", "PT-08", "PT-09",
             "PT-10a", "PT-12", "PT-13", "PT-14", "PT-15", "PT-16", "PT-17",
-            "PT-18", "PT-19", "PT-20", "PT-21", "PT-22", "PT-23", "PT-24", "PT-25"]
+            "PT-18", "PT-19", "PT-20", "PT-21", "PT-22", "PT-23", "PT-24", "PT-25", "PT-27"]
 # Rows that need a build without the probe route (--noprobe-bin).
 EXPECTED_NOPROBE = ["PT-26", "PT-12n", "PT-13n"]
 
@@ -1030,6 +1030,64 @@ def pt26(c):
     out.append(f"probe_enabled_exit={p.returncode}")
     out.append(f"upstream={len(c.ulog())}")
     return ok, " ".join(out)
+
+
+@case("PT-27", "acc 12", "sentinel sweep on the real binary: approval page, list and caller answers, a panic while a hold exists, then every file and the proxy log", "hold")
+def pt27(c):
+    e = c.e
+    c.start_hold()
+    raw, _ = c.held_req(7)
+    t = Caller(c.port, raw)
+    rid = only(c, c.wait_pending(1))
+    seen = []
+
+    def page(path, accept):
+        conn = http.client.HTTPConnection("127.0.0.1", PORT_E, timeout=10)
+        conn.request("GET", path, headers={"Authorization": c.basic, "Accept": accept})
+        r = conn.getresponse()
+        data = r.read().decode(errors="replace")
+        seen.append(f"{r.getheaders()} {data}")
+        conn.close()
+        return r.status
+
+    sts = [page("/pending", "text/html"), page("/pending", "application/json"),
+           page(f"/pending/{rid}", "text/html"), page(f"/pending/{rid}", "application/json")] if rid else []
+    # Wrong password: the refusal must not echo it.
+    conn = http.client.HTTPConnection("127.0.0.1", PORT_E, timeout=10)
+    conn.request("GET", "/pending", headers={"Authorization": "Basic " + base64.b64encode(b"approver:SENTINEL-WRONG-PW").decode()})
+    bad = conn.getresponse()
+    seen.append(f"{bad.status} {bad.read().decode(errors='replace')}")
+    conn.close()
+    # Panic injected on the public listener while the hold exists: the entry survives.
+    r = c.get("/__ap_test_panic", port=c.port)
+    still = len(c.pending())
+    ast, res = c.decide(rid, "approve") if rid else (0, None)
+    caller = t.result()
+    if caller:
+        seen.append(f"{caller['headers']} {caller['body']!r}")
+    e.stop_proxy()  # flush every file
+    needles = [c.auth.split(" ", 1)[1], c.key, c.pw, base64.b64encode(f"approver:{c.pw}".encode()).decode(), "SENTINEL-WRONG-PW"]
+    in_responses = [n for n in needles if any(n in x for x in seen)]
+    hits = []
+    for root, _d, files in os.walk(e.work):
+        rel = os.path.relpath(root, e.work)
+        if rel == "secrets" or rel.startswith("secrets" + os.sep):
+            continue
+        for fn in files:
+            p = os.path.join(root, fn)
+            try:
+                data = open(p, "rb").read()
+            except OSError:
+                continue
+            if any(n.encode() in data for n in needles):
+                hits.append(os.path.relpath(p, e.work))
+    log = open(os.path.join(e.work, f"proxy-{PORT_D}.log"), "rb").read()
+    ok = (rid is not None and all(s == 200 for s in sts) and bad.status == 401 and not in_responses
+          and not hits and b"panic at" in log and still == 1 and ast == 200
+          and caller is not None and caller["status"] == 200)
+    return ok, (f"page_statuses={sts} wrong_pw={bad.status} in_responses={len(in_responses)} files_with_sentinel={hits} "
+                f"panic_line={b'panic at' in log} pending_after_panic={still} approve={ast}/{res} "
+                f"caller={caller and caller['status']}")
 
 
 CASES.append(("PT-12n", "acc 28", "framing conflicts on a build without the probe route", "np-main", pt12))

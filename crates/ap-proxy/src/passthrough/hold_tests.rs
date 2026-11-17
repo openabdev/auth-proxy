@@ -36,6 +36,10 @@ const AUTH: &str = "gate.example.test";
 const SENTINEL: &str = "SENTINEL-DISCORD-TOKEN-0001";
 const PATH_TOKEN: &str = "SENTINEL-PATH-TOKEN-0002";
 
+// The cross-cutting leak suite and refusal table reuse this module's fixture.
+#[path = "../leak_tests.rs"]
+mod leak_tests;
+
 // ---------------------------------------------------------------- mock upstreams
 
 #[derive(Clone, Debug)]

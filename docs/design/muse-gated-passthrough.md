@@ -1,8 +1,11 @@
 # Muse gated passthrough: a hold-the-connection approval gate
 
-Status: design only, no code. Branch `design/muse-gated-passthrough`, based on `main` at the merge of
-PR #11 (`b3f7864`). Scope: a minimal proof of concept (PoC) for one consumer, Muse calling the Discord
-HTTP API through auth-proxy in standalone service mode.
+Status: stage 1 is implemented and measured. Stage 2 (held-connection approval) is implemented on
+branch `feat/muse-stage2` and tested in CI against a mock upstream; it is not deployed, and the
+through-the-front measurements (hold window, disconnect signal) are still open. Scope: a minimal proof
+of concept (PoC) for one consumer, Muse calling the Discord HTTP API through auth-proxy in standalone
+service mode. See "Stage 2 implementation notes" at the end of section 7 for where the code differs from
+this text.
 
 This document supersedes, for this PoC only, two earlier sketches: the "platform vault path" in the
 README Deployment models section, and the parked-and-polled design in
@@ -898,6 +901,36 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
     `audit_unavailable` with no notification and no entry, and the mock upstream records nothing; an allowed
     read still passes. With the sink failing between approve and send, the caller gets 503
     `audit_unavailable`, the approve result is `audit_unavailable`, and nothing reaches the mock.
+
+### Stage 2 implementation notes
+
+Where the implementation differs from, or settles, the text above:
+
+- **Codes.** The `Upgrade` row is answered with the Phase 1 code `websocket_unsupported` (501) and the
+  `CONNECT` row with `connect_refused` (405), not the names `upgrade_not_supported` and
+  `method_not_allowed` in the section 3.5 table. Status and decision header match the table.
+- **Unknown route.** An unknown route (and the approval paths, which are not routes on the public
+  listener) is answered 423 `route_unknown` with `X-AP-Decision`, as in stage 1, not 404.
+- **Milestones.** "Connect done" (`forward_started`) is the first poll of the request body stream, which
+  reqwest does only after a connection exists. "First byte handed over" resolves when the first body chunk
+  is yielded. A test checks that the upstream has accepted the connection and received no request byte
+  while the milestone hook is paused.
+- **Disconnect.** Hyper drops the handler future when the peer closes (tested on the direct path), so no
+  peer-watch fallback was needed. Through the front it is still unmeasured.
+- **Notification on supersede.** The notifier has one `notify` method. A new distinct entry notifies once;
+  a supersede does not notify again, and the old entry's page links to the newest one. An in-place update
+  of the notification would need a second method.
+- **Policy file removed.** Waiting holds are answered 503 `dropped_on_reload`, and new requests get 503
+  `policy_unavailable`.
+- **Non-UTF-8 bodies.** The approval page shows a lossy rendering with a banner. No new refusal.
+- **Test hooks.** `AP_TEST_HOLD_PAUSE_MS` exists only under the `matrix-upstream` feature and CI greps it
+  out of the default release binary.
+- **Black-box coverage of the front.** Acceptance 11 (network half), 18 and 19 through the real front, and
+  the hold window through the front need the deployment and are on the owner checklist.
+- **Duplicate delivery.** Exactly-once is not claimed: forwarded, response lost, retried, approved again
+  runs twice (see `docs/runbooks/muse-stage2.md`).
+- **Not claimed.** Protection from the Muse platform, exactly-once delivery, and an approval plane that is
+  unreachable from the caller path (a network control).
 
 ## 8. Open questions for the owner
 

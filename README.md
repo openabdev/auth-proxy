@@ -114,6 +114,24 @@ The gate constrains the agent, not the Muse platform: Muse's egress holds the re
 can call Discord directly. See `docs/design/muse-gated-passthrough.md`, `docs/runbooks/muse-stage1.md`
 and `deploy/muse/pilot-policy.example.toml`.
 
+## Muse gated passthrough (stage 2, pilot)
+
+Stage 2 adds a third verdict, `hold`, for writes the owner wants to approve one by one. A held request
+keeps its connection open. The gate tells the owner a request is waiting (a fixed text and a link, never
+the content), the owner opens a separate approval page, and only an explicit approve forwards the request.
+Deny, expiry (`hold_secs`), a caller who gives up, a policy reload that drops the identity, and shutdown
+all end the request with a refusal and nothing sent upstream. The connection is the state: there is no
+queue, and a restart forgets every held request.
+
+The gate constrains the agent, not the Muse platform. Muse's egress holds the real Discord token and can
+call Discord directly. A stolen caller key lets someone send requests as that identity (the per-identity
+cap and the cooldown bound the prompt spam) and does not give them approval rights.
+
+Not claimed: exactly-once delivery (if the request was forwarded and the response was lost, a retry can be
+approved and forwarded again), protection against Muse itself, a measured end-to-end hold window through the
+real front, or a measured disconnect signal through the front. See `docs/runbooks/muse-stage2.md`
+and `docs/design/muse-gated-passthrough.md`.
+
 ## Features
 
 Implemented and tested in Phase 1:

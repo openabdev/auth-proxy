@@ -71,14 +71,14 @@ mv policy.toml.new policy.toml
 There is no reload command and no signal. The gate re-reads the file on the next request that needs the policy.
 A file that cannot be read or validated is not logged: the gate drops the policy and every request, with the old
 key too, gets 503 `policy_unavailable` until a valid file is in place (the refusal appears in the audit stream, not
-in the journal). So the request itself is the check. Run both commands in step 6 with the new key (step 6 expects
-the right-key request to pass the gate) and also with the old key. Required result:
+in the journal). So the request itself is the check. Send command A from step 6 once with the new key and once with the old key
+(it needs no platform change). Required result:
 
-- the new key and the old key both pass the gate (no `X-AP-Decision` header, see step 6), and
-- no response is 503 `policy_unavailable`. If one is, restore the previous file at once (`mv` the saved copy back)
-  and look in the audit stream for `policy_unavailable` lines.
+- both requests pass the gate: no `X-AP-Decision` header, the upstream's own answer;
+- neither returns 503 `policy_unavailable`. If one does, put the previous file back at once (`mv` the saved copy
+  over the live file) and look for `policy_unavailable` lines in the audit stream.
 
-The platform keeps working with the old key through this step, so a failure here is visible before step 5.
+The platform keeps using the old key through this step, so a failure shows up here, before step 5.
 
 ## 5. Re-register the connector on the calling platform
 

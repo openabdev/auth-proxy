@@ -496,6 +496,113 @@ class ValidatorTests(unittest.TestCase):
         copy.edit_pod(mutate)
         self.assert_fails(copy, "self-check-interval-agrees")
 
+    def _flag(self, copy, flag, value):
+        def mutate(pod):
+            cmd = copy.container(pod, "proxy")["command"]
+            cmd[cmd.index(flag) + 1] = value
+        copy.edit_pod(mutate)
+
+    def test_wrong_rules_owner_uid_flag_is_refused(self):
+        copy = Copy(self)
+        self._flag(copy, "--netfilter-rules-uid", "1000")
+        self.assert_fails(copy, "proxy-status-owner-uids-match-the-writers")
+
+    def test_wrong_probe_owner_uid_flag_is_refused(self):
+        copy = Copy(self)
+        self._flag(copy, "--netfilter-probe-uid", "0")
+        self.assert_fails(copy, "proxy-status-owner-uids-match-the-writers")
+
+    def test_missing_owner_uid_flags_are_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            cmd = copy.container(pod, "proxy")["command"]
+            i = cmd.index("--netfilter-probe-uid")
+            del cmd[i:i + 2]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "proxy-status-owner-uids-match-the-writers")
+
+    def test_agent_mounting_a_status_volume_is_refused(self):
+        for vol in ("netcheck-rules", "netcheck-probe"):
+            copy = Copy(self)
+
+            def mutate(pod, vol=vol):
+                copy.container(pod, "agent")["volumeMounts"].append(
+                    {"name": vol, "mountPath": "/x"})
+
+            copy.edit_pod(mutate)
+            self.assert_fails(copy, "agent-cannot-write-the-status-volumes")
+
+    def test_fsgroup_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["securityContext"]["fsGroup"] = 1000
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "no-fsgroup-and-no-hostpath-volumes")
+
+    def test_hostpath_status_volume_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for v in pod["spec"]["volumes"]:
+                if v["name"] == "netcheck-probe":
+                    v.pop("emptyDir")
+                    v["hostPath"] = {"path": "/tmp/x"}
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "no-fsgroup-and-no-hostpath-volumes")
+
+    def test_unconfined_seccomp_on_netcheck_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "netcheck")["securityContext"]["seccompProfile"] = {
+                "type": "Unconfined"}
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "pod-seccomp-runtime-default-and-no-container-override")
+
+    def test_pod_without_seccomp_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["securityContext"].pop("seccompProfile")
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "pod-seccomp-runtime-default-and-no-container-override")
+
+    def test_host_namespaces_are_refused(self):
+        for key in ("hostNetwork", "hostPID", "hostIPC"):
+            copy = Copy(self)
+
+            def mutate(pod, key=key):
+                pod["spec"][key] = True
+
+            copy.edit_pod(mutate)
+            self.assert_fails(copy, "no-host-namespaces")
+
+    def test_netcheck_with_another_command_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "netcheck")["command"] = [
+                "/bin/sh", "-c", "while true; do echo state=ok > /run/netcheck/status; sleep 1; done"]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "netcheck-and-netprobe-run-the-expected-programs")
+
+    def test_netprobe_with_another_command_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "netprobe")["command"] = ["/bin/true"]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "netcheck-and-netprobe-run-the-expected-programs")
+
     def test_proxy_without_the_readiness_probe_is_refused(self):
         copy = Copy(self)
 

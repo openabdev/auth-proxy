@@ -198,6 +198,13 @@ spec:
         - /run/auth-proxy-netcheck/probe/status
         - --netfilter-interval-secs
         - "30"
+        # The only owners the proxy accepts for the two status files: netcheck runs as root and
+        # netprobe as the agent UID. A file of another owner, or one that group or world can write,
+        # fails the check.
+        - --netfilter-rules-uid
+        - "0"
+        - --netfilter-probe-uid
+        - "1000"
       # Not ready until the self-check passes, and not ready while it fails. The image has no shell
       # or curl, so the probe is the binary itself, asking its admin socket. A failed self-check
       # does not restart the container: restarting the proxy cannot bring the rules back.
@@ -352,6 +359,10 @@ spec:
       emptyDir: {}
     # Status files of the netfilter self-check, one volume per writer so that neither checker can
     # replace the other's file. The proxy mounts both read-only. No other container mounts either.
+    # Write surface of the agent UID (1000): it mounts neither volume, so it can create nothing in
+    # them. The agent can write only home, work, tmp and the agent-runtime socket directory. The
+    # proxy also refuses a status file that is not a regular file owned by the checker's UID, or
+    # that group or world can write, so a planted file would fail the check. No fsGroup is set.
     - name: netcheck-rules
       emptyDir: {}
     - name: netcheck-probe

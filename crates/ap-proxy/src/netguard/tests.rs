@@ -8,6 +8,12 @@ use crate::test_support::{buffer_sink, Scratch};
 
 const MAX: Duration = Duration::from_secs(20);
 
+/// The owner of the files the tests create.
+fn me() -> u32 {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}
+
 fn ok(tick: &str) -> String {
     format!("tick={tick} state=ok reason=ok\n")
 }
@@ -19,7 +25,7 @@ fn fail(tick: &str, reason: &str) -> String {
 fn fresh(text: &str) -> Option<Reading<'_>> {
     Some(Reading {
         text,
-        age: Duration::ZERO,
+        age: Some(Duration::ZERO),
     })
 }
 
@@ -172,7 +178,7 @@ fn a_file_left_by_a_dead_checker_is_not_fresh_when_the_proxy_starts() {
     let aged = |text| {
         Some(Reading {
             text,
-            age: Duration::from_secs(600),
+            age: Some(Duration::from_secs(600)),
         })
     };
     assert_eq!(
@@ -337,6 +343,8 @@ async fn the_poll_loop_opens_closes_and_reopens_with_the_files() {
         rules_status: rules.clone(),
         probe_status: probe.clone(),
         interval: Duration::ZERO,
+        rules_uid: me(),
+        probe_uid: me(),
     };
     let gate = Gate::new();
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -384,4 +392,151 @@ async fn the_poll_loop_opens_closes_and_reopens_with_the_files() {
         "{log:?}"
     );
     assert!(log.contains(&"failed:rules:missing".to_string()), "{log:?}");
+}
+
+#[test]
+fn a_file_with_an_unknown_age_stays_stale_until_a_new_tick() {
+    let t0 = Instant::now();
+    let mut g = Guard::new(MAX, t0);
+    let (r, p) = (ok("r"), ok("p"));
+    let unaged = |text| Some(Reading { text, age: None });
+    assert_eq!(
+        g.observe(t0, [unaged(&r), unaged(&p)]),
+        Some(GuardState::Unverified("rules:stale".into()))
+    );
+    let (r2, p2) = (ok("r2"), ok("p2"));
+    assert_eq!(
+        g.observe(t0, [fresh(&r2), fresh(&p2)]),
+        Some(GuardState::Ready)
+    );
+}
+
+#[test]
+fn an_open_gate_closes_by_itself_when_the_monitor_stops_publishing() {
+    let gate = Gate::new();
+    gate.set(GuardState::Ready);
+    assert_eq!(gate.state(), GuardState::Ready);
+    let later = Instant::now() + GATE_STALE + Duration::from_secs(1);
+    assert_eq!(
+        gate.state_at(later),
+        GuardState::Failed("gate:stale".into())
+    );
+}
+
+fn good_file(dir: &Path) -> PathBuf {
+    let path = dir.join("status");
+    std::fs::write(&path, ok("t")).expect("write");
+    path
+}
+
+#[test]
+fn a_regular_file_owned_by_the_writer_reads() {
+    let scratch = Scratch::new("rs-ok");
+    let path = good_file(scratch.path());
+    let (text, age) = read_status(&path, me()).expect("reads");
+    assert_eq!(text, ok("t"));
+    assert!(age.is_some());
+}
+
+#[test]
+fn a_status_file_of_the_wrong_owner_or_writable_by_others_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new("rs-own");
+    let path = good_file(scratch.path());
+    assert!(read_status(&path, me() + 1).is_none(), "wrong owner");
+    for mode in [0o664, 0o646, 0o666] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        assert!(read_status(&path, me()).is_none(), "mode {mode:o}");
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    assert!(read_status(&path, me()).is_some());
+}
+
+#[test]
+fn an_oversized_status_file_is_refused() {
+    let scratch = Scratch::new("rs-big");
+    let path = scratch.path().join("status");
+    std::fs::write(&path, "x".repeat(MAX_STATUS_BYTES as usize + 1)).expect("write");
+    assert!(read_status(&path, me()).is_none());
+}
+
+#[test]
+fn a_symlink_is_refused_even_to_a_good_file() {
+    let scratch = Scratch::new("rs-link");
+    let target = good_file(scratch.path());
+    let link = scratch.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    assert!(read_status(&link, me()).is_none());
+}
+
+#[test]
+fn a_directory_is_refused() {
+    let scratch = Scratch::new("rs-dir");
+    let dir = scratch.path().join("status");
+    std::fs::create_dir(&dir).expect("mkdir");
+    assert!(read_status(&dir, me()).is_none());
+}
+
+fn mkfifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
+    // SAFETY: c is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "mkfifo");
+}
+
+#[test]
+fn a_fifo_with_no_writer_is_refused_without_blocking() {
+    let scratch = Scratch::new("rs-fifo");
+    let path = scratch.path().join("status");
+    mkfifo(&path);
+    let start = Instant::now();
+    assert!(read_status(&path, me()).is_none());
+    assert!(start.elapsed() < Duration::from_secs(1), "must not block");
+}
+
+#[test]
+fn a_unix_socket_is_refused() {
+    let scratch = Scratch::new("rs-sock");
+    let path = scratch.path().join("status");
+    let _l = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+    assert!(read_status(&path, me()).is_none());
+}
+
+#[tokio::test]
+async fn a_fifo_at_a_status_path_closes_the_gate_and_never_stalls_the_runtime() {
+    for which in ["rules", "probe"] {
+        let scratch = Scratch::new("mon-fifo");
+        let rules = scratch.path().join("rules");
+        let probe = scratch.path().join("probe");
+        write(&rules, &ok("r1"));
+        write(&probe, &ok("p1"));
+        let opts = NetfilterOpts {
+            rules_status: rules.clone(),
+            probe_status: probe.clone(),
+            interval: Duration::ZERO,
+            rules_uid: me(),
+            probe_uid: me(),
+        };
+        let gate = Gate::new();
+        let task = tokio::spawn(monitor(
+            opts,
+            Duration::from_millis(20),
+            Arc::clone(&gate),
+            |_| {},
+        ));
+        wait_for(&gate, |s| *s == GuardState::Ready).await;
+        let target = if which == "rules" { &rules } else { &probe };
+        std::fs::remove_file(target).expect("remove");
+        mkfifo(target);
+        let s = wait_for(&gate, |s| matches!(s, GuardState::Failed(_))).await;
+        assert_eq!(s, GuardState::Failed(format!("{which}:missing")));
+        // The runtime still answers: the single worker is not stuck in an open().
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::time::sleep(Duration::from_millis(10)),
+        )
+        .await
+        .expect("runtime alive");
+        task.abort();
+    }
 }

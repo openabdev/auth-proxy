@@ -44,7 +44,8 @@ mod tests;
 /// Command-line usage, printed with every argument error.
 pub const USAGE: &str = "usage: auth-proxy --config <path> [--session-socket <path>] \
 [--admin-socket <path>] [--secret-root <dir>] [--token-dir <dir>] [--expiry-store <file>] \
-[--netfilter-rules-status <file> --netfilter-probe-status <file> [--netfilter-interval-secs <n>]]\n\
+[--netfilter-rules-status <file> --netfilter-probe-status <file> [--netfilter-interval-secs <n>] \
+[--netfilter-rules-uid <uid>] [--netfilter-probe-uid <uid>]]\n\
        auth-proxy --check-ready [--admin-socket <path>]";
 
 /// Where the process reads its config, binds its sockets, and finds its secrets and tokens.
@@ -78,6 +79,8 @@ where
     let mut rules_status = None;
     let mut probe_status = None;
     let mut interval = None;
+    let mut rules_uid = netguard::DEFAULT_RULES_UID;
+    let mut probe_uid = netguard::DEFAULT_PROBE_UID;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let value = args
@@ -100,6 +103,16 @@ where
                     ))
                 }
             },
+            "--netfilter-rules-uid" => {
+                rules_uid = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("--netfilter-rules-uid must be a number\n{USAGE}"))?
+            }
+            "--netfilter-probe-uid" => {
+                probe_uid = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("--netfilter-probe-uid must be a number\n{USAGE}"))?
+            }
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
     }
@@ -111,6 +124,8 @@ where
             interval: std::time::Duration::from_secs(
                 interval.unwrap_or(netguard::DEFAULT_INTERVAL_SECS),
             ),
+            rules_uid,
+            probe_uid,
         }),
         (None, None) if interval.is_none() => None,
         _ => {

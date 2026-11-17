@@ -19,6 +19,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -43,6 +44,15 @@ pub const STALE_SLACK: Duration = Duration::from_secs(5);
 pub const POLL: Duration = Duration::from_secs(1);
 /// A status file is one short line. Anything larger is malformed.
 const MAX_STATUS_BYTES: u64 = 512;
+/// The gate counts as stale when the monitor has not published for this long. It closes the gate
+/// if the monitor task dies or stalls, so an open gate always rests on a recent reading.
+const GATE_STALE: Duration = Duration::from_secs(5);
+/// One read of a status file must finish within this. A read that does not counts as missing.
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Default owner of the rules status file: `netcheck` runs as root.
+pub const DEFAULT_RULES_UID: u32 = 0;
+/// Default owner of the probe status file: `netprobe` runs as the agent UID.
+pub const DEFAULT_PROBE_UID: u32 = 1000;
 
 /// Where the checkers write and how often they run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +60,10 @@ pub struct NetfilterOpts {
     pub rules_status: PathBuf,
     pub probe_status: PathBuf,
     pub interval: Duration,
+    /// The only owner the rules status file may have.
+    pub rules_uid: u32,
+    /// The only owner the probe status file may have.
+    pub probe_uid: u32,
 }
 
 impl NetfilterOpts {
@@ -89,7 +103,9 @@ impl GuardState {
 #[derive(Debug, Clone, Copy)]
 pub struct Reading<'a> {
     pub text: &'a str,
-    pub age: Duration,
+    /// Age of the file by its mtime. `None` when it is unknown (no mtime, or one in the future),
+    /// which counts as stale until a new tick arrives.
+    pub age: Option<Duration>,
 }
 
 /// A parsed status line.
@@ -145,6 +161,8 @@ struct Source {
     name: &'static str,
     last_tick: Option<String>,
     last_change: Instant,
+    /// The first reading could not be aged, so the source is stale until a new tick arrives.
+    unaged: bool,
 }
 
 /// The state machine. It holds no clock and does no I/O: the caller passes the time and the two
@@ -162,6 +180,7 @@ impl Guard {
             name,
             last_tick: None,
             last_change: now,
+            unaged: false,
         };
         Guard {
             max_age,
@@ -222,17 +241,21 @@ impl Guard {
             // First sight counts the file's own age, so a file left behind by a dead checker
             // does not look fresh when the proxy restarts. A later new tick is fresh by itself.
             let first = src.last_tick.is_none();
-            src.last_change = if first {
-                now.checked_sub(reading.age).unwrap_or(now)
-            } else {
-                now
-            };
+            src.unaged = false;
+            src.last_change = now;
+            if first {
+                // An unknown age, or one the monotonic clock cannot go back by, is not trusted.
+                match reading.age.and_then(|a| now.checked_sub(a)) {
+                    Some(t) => src.last_change = t,
+                    None => src.unaged = true,
+                }
+            }
             src.last_tick = Some(parsed.tick.clone());
         }
         if !parsed.ok {
             return Some(format!("{name}:{}", parsed.reason));
         }
-        if now.saturating_duration_since(src.last_change) > max_age {
+        if src.unaged || now.saturating_duration_since(src.last_change) > max_age {
             return Some(format!("{name}:stale"));
         }
         None
@@ -241,42 +264,73 @@ impl Guard {
 
 /// The shared gate state, read by the agent listener and the readiness endpoint.
 pub struct Gate {
-    state: Mutex<GuardState>,
+    state: Mutex<(GuardState, Instant)>,
 }
 
 impl Gate {
     pub fn new() -> Arc<Gate> {
         Arc::new(Gate {
-            state: Mutex::new(GuardState::Unverified("starting".to_string())),
+            state: Mutex::new((
+                GuardState::Unverified("starting".to_string()),
+                Instant::now(),
+            )),
         })
     }
 
     pub fn state(&self) -> GuardState {
+        self.state_at(Instant::now())
+    }
+
+    fn state_at(&self, now: Instant) -> GuardState {
         match self.state.lock() {
-            Ok(s) => s.clone(),
+            // An open gate needs a recent publication from the monitor. If the monitor task has
+            // died or stalled, the gate closes by itself.
+            Ok(s)
+                if s.0 == GuardState::Ready && now.saturating_duration_since(s.1) > GATE_STALE =>
+            {
+                GuardState::Failed("gate:stale".to_string())
+            }
+            Ok(s) => s.0.clone(),
             // A poisoned lock closes the gate.
             Err(_) => GuardState::Failed("gate:poisoned".to_string()),
         }
     }
 
+    /// Publish the monitor's current state. The monitor calls it on every poll.
     fn set(&self, next: GuardState) {
         let mut s = match self.state.lock() {
             Ok(s) => s,
             Err(p) => p.into_inner(),
         };
-        *s = next;
+        *s = (next, Instant::now());
     }
 }
 
-/// Read one status file: its text and its age. `None` when it cannot be read or is too large.
-pub fn read_status(path: &Path) -> Option<(String, Duration)> {
-    let file = fs::File::open(path).ok()?;
-    let age = file
-        .metadata()
+/// Read one status file: its text and its age. `None` when it cannot be trusted or read.
+///
+/// The file is opened with `O_NONBLOCK` and `O_NOFOLLOW`, so a FIFO cannot block the open and a
+/// symlink is refused. The opened descriptor is then checked: it must be a regular file owned by
+/// `owner_uid`, not writable by group or world, and no larger than one status line. Anything else
+/// (FIFO, socket, directory, device, symlink, wrong owner, oversized) reads as `None`, and the gate
+/// treats that as a failing check. The read never blocks: a regular file does not block on read.
+pub fn read_status(path: &Path, owner_uid: u32) -> Option<(String, Option<Duration>)> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file()
+        || meta.uid() != owner_uid
+        || meta.mode() & 0o022 != 0
+        || meta.len() > MAX_STATUS_BYTES
+    {
+        return None;
+    }
+    let age = meta
+        .modified()
         .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .unwrap_or(Duration::ZERO);
+        .and_then(|t| SystemTime::now().duration_since(t).ok());
     let mut text = String::new();
     file.take(MAX_STATUS_BYTES + 1)
         .read_to_string(&mut text)
@@ -287,6 +341,16 @@ pub fn read_status(path: &Path) -> Option<(String, Duration)> {
     Some((text, age))
 }
 
+/// `read_status` on a blocking thread with a deadline, so a stuck filesystem can never stall the
+/// monitor or a worker. A read that misses the deadline counts as missing.
+async fn read_status_bounded(path: PathBuf, uid: u32) -> Option<(String, Option<Duration>)> {
+    let task = tokio::task::spawn_blocking(move || read_status(&path, uid));
+    match tokio::time::timeout(READ_TIMEOUT, task).await {
+        Ok(Ok(r)) => r,
+        _ => None,
+    }
+}
+
 fn audit_state(audit: &AuditSink, state: &GuardState) {
     let line = json!({
         "event": "netfilter",
@@ -295,7 +359,9 @@ fn audit_state(audit: &AuditSink, state: &GuardState) {
     })
     .to_string();
     audit.write_line(&line);
-    eprintln!(
+    // A failed write to stderr must not panic: the monitor has to keep running.
+    let _ = writeln!(
+        std::io::stderr(),
         "auth-proxy: netfilter self-check {}: {}",
         state.name(),
         state.reason()
@@ -310,7 +376,7 @@ pub fn spawn_monitor(opts: NetfilterOpts, gate: Arc<Gate>, app: Arc<App>) {
     }));
 }
 
-fn view(r: &Option<(String, Duration)>) -> Option<Reading<'_>> {
+fn view(r: &Option<(String, Option<Duration>)>) -> Option<Reading<'_>> {
     r.as_ref().map(|(text, age)| Reading { text, age: *age })
 }
 
@@ -322,10 +388,11 @@ where
     let mut guard = Guard::new(opts.max_age(), Instant::now());
     on_change(guard.state());
     loop {
-        let rules = read_status(&opts.rules_status);
-        let probe = read_status(&opts.probe_status);
-        if let Some(next) = guard.observe(Instant::now(), [view(&rules), view(&probe)]) {
-            gate.set(next.clone());
+        let rules = read_status_bounded(opts.rules_status.clone(), opts.rules_uid).await;
+        let probe = read_status_bounded(opts.probe_status.clone(), opts.probe_uid).await;
+        let changed = guard.observe(Instant::now(), [view(&rules), view(&probe)]);
+        gate.set(guard.state().clone());
+        if let Some(next) = changed {
             on_change(&next);
         }
         tokio::time::sleep(poll).await;

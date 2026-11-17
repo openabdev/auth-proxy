@@ -17,7 +17,7 @@ get one.
 | Check | Container | Privilege | What it does |
 |---|---|---|---|
 | Rule presence | `netcheck` | root, `NET_ADMIN` only | Compares `iptables -S OUTPUT` and `ip6tables -S OUTPUT` with the snapshot `netinit` wrote when it installed the rules. Any difference (a missing, extra, reordered or changed rule, or a changed default policy) fails. |
-| Functional probe | `netprobe` | agent UID, no capability | Runs as UID 1000, so the rules apply to it exactly as to the agent. Tries a TCP connect to a loopback port that is not the proxy or egress port, a TCP connect to a routable non-loopback address (`192.0.2.1:443`, TEST-NET-1, never answered), and a UDP DNS query to the first resolver in `/etc/resolv.conf`. Each must be stopped on the host: a refused connect, or for UDP a send that fails with a permission error (what a local `REJECT` returns for UDP, measured on k3s). A connection, a reply, a timeout or any other error fails. |
+| Functional probe | `netprobe` | agent UID, no capability | Runs as UID 1000, so the rules apply to it exactly as to the agent. Tries a TCP connect to a loopback port that is not the proxy or egress port, a TCP connect to a routable non-loopback address (`192.0.2.1:443`, TEST-NET-1, never answered), and a UDP DNS query to the first resolver in `/etc/resolv.conf`. Each must be refused: a refused connect, or for UDP a send that fails with a permission error (what a local `REJECT` returns for UDP, measured on k3s). A refusal can also come from the network (a CNI policy or an upstream `REJECT`), so the loopback leg, which nothing outside the pod can answer, and the exact rule comparison by `netcheck` carry the local guarantee. A connection, a reply, a timeout or any other error fails. |
 
 Each container writes one line to its own status file every interval (default 30 s):
 
@@ -118,7 +118,30 @@ Proxy flags (all in the manifest):
 | `--netfilter-rules-status <file>` | Status file written by `netcheck`. |
 | `--netfilter-probe-status <file>` | Status file written by `netprobe`. |
 | `--netfilter-interval-secs <n>` | The checkers' interval, 1 to 3600, default 30. The stale limit is `2n + 5` seconds. |
+| `--netfilter-rules-uid <uid>` | The only owner accepted for the rules status file. Default 0 (`netcheck` runs as root). |
+| `--netfilter-probe-uid <uid>` | The only owner accepted for the probe status file. Default 1000 (`netprobe` runs as the agent UID). |
 
 Both status flags go together; with neither, there is no gate. Keep the interval the same in
 `netcheck` (`INTERVAL`), `netprobe` (`--interval-secs`) and the proxy flag. The manifest validator
 checks that the three agree.
+
+## Status files are untrusted input
+
+The agent UID shares the pod, so the proxy does not trust a status path just because it is mounted.
+Each file is opened with `O_NONBLOCK` and `O_NOFOLLOW`, then the opened descriptor is checked. It
+must be a regular file, owned by the expected UID, not writable by group or world, and at most 512
+bytes. A FIFO, socket, directory, symlink, device, oversized file or wrong owner counts as a failing
+check (`503 netfilter_unverified`, not ready). Reads run on a blocking thread with a 2 s deadline, so
+no status path can stall a worker or the admin socket. The gate also closes by itself
+(`gate:stale`) if the monitor stops publishing for 5 s. A file whose age is unknown is stale until a
+new tick arrives.
+
+Write surface in the pod (the manifest validator asserts each point):
+
+- The agent UID (1000) mounts neither status volume. It can write only `home`, `work`, `tmp` and the
+  `agent-runtime` socket directory. It cannot create, replace or link anything in either status
+  volume.
+- `netcheck-rules` is writable only by `netcheck` (root). `netcheck-probe` is writable only by
+  `netprobe` (UID 1000, the agent UID, but a separate process that mounts nothing else). The proxy
+  mounts both read-only. Both are `emptyDir`; there is no `hostPath` volume and no `fsGroup`.
+- Files are created with mode 0644, so the owner check and the no-group/world-write rule hold.

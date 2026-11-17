@@ -204,6 +204,8 @@ paths = ["/v1/"]
             rules_status: scratch.path().join("r"),
             probe_status: scratch.path().join("p"),
             interval: std::time::Duration::from_secs(30),
+            rules_uid: 0,
+            probe_uid: 1000,
         }),
     })
     .await;

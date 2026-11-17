@@ -739,6 +739,54 @@ def main():
         % (netcheck_env.get("EXPECT_DIR"), mount_path_of(netcheck, NETINIT_VOL),
            mount_path_of(netinit, NETINIT_VOL)),
     )
+    # The proxy accepts a status file only from its writer's UID: root for netcheck, the agent UID
+    # for netprobe. The flags must agree with the container UIDs.
+    check(
+        "proxy-status-owner-uids-match-the-writers",
+        flag_value("--netfilter-rules-uid") == str(nsc.get("runAsUser"))
+        and flag_value("--netfilter-probe-uid") == str(psc2.get("runAsUser"))
+        and flag_value("--netfilter-probe-uid") == str(EXPECTED_UIDS["agent"]),
+        "flags %s %s; netcheck uid %s; netprobe uid %s"
+        % (flag_value("--netfilter-rules-uid"), flag_value("--netfilter-probe-uid"),
+           nsc.get("runAsUser"), psc2.get("runAsUser")),
+    )
+    # What the agent UID can and cannot write. It mounts neither status volume, so it cannot create,
+    # replace or link a file there; no fsGroup and no hostPath volume can widen that.
+    agent_rw = sorted(
+        m.get("name") for m in containers.get("agent", {}).get("volumeMounts", [])
+        if not m.get("readOnly")
+    )
+    check(
+        "agent-cannot-write-the-status-volumes",
+        not ({RULES_VOL, PROBE_VOL, NETINIT_VOL} & set(agent_rw))
+        and not ({RULES_VOL, PROBE_VOL} & {m.get("name") for c in all_ctrs
+                                           if c.get("name") not in ("netcheck", "netprobe", "proxy")
+                                           for m in c.get("volumeMounts", [])}),
+        "agent writable mounts: %s" % agent_rw,
+    )
+    check(
+        "no-fsgroup-and-no-hostpath-volumes",
+        "fsGroup" not in spec.get("securityContext", {})
+        and not any("hostPath" in v for v in spec.get("volumes", [])),
+    )
+    # The long-lived NET_ADMIN checker and the probe are hardened and run what they should.
+    check(
+        "pod-seccomp-runtime-default-and-no-container-override",
+        spec.get("securityContext", {}).get("seccompProfile", {}).get("type") == "RuntimeDefault"
+        and not any(
+            "seccompProfile" in c.get("securityContext", {}) for c in all_ctrs
+        ),
+    )
+    check(
+        "no-host-namespaces",
+        not any(spec.get(k) for k in ("hostNetwork", "hostPID", "hostIPC")),
+    )
+    check(
+        "netcheck-and-netprobe-run-the-expected-programs",
+        netcheck.get("command") == ["/bin/sh", "/usr/local/bin/netcheck.sh"]
+        and netprobe.get("command", [None])[0] == "ap-netprobe",
+        "netcheck %s; netprobe %s" % (netcheck.get("command"), netprobe.get("command")),
+    )
     rp = containers.get("proxy", {}).get("readinessProbe", {}).get("exec", {}).get("command", [])
     check(
         "proxy-readiness-probe-asks-its-admin-socket",

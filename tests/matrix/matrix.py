@@ -45,7 +45,7 @@ CANON_IDS = ["C1-1", "C1-2", "C1-3", "C1-4", "C1-5", "C1-6", "C1-7"]
 # Netfilter self-check rows (issue #20): the proxy reads two checker status files and refuses to
 # serve unless both are healthy and ticking. The checkers are faked here by a thread that writes the
 # same one-line files; the cluster test uses the real ones.
-NF_IDS = ["NF-01", "NF-02", "NF-03", "NF-04", "NF-05", "NF-06", "NF-07", "NF-08", "NF-09", "NF-10"]
+NF_IDS = ["NF-01", "NF-02", "NF-03", "NF-04", "NF-05", "NF-06", "NF-07", "NF-08", "NF-09", "NF-10", "NF-11"]
 EXPECTED = GATE_IDS + P1_IDS + CANON_IDS + NF_IDS
 
 
@@ -981,6 +981,7 @@ class FakeCheckers:
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
             f.write(f"tick=fake-{self.n} state={state} reason={reason}\n")
+        os.chmod(tmp, 0o644)  # the proxy refuses a status file that group or world can write
         os.replace(tmp, path)
 
     def loop(self):
@@ -1188,6 +1189,61 @@ def _(e):
     return st == 200 and r.status == 200, f"challenge={st} revoke_all={r.status}"
 
 
+@case("NF-11", "NF", "non-regular status file (FIFO, symlink, directory, group-writable, oversized): refused, and the admin socket never stalls", instance="netfilter")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    other = os.path.join(os.path.dirname(e.nf.rules_path), "elsewhere")
+
+    def fifo():
+        os.mkfifo(e.nf.rules_path)
+
+    def symlink():
+        with open(other, "w") as f:
+            f.write("tick=x state=ok reason=ok\n")
+        os.chmod(other, 0o644)
+        os.symlink(other, e.nf.rules_path)
+
+    def directory():
+        os.mkdir(e.nf.rules_path)
+
+    def group_writable():
+        with open(e.nf.rules_path, "w") as f:
+            f.write("tick=gw state=ok reason=ok\n")
+        os.chmod(e.nf.rules_path, 0o664)
+
+    def oversized():
+        with open(e.nf.rules_path, "w") as f:
+            f.write("tick=big state=ok reason=ok\n" + "x" * 4096)
+        os.chmod(e.nf.rules_path, 0o644)
+
+    def clear(path):
+        if os.path.isdir(path) and not os.path.islink(path):
+            os.rmdir(path)
+        elif os.path.lexists(path):
+            os.remove(path)
+
+    out = {}
+    worst_admin = 0.0
+    for label, make in (("fifo", fifo), ("symlink", symlink), ("directory", directory),
+                        ("group_writable", group_writable), ("oversized", oversized)):
+        e.nf.start(rules=True, probe=True)
+        healthy = nf_wait(e, s, True, 6)
+        e.nf.start(rules=False, probe=True)  # the rules checker stops writing, then its path is spoiled
+        time.sleep(0.4)
+        clear(e.nf.rules_path)
+        make()
+        refused = nf_wait(e, s, False, 4) is not None
+        t0 = time.time()
+        rst, _ = nf_ready(e)
+        worst_admin = max(worst_admin, time.time() - t0)
+        out[label] = (healthy is not None, refused, rst == 503)
+        clear(e.nf.rules_path)
+    e.nf.start(rules=True, probe=True)
+    recovered = nf_wait(e, s, True, 6) is not None
+    ok = all(all(v) for v in out.values()) and worst_admin < 1.0 and recovered
+    return ok, f"(was_healthy, refused, not_ready) {out} worst_admin_s={worst_admin:.2f} recovered={recovered}"
+
+
 @case("NF-10", "NF", "no self-check configured: always ready, never gated, no status files needed", instance="netfilter-off")
 def _(e):
     s = e.mint("agent-1", ("c-up",))
@@ -1226,7 +1282,8 @@ def run_instance(e, instance, results):
         e.nf = FakeCheckers(nfdir)
         e.start_proxy(cfg, PORT_NETFILTER, extra_args=[
             "--netfilter-rules-status", e.nf.rules_path, "--netfilter-probe-status", e.nf.probe_path,
-            "--netfilter-interval-secs", str(NF_INTERVAL)])
+            "--netfilter-interval-secs", str(NF_INTERVAL),
+            "--netfilter-rules-uid", str(os.getuid()), "--netfilter-probe-uid", str(os.getuid())])
     elif instance == "netfilter-off":
         cfg = os.path.join(e.work, "config-netfilter-off.toml")
         e.write_file(cfg, e.main_text(port=PORT_NETFILTER))

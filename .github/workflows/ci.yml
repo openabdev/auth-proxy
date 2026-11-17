@@ -20,6 +20,12 @@ jobs:
           python3 --version
           openssl version
 
+      - name: Kubernetes manifest validator and its mutation tests
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+          python3 deploy/k8s/validate_manifests.py
+          python3 deploy/k8s/test_validate_manifests.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

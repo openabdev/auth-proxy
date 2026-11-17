@@ -151,8 +151,124 @@ pub fn parse_ap_path(path: &str) -> Result<ApPath<'_>, Code> {
     })
 }
 
-fn is_caller_key(k: &str) -> bool {
+pub fn is_caller_key(k: &str) -> bool {
     k.strip_prefix("apk_").is_some_and(is_lower_hex_64)
+}
+
+/// Split `/<route>/<rest>` into the route name and the route-relative path.
+///
+/// The first segment must be `[a-z0-9-]{1,32}`, else `route_unknown`. A missing rest is `/`.
+pub fn parse_route_path(path: &str) -> Result<(&str, String), Code> {
+    let rest = path.strip_prefix('/').ok_or(Code::RouteUnknown)?;
+    let (route, tail) = match rest.split_once('/') {
+        Some((r, t)) => (r, format!("/{t}")),
+        None => (rest, "/".to_string()),
+    };
+    let ok = !route.is_empty()
+        && route.len() <= 32
+        && route
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !ok {
+        return Err(Code::RouteUnknown);
+    }
+    Ok((route, tail))
+}
+
+/// Read the caller key from exactly one value of `name`, in the form `apk_<64 lowercase hex>`.
+///
+/// Missing, duplicate, non-UTF-8 and malformed values are all `caller_rejected`. The value is
+/// never formatted into a message.
+pub fn caller_key_from_header(headers: &HeaderMap, name: &str) -> Result<String, Code> {
+    let mut values = headers.get_all(name).iter();
+    let value = match (values.next(), values.next()) {
+        (Some(v), None) => v,
+        _ => return Err(Code::CallerRejected),
+    };
+    let s = value.to_str().map_err(|_| Code::CallerRejected)?;
+    if !is_caller_key(s) {
+        return Err(Code::CallerRejected);
+    }
+    Ok(s.to_string())
+}
+
+/// True when the request framing is ambiguous and must be refused before policy runs.
+///
+/// Refused: `Content-Length` with `Transfer-Encoding`; more than one `Content-Length`; a
+/// `Content-Length` that is not plain digits (a comma list, a sign, blanks); a
+/// `Transfer-Encoding` other than a single `chunked`; a `Connection` header that nominates a
+/// framing header, `Host`, `Authorization` or the caller-key header.
+pub fn framing_refused(headers: &HeaderMap, caller_key_header: &str) -> bool {
+    let cl: Vec<_> = headers
+        .get_all(http::header::CONTENT_LENGTH)
+        .iter()
+        .collect();
+    let te: Vec<_> = headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .collect();
+    if !cl.is_empty() && !te.is_empty() {
+        return true;
+    }
+    if cl.len() > 1 {
+        return true;
+    }
+    if let Some(v) = cl.first() {
+        let digits = v
+            .to_str()
+            .map(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .unwrap_or(false);
+        if !digits {
+            return true;
+        }
+    }
+    if !te.is_empty() {
+        let single_chunked = te.len() == 1
+            && te[0]
+                .to_str()
+                .map(|s| s.eq_ignore_ascii_case("chunked"))
+                .unwrap_or(false);
+        if !single_chunked {
+            return true;
+        }
+    }
+    for v in headers.get_all(http::header::CONNECTION) {
+        let Ok(s) = v.to_str() else {
+            return true;
+        };
+        for tok in s.split(',') {
+            let t = tok.trim().to_ascii_lowercase();
+            if matches!(
+                t.as_str(),
+                "content-length" | "transfer-encoding" | "host" | "authorization"
+            ) || t == caller_key_header
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Replace the secret token segment of Discord webhook and interaction paths with `<redacted>`.
+///
+/// Matches `webhooks/<id>/<token>` and `interactions/<id>/<token>` at any depth. The rest of
+/// the path is kept. A path with no such prefix is returned unchanged.
+pub fn redact_path(path: &str) -> String {
+    let segs: Vec<&str> = path.split('/').collect();
+    let mut out: Vec<&str> = Vec::with_capacity(segs.len());
+    let mut i = 0;
+    while i < segs.len() {
+        out.push(segs[i]);
+        if (segs[i] == "webhooks" || segs[i] == "interactions") && i + 2 < segs.len() {
+            out.push(segs[i + 1]);
+            out.push("<redacted>");
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    out.join("/")
 }
 
 /// True for exactly 64 lowercase hex characters (sha256 hex, or the key and surrogate digests).
@@ -518,5 +634,104 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn route_path_splits_and_refuses() {
+        assert_eq!(
+            parse_route_path("/discord/api/v10/x"),
+            Ok(("discord", "/api/v10/x".to_string()))
+        );
+        assert_eq!(
+            parse_route_path("/discord"),
+            Ok(("discord", "/".to_string()))
+        );
+        assert_eq!(parse_route_path("/"), Err(Code::RouteUnknown));
+        assert_eq!(parse_route_path("//x"), Err(Code::RouteUnknown));
+        assert_eq!(parse_route_path("/Disc/x"), Err(Code::RouteUnknown));
+        assert_eq!(
+            parse_route_path(&format!("/{}/x", "a".repeat(33))),
+            Err(Code::RouteUnknown)
+        );
+    }
+
+    #[test]
+    fn caller_key_header_rules() {
+        let n = "x-ap-caller-key";
+        let mut h = HeaderMap::new();
+        assert_eq!(caller_key_from_header(&h, n), Err(Code::CallerRejected));
+        h.append(n, HeaderValue::from_static(KEY));
+        assert_eq!(caller_key_from_header(&h, n), Ok(KEY.to_string()));
+        h.append(n, HeaderValue::from_static(KEY));
+        assert_eq!(caller_key_from_header(&h, n), Err(Code::CallerRejected));
+        let mut m = HeaderMap::new();
+        m.insert(n, HeaderValue::from_static("apk_short"));
+        assert_eq!(caller_key_from_header(&m, n), Err(Code::CallerRejected));
+        let mut m = HeaderMap::new();
+        m.insert(n, HeaderValue::from_bytes(b"apk_\xff").unwrap());
+        assert_eq!(caller_key_from_header(&m, n), Err(Code::CallerRejected));
+    }
+
+    fn hm(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(*k, HeaderValue::from_static(v));
+        }
+        h
+    }
+
+    #[test]
+    fn framing_cases() {
+        let k = "x-ap-caller-key";
+        assert!(!framing_refused(&hm(&[("content-length", "12")]), k));
+        assert!(!framing_refused(
+            &hm(&[("transfer-encoding", "chunked")]),
+            k
+        ));
+        assert!(!framing_refused(&hm(&[]), k));
+        assert!(!framing_refused(&hm(&[("connection", "keep-alive")]), k));
+        for bad in [
+            vec![("content-length", "1"), ("transfer-encoding", "chunked")],
+            vec![("content-length", "1"), ("content-length", "1")],
+            vec![("content-length", "1, 1")],
+            vec![("content-length", "+1")],
+            vec![("content-length", "")],
+            vec![("transfer-encoding", "gzip")],
+            vec![("transfer-encoding", "gzip, chunked")],
+            vec![
+                ("transfer-encoding", "chunked"),
+                ("transfer-encoding", "chunked"),
+            ],
+            vec![("connection", "close, Content-Length")],
+            vec![("connection", "x-ap-caller-key")],
+            vec![("connection", "authorization")],
+        ] {
+            assert!(framing_refused(&hm(&bad), k), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn redacts_webhook_and_interaction_tokens() {
+        assert_eq!(
+            redact_path("/api/v10/webhooks/1/SECRET/github"),
+            "/api/v10/webhooks/1/<redacted>/github"
+        );
+        assert_eq!(
+            redact_path("/api/v10/interactions/1/SECRET/callback"),
+            "/api/v10/interactions/1/<redacted>/callback"
+        );
+        assert_eq!(
+            redact_path("/api/v10/webhooks/1/SECRET"),
+            "/api/v10/webhooks/1/<redacted>"
+        );
+        assert_eq!(
+            redact_path("/api/v10/channels/1/messages"),
+            "/api/v10/channels/1/messages"
+        );
+        assert_eq!(redact_path("/api/v10/webhooks/1"), "/api/v10/webhooks/1");
+        assert_eq!(
+            redact_path("/x/webhooks/1/S/interactions/2/T/c"),
+            "/x/webhooks/1/<redacted>/interactions/2/<redacted>/c"
+        );
     }
 }

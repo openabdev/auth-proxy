@@ -15,10 +15,10 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Instant, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use ap_broker::broker::Broker;
 use ap_broker::clock::SystemClock;
@@ -27,9 +27,8 @@ use ap_broker::proof::{parse_public_key, NonceTable};
 use ap_broker::registry::{sha256_hex, Access, Registry, RegistryCfg};
 use ap_core::audit::{path_only, AuditRec};
 use ap_core::canon;
-use ap_core::config::{self, Config, ErrorShape, Grant, Identity, Route};
+use ap_core::config::{Config, ErrorShape, Grant, Identity, Route};
 use ap_core::error::{render, Code};
-use ap_core::policy::Snapshot;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::response::Response;
@@ -40,41 +39,16 @@ use subtle::ConstantTimeEq;
 
 use crate::audit_sink::AuditSink;
 use crate::forward;
+use crate::policy_store::{Loaded, PolicyStore};
 
 #[cfg(test)]
 mod h2_tests;
 #[cfg(test)]
 mod tests;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stamp {
-    modified: SystemTime,
-    len: u64,
-}
-
-fn stamp_of(path: &Path) -> Option<Stamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    Some(Stamp {
-        modified: meta.modified().ok()?,
-        len: meta.len(),
-    })
-}
-
-/// A policy file that loaded and validated, with the stamp it was read under.
-#[derive(Clone)]
-struct Loaded {
-    stamp: Stamp,
-    cfg: Arc<Config>,
-    snap: Arc<Snapshot>,
-}
-
 /// Shared state for the agent listener and the session plane.
 pub struct App {
-    policy_path: PathBuf,
-    policy: RwLock<Option<Loaded>>,
+    policy: PolicyStore,
     listen_authority: String,
     max_body: u64,
     pub(crate) token_dir: PathBuf,
@@ -125,15 +99,9 @@ impl App {
             }
         }
         let authority_lease_secs = cfg.sessions.authority_lease_secs;
-        let snap = Arc::new(Snapshot::from_config(&cfg));
-        let policy = stamp_of(&policy_path).map(|stamp| Loaded {
-            stamp,
-            snap,
-            cfg: Arc::new(cfg),
-        });
+        let policy = PolicyStore::new(policy_path, cfg);
         Ok(Arc::new(App {
-            policy_path,
-            policy: RwLock::new(policy),
+            policy,
             listen_authority,
             max_body,
             token_dir,
@@ -148,40 +116,9 @@ impl App {
         }))
     }
 
-    /// The policy in force now. The file's stamp (mtime and size) is checked on every call. A
-    /// change triggers a reload. A file that cannot be read or validated drops the snapshot and
-    /// returns `None`, so the caller answers 503.
+    /// The policy in force now, reloaded when the file changed. `None` means 503.
     fn policy(&self) -> Option<Loaded> {
-        let Some(stamp) = stamp_of(&self.policy_path) else {
-            self.drop_policy();
-            return None;
-        };
-        if let Ok(guard) = self.policy.read() {
-            if let Some(l) = guard.as_ref() {
-                if l.stamp == stamp {
-                    return Some(l.clone());
-                }
-            }
-        }
-        let loaded = std::fs::read_to_string(&self.policy_path)
-            .ok()
-            .and_then(|text| config::load(&text).ok())
-            .map(|cfg| Loaded {
-                stamp,
-                snap: Arc::new(Snapshot::from_config(&cfg)),
-                cfg: Arc::new(cfg),
-            });
-        match self.policy.write() {
-            Ok(mut slot) => *slot = loaded.clone(),
-            Err(_) => return None,
-        }
-        loaded
-    }
-
-    fn drop_policy(&self) {
-        if let Ok(mut slot) = self.policy.write() {
-            *slot = None;
-        }
+        self.policy.current()
     }
 }
 

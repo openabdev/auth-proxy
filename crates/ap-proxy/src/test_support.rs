@@ -146,6 +146,36 @@ impl Upstream {
 }
 
 async fn echo(req: hyper::Request<Incoming>) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
+    use http_body_util::BodyExt;
+    if req.uri().path() == "/xap" {
+        let resp = hyper::Response::builder()
+            .header("x-ap-decision", "denied")
+            .header("x-ap-other", "kept")
+            .header("x-plain", "yes")
+            .body(Full::new(Bytes::from_static(b"upstream-body")))
+            .expect("xap response");
+        return Ok(resp);
+    }
+    if req.uri().path().ends_with("/echo2") {
+        let (parts, body) = req.into_parts();
+        let len = match body.collect().await {
+            Ok(b) => b.to_bytes().len(),
+            Err(_) => 0,
+        };
+        let headers: Vec<(String, String)> = parts
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let out = serde_json::json!({
+            "headers": headers,
+            "body_len": len,
+            "path": parts.uri.to_string(),
+        });
+        return Ok(hyper::Response::new(Full::new(Bytes::from(
+            serde_json::to_vec(&out).unwrap_or_default(),
+        ))));
+    }
     if req.uri().path() == "/redirect" {
         let resp = hyper::Response::builder()
             .status(302)

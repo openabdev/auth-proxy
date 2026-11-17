@@ -92,7 +92,9 @@ reuses Phase 1 steps 1 to 3 and 6 and skips steps 4, 5 and 7 [I phase1.md sectio
 
 1. Refuse `CONNECT` (405) and `Upgrade` (501), as in Phase 1 [I pipeline.rs `handle`], each carrying `X-AP-Decision: denied`.
 2. Canonicalize: origin form, one `Host`, no ambiguous path (section 3.8).
-3. Read the caller key from the header (section 3.2), find the identity by constant-time hash compare.
+3. Read the caller key from exactly one source: the header, or a `/ap/<caller-key>/` path prefix that is stripped
+   before routing and forwarding (section 3.2). Both present is 400 `caller_key_ambiguous`. Find the identity by
+   constant-time hash compare.
 4. Evaluate policy for identity, route, method and route-relative path. Result is `allow`, `hold` or deny.
 5. `allow`: forward now. `hold`: section 3.4. Deny: terminal error (section 3.5).
 6. Audit: one record per allowed request, hold transitions for a held one (section 3.9).
@@ -138,9 +140,21 @@ Tailnet identity headers that `tailscale serve` injects are ignored: no decision
   `Transfer-Encoding`, with more than one or a comma-joined `Content-Length`, or with a `Transfer-Encoding`
   other than a single `chunked` is refused 400 (`framing_refused`) and produces no upstream request. hyper's
   HTTP/1 parser may refuse some of these before the handler runs, in which case the answer is hyper's, not
-  ours [A, not checked in this work]. The gate does not rely on that. Stage 1 sends raw HTTP/1 requests
+  ours. The gate does not rely on that. Stage 1 sends raw HTTP/1 requests
   directly and through the front and records which layer refused and whether the answer carries
   `X-AP-Decision`.
+  **Known gap (stage 1, decided by the owner):** hyper 1.12 changes three cases before the handler can see
+  them [I hyper-1.12.0 `proto/h1/role.rs`]: it deletes `Content-Length` when `Transfer-Encoding: chunked`
+  is present, it collapses identical duplicate `Content-Length` headers into one, and its parser accepts a
+  bare LF line ending. The handler therefore cannot refuse these three, and a direct request carrying one is
+  forwarded. Stage 1 accepts this because the listener is loopback-only, so a direct request is possible
+  only from the proxy host itself, and the real path goes through the owner's `tailscale serve`, which was
+  measured to normalise or terminate all three [M, source: `docs/evidence/muse-stage1-front-measurements.md`].
+  The fix is a connection-level raw-head scanner (about 100 lines, with a Content-Length and chunked
+  body-length tracker so it finds each head on a keep-alive connection). It is the stage 2 candidate and must be decided
+  before any listener is exposed beyond the front. It was not built now because a second HTTP parser in
+  front of hyper adds a parser-differential surface, and `keep_alive(false)` would change behaviour that
+  the front's pooled connections rely on.
 - Body framing: a held body gets a `Content-Length` computed from the buffered bytes. An allowed request
   forwards a declared `Content-Length` as declared, and an allowed chunked body is forwarded chunked, with
   no buffering and no computed length. The body bytes are unchanged; only framing, which is hop-by-hop,
@@ -186,6 +200,22 @@ What is worse, and the control for each:
 
 The caller key authenticates the connector to the gate. It is not a Discord credential and not an
 approval credential.
+
+**Two sources, exactly one per request.** The key is accepted from the header, or from a path prefix
+`/ap/<caller-key>/<route>/<rest>` (the Phase 1 form, parsed by the same `parse_ap_path` with the same key
+format). A connector whose helper cannot add a custom header uses the path form. A request carrying both is
+refused 400 `caller_key_ambiguous` before any key is compared, never resolved by picking one. The prefix is
+stripped before routing and forwarding, so `/ap/<key>/discord/x` is routed and forwarded exactly as
+`/discord/x`; the probe works under it (`/ap/<key>/__ap_probe/<status>/<secs>`).
+
+**`Authorization` is not a source.** A registered connector credential is injected as `Authorization`. On a
+passthrough route that header is the upstream credential and is forwarded unchanged, so using it as the caller
+key would send the key to Discord.
+
+The path form brings back the cost named above: the key is in the URL. The audit line, evidence record,
+journal, error bodies and panic message never contain the `/ap/<key>` prefix or the key (the audit path field
+is the stripped, redacted route-relative path), and the matrix scans every output for it. Anything in front of
+the gate that logs URLs would still see it, and the key is unsafe wherever such a log is kept.
 
 ### 3.3 Policy: a third verdict, and segment patterns
 
@@ -332,7 +362,9 @@ reach Discord, by name at least.
 ### 3.5 Outcome contract
 
 Every refusal the gate generates carries `X-AP-Decision` and a small JSON body
-`{"ap_decision": "...", "code": "..."}`. This table is the single list of gate refusals. Discord's response
+`{"ap_decision": "...", "code": "..."}`. The body is the reliable copy: Muse's helper discards all response
+headers and shows the agent only `HTTP <code>: <body>` [M-reported], so the decision must be readable from the
+body alone. The body has this fixed two-field shape for every row below and echoes no request data. This table is the single list of gate refusals. Discord's response
 is returned verbatim, including any `x-ap-*` headers it carries; the gate's own refusals are identified by
 a locally generated status plus `X-AP-Decision`, and Discord is not expected to send that header [A].
 
@@ -342,6 +374,7 @@ a locally generated status plus `X-AP-Decision`, and Discord is not expected to 
 | No grant matches | 423 | `denied` | `no_grant` | nothing |
 | Unknown route name | 423 | `denied` | `route_unknown` | nothing |
 | Caller key missing, duplicate, malformed or unknown | 401 | `rejected` | `caller_rejected` | nothing |
+| Caller key in both the header and the path prefix | 400 | `denied` | `caller_key_ambiguous` | nothing |
 | Canonicalization refusal (Phase 1 codes, for example `path_ambiguous`, `Host` mismatch) | 400 | `denied` | Phase 1 code | nothing |
 | Framing conflict (section 3.1) | 400 | `denied` | `framing_refused` | nothing |
 | More than one `Authorization` header | 400 | `denied` | `authorization_duplicate` | nothing |
@@ -357,7 +390,7 @@ a locally generated status plus `X-AP-Decision`, and Discord is not expected to 
 | Failure after the first upstream request byte (reset, stalled or undeclared oversized allowed body, upstream error) | none: the client connection is closed | none | n/a | possibly the request |
 
 If hyper refuses a request before the handler runs (section 3.1 framing policy), the answer is hyper's and
-may lack the header; stage 1 records this.
+may lack the header; stage 1 records this. The three cases in the section 3.1 known gap never reach the handler.
 
 Why these statuses: Discord's documented API statuses are 2xx, 304, 400, 401, 403, 404, 405, 429 and some
 5xx [A, not checked in this work]. 423 and 410 are not expected from Discord. 400, 401, 405, 413 and 503
@@ -699,8 +732,8 @@ Goal: validate Muse's hook format end to end with no approval machinery. A write
 `hold` is simply denied. Stage 1 contains items 1 to 3 and 5 to 6 of the "needed" list, and the
 `decision = "allow"` half of item 4.
 
-Evidence to collect from a real Muse connector run (names only, never values): which header carries the
-key, whether `Authorization` arrives (present or absent), the `Host`
+Evidence to collect from a real Muse connector run (names only, never values): which header or path prefix
+carries the key, whether `Authorization` arrives (present or absent), the `Host`
 header and path prefix, HTTP version at the TLS front, whether bodies are chunked or compressed, whether
 Muse sends other headers we would forward, whether two identical connector calls carry the same
 forwarded header names, the `Content-Type` of message create, and whether the front sends `100 Continue`
@@ -715,17 +748,19 @@ Acceptance:
    another `X-AP-*` header keeps both.
 2. A `POST /channels/{id}/messages` is 423 `no_grant` with `X-AP-Decision: denied`, and the mock upstream
    records no request.
-3. Missing, duplicate and malformed caller-key headers are `caller_rejected`, status 401 with
-   `X-AP-Decision: rejected` (not the 423 of a human denial), nothing upstream. An unknown route name is
+3. Missing, duplicate and malformed caller-key headers (and unknown or malformed path-prefix keys) are `caller_rejected`, status 401 with
+   `X-AP-Decision: rejected` (not the 423 of a human denial), nothing upstream. The key in both the header and
+   the path prefix is 400 `caller_key_ambiguous`. Every refusal body is `{"ap_decision","code"}` matching the header. An unknown route name is
    423 `denied` (`route_unknown`) and nothing is sent. Duplicate `Authorization` is 400
    `authorization_duplicate` with `X-AP-Decision: denied`; `CONNECT` is 405 and `Upgrade` 501, each with the header.
-4. **Caller-key header stripped upstream:** the mock upstream's recorded headers contain neither the
-   caller-key header nor any `x-ap-*` header, for allowed requests.
+4. **Caller key stripped upstream:** the mock upstream's recorded headers contain neither the
+   caller-key header nor any `x-ap-*` header, and its recorded path contains no `/ap/<key>` prefix, for allowed requests
+   in both key forms.
 5. **`Authorization` forwarded unchanged:** the mock upstream receives the identical `Authorization` value
    that the test sent.
 6. **`Authorization` never in any log:** run the proxy with a sentinel token, exercise allow, deny, 413,
    malformed, upstream-failure and panic-injection paths, and assert the sentinel and the caller key are
-   absent from stdout, stderr and the audit stream. The test also sends a path-token sentinel
+   absent from stdout, stderr and the audit stream, for both key forms (the `/ap/<key>` prefix included). The test also sends a path-token sentinel
    (`/webhooks/<id>/<sentinel>` and `/interactions/<id>/<sentinel>/callback`) and asserts that it is absent
    from the audit stream and the logs. (Phase 1 has the same discipline for surrogates and
    credentials [I audit.rs].)
@@ -750,7 +785,11 @@ Acceptance:
 12. **Framing:** raw HTTP/1 requests with both `Content-Length` and `Transfer-Encoding`, duplicate and
     comma-joined `Content-Length`, a `Transfer-Encoding` other than `chunked`, and conflicting `Connection`
     nominations, sent directly and through the real front: the mock upstream records no request. Record
-    which layer refused and whether the answer carries `X-AP-Decision`.
+    which layer refused and whether the answer carries `X-AP-Decision`. Stage 1 asserts this for the
+    refused cases (differing or comma-joined `Content-Length`, bad `Transfer-Encoding`, `Connection`
+    nominations, obs-fold, wrong or duplicate `Host`). Identical duplicate `Content-Length`, a request with
+    `Content-Length` and `Transfer-Encoding: chunked`, and bare LF are the section 3.1 known gap: they are
+    documented and measured, not asserted as refused.
 13. **Allowed-body boundary:** an allowed body that stalls after a prefix, and an undeclared body that
     exceeds the cap after the mock upstream consumed a prefix, close the client connection with one audit record, `code = body_failed_after_send`. A stall before the
     first upstream byte is 503 `unavailable`, and an undeclared over-cap body before it is 413. An
@@ -857,6 +896,25 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
 
 ## 8. Open questions for the owner
 
+### Muse-reported facts [M-reported]
+
+Reported by the Muse side after trying the gate. They are not measured by us and describe the current Discord
+helper, not the new connector, until the first measurement round says otherwise.
+
+- The base URL is hard-coded to the Discord host and any other host is refused. Muse will register a separate
+  connector, `oab-auth-proxy`, for the gate host [owner decision]; the first round uses a dummy credential.
+- The helper cannot add a custom request header. The registered credential is injected as `Authorization`.
+- JSON requests have a 30 s socket timeout (60 s for multipart). No retries, no trace, request or idempotency headers.
+- All response headers are discarded; the agent sees only `HTTP <code>: <body>`. Consequence: the decision
+  lives in the JSON body (section 3.5).
+- Redirects are not followed. `Host` includes a non-default port.
+- The agent can still reach Discord directly.
+
+Consequences. (a) The 30 s JSON timeout is a hard constraint on the stage 2 hold window: `hold_secs` must stay
+below it unless Muse raises it for this connector, so the 120 s default is not usable as things stand. (b) The
+gate constrains the agent only if the new connector is the agent's only route to Discord. While the agent can
+call Discord directly, the gate is advisory (section 4.3).
+
 Open questions 1 to 4 are stage 1 blockers.
 
 1. **Muse's tolerance for a held connection (open point d).** How long will the Muse custom connector wait
@@ -865,16 +923,20 @@ Open questions 1 to 4 are stage 1 blockers.
    120, range 5 to 600) and stage 1 item 10 measures it. Until measured, treat 120 s as a guess. The TLS
    front's own idle timeout also bounds the window, and whether `tailscale serve` cuts a long idle
    connection is unmeasured [A] and measured in stage 1.
-2. **Caller-key header name.** Can the connector set an arbitrary header name, and does it constrain the
-   name or value format? Default `X-AP-Caller-Key` is a guess [A].
+2. **Caller-key header name.** Answered [M-reported]: the current helper cannot add a custom request header,
+   and the registered credential is injected as `Authorization`, which cannot be the caller key. The gate
+   therefore also accepts the key in the path prefix (section 3.2). Still open: whether a future connector can
+   set `X-AP-Caller-Key`.
 3. **How does Muse reach the gate, and who terminates TLS?** Decided: `tailscale serve` on the owner's
    own node, proxy loopback-only (section 4.2). Still to confirm in stage 1: can Muse's egress reach that
    address, given the ACL restriction to Muse's node?
-4. **Base URL shape.** The PoC uses path-prefix routing, `/discord/api/v10/...`. Does the connector accept
-   a base URL with a path prefix, or must the gate sit at the root and serve one route?
+4. **Base URL shape.** The PoC uses path-prefix routing, `/discord/api/v10/...`. Muse will register a separate
+   connector, `oab-auth-proxy`, with its own base URL for this host [owner decision]. Whether that base URL may
+   carry a path prefix such as `/ap/<caller-key>` is to be confirmed by the first measurement round, which uses a
+   dummy credential only.
 5. **Status codes for the terminal errors.** The proposed 423, 410 and 503 are untested against Muse
-   [A]. Does Muse treat unusual statuses or non-Discord bodies as a connector failure, retry on them, or
-   show them to the agent?
+   [A]. The helper shows the agent `HTTP <code>: <body>` and does not retry [M-reported], so the body is what the
+   agent reads (section 3.5). Still open: how the agent reacts to those statuses.
 6. **Retry behaviour.** After an `expired` or `denied`, does Muse's agent retry automatically? If so each
    retry is another phone prompt; dedupe, the per-identity cap and the default 60 s cooldown bound this.
 7. **Approver channel.** Answered in the review comments: Basic auth plus a per-page CSRF token for the PoC,

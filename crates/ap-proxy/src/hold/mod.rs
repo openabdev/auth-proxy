@@ -259,13 +259,36 @@ impl Table {
         })
     }
 
-    /// Approve `id` for `approver` and wait for the handler's confirmation.
+    /// Approve `id` for `approver` and wait for the handler's confirmation, with no policy
+    /// re-check. The approval listener uses [`Table::approve_if`].
     ///
     /// The first transition out of `Pending` wins, so two concurrent approves give one result
     /// from the handler and `AlreadyDecided` for the other.
     pub async fn approve(&self, id: &str, approver: &str) -> ApproveResult {
+        self.approve_if(id, approver, |_, _| true).await
+    }
+
+    /// Like [`Table::approve`], but `still_held(identity, request)` is asked first, under the
+    /// table lock. When it answers `false` the entry is dropped (the caller gets
+    /// `dropped_on_reload`, nothing is sent upstream) and the result is `PolicyChanged`, so an
+    /// approval can never run a permission the policy no longer gives.
+    pub async fn approve_if(
+        &self,
+        id: &str,
+        approver: &str,
+        still_held: impl FnOnce(&str, &HeldRequest) -> bool,
+    ) -> ApproveResult {
         let confirmed = {
             let mut g = self.lock();
+            let keep = g.pending.get(id).map(|e| still_held(&e.identity, &e.req));
+            if keep == Some(false) {
+                if let Some(mut entry) = g.finish(id, State::Dropped, None) {
+                    if let Some(tx) = entry.tx.take() {
+                        let _ = tx.send(Decision::Dropped);
+                    }
+                }
+                return ApproveResult::PolicyChanged;
+            }
             match g.finish(id, State::Approved, None) {
                 Some(mut entry) => {
                     let (ctx, crx) = oneshot::channel();
@@ -357,14 +380,14 @@ impl Table {
 
     fn drop_where<P, D>(&self, mut pred: P, decision: D) -> usize
     where
-        P: FnMut(&str) -> bool,
+        P: FnMut(&str, &HeldRequest) -> bool,
         D: Fn() -> Decision,
     {
         let mut g = self.lock();
         let ids: Vec<String> = g
             .pending
             .iter()
-            .filter(|(_, e)| pred(&e.identity))
+            .filter(|(_, e)| pred(&e.identity, &e.req))
             .map(|(id, _)| id.clone())
             .collect();
         for id in &ids {
@@ -380,12 +403,22 @@ impl Table {
     /// A policy reload kept only the identities in `present`: drop the `Pending` entries of the
     /// others. Entries of identities that remain are untouched. Returns the number dropped.
     pub fn drop_identities_missing(&self, present: &HashSet<String>) -> usize {
-        self.drop_where(|identity| !present.contains(identity), || Decision::Dropped)
+        self.drop_where(
+            |identity, _| !present.contains(identity),
+            || Decision::Dropped,
+        )
+    }
+
+    /// A policy reload: drop every `Pending` entry for which `still_held(identity, request)` is
+    /// false, that is, whose identity, route, method or path no longer yields a hold. Returns
+    /// the number dropped.
+    pub fn drop_unless(&self, mut still_held: impl FnMut(&str, &HeldRequest) -> bool) -> usize {
+        self.drop_where(|i, r| !still_held(i, r), || Decision::Dropped)
     }
 
     /// The policy file went away: drop every `Pending` entry.
     pub fn drop_all(&self) -> usize {
-        self.drop_where(|_| true, || Decision::Dropped)
+        self.drop_where(|_, _| true, || Decision::Dropped)
     }
 
     /// Shutdown: answer every `Pending` entry `Shutdown` and refuse new admissions. An approved
@@ -393,7 +426,7 @@ impl Table {
     /// has claimed runs on in its handler.
     pub fn drain_pending(&self) -> usize {
         self.lock().closed = true;
-        self.drop_where(|_| true, || Decision::Shutdown)
+        self.drop_where(|_, _| true, || Decision::Shutdown)
     }
 
     /// An approved request asks to start its forward (design 3.7). The closed check and `f`, the

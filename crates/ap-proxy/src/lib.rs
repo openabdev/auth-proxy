@@ -400,7 +400,8 @@ a passthrough-only config has no per-UID rules"
     let approval = async {
         match (approval_listener, approval_cfg) {
             (Some(l), Some(cfg)) => {
-                let state = approval::ApprovalApp::new(Arc::clone(&app.hold), &cfg);
+                let state =
+                    approval::ApprovalApp::new(Arc::clone(&app.hold), &cfg, app.policy_source());
                 listener::approval::serve_approval(l, state, Default::default()).await;
             }
             _ => std::future::pending::<()>().await,

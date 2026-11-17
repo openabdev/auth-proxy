@@ -234,7 +234,9 @@ prefix matching on `paths` [I policy.rs `evaluate`; config.rs `Grant`]. Two chan
 1. **Verdict.** A grant gains `decision = "allow" | "hold"`. A passthrough grant has no `credential`
    (today `credential` is a required field [I config.rs `Grant`]). If more than one grant matches, `hold`
    beats `allow` (the stricter wins). No match is deny, as today.
-   Policy load refuses an `allow` grant (a prefix or a pattern) of the same identity, route and method that
+   Two passthrough routes may not share one host and port (the upstream resource is the authority and path, not
+   the route name, so a second route name would be a second verdict for the same resource); policy load refuses
+   the config. Policy load also refuses an `allow` grant (a prefix or a pattern) of the same identity, route and method that
    overlaps a `hold` pattern, so the rule is not relied on: a spelling of a held resource that the pattern does
    not claim, such as a trailing `/`, would otherwise reach the allow grant. The matcher also answers a
    trailing-slash spelling of a held path with `no_grant`, whatever allow grants exist. The path that policy
@@ -547,8 +549,13 @@ passthrough mode adds fields and transitions, and keeps that property:
   `code = upstream_reset` or `body_failed_after_send` after a post-first-byte failure. Each carries the request
   id, identity, route, method, the redacted route-relative path (below), the digest, and for decisions the
   approver identity.
-- `dropped_on_reload`: when a policy reload removes an identity, its `Pending` entries move to `Dropped`,
-  are answered 503 `unavailable`, and nothing is sent. Entries of identities that remain are untouched.
+- `dropped_on_reload`: on every policy reload each `Pending` entry is checked again against the new policy.
+  An entry whose identity, route, method or path no longer yields `hold` (identity removed, route removed or
+  renamed, hold grant removed, method removed, pattern narrowed, or a policy that is invalid or gone) moves to
+  `Dropped`, is answered 503 `unavailable`, and nothing is sent. Entries that still yield `hold` are untouched.
+  An approve checks the current policy the same way before it takes effect; if the grant is gone the entry is
+  dropped the same way and the approve answers `policy_changed` (HTTP 410), so a race between a reload and an
+  approve cannot forward.
 - `auth_present` (boolean). It gives stage 1 evidence that Muse's swap happened without logging the token.
 - Path redaction. Discord paths can carry secrets: the token segment of `/webhooks/{id}/{token}...` and
   `/interactions/{id}/{token}/...` is replaced by `<redacted>` in the audit record, on the approval page
@@ -891,9 +898,11 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
     entry and notification. Order: during a cooldown a duplicate is 503 `cooldown`; at
     `max_held_per_identity` an identical retry supersedes instead of getting 503; a cooldown leaves the
     identity's existing `Pending` entries held.
-21. **Reload drops holds:** removing an identity from the policy and reloading answers its held requests
-    503 `unavailable` with audit `dropped_on_reload`, sends nothing upstream, and leaves other identities'
-    holds untouched.
+21. **Reload drops holds:** removing an identity, the route or the hold grant, removing the method, narrowing the
+    pattern, or replacing the policy with an invalid file, then reloading, answers the affected held requests
+    503 `unavailable` with audit `dropped_on_reload`, sends nothing upstream, and leaves holds that the new
+    policy still holds untouched. An approve that arrives after the file changed but before the reload tick is
+    refused (`policy_changed`) and sends nothing.
 22. **Approval page:** a body containing HTML and script is shown escaped; every response, errors included,
     carries `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; form-action 'self'`,
     `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`,

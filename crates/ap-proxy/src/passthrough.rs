@@ -21,7 +21,7 @@ use ap_core::canon;
 use ap_core::config::{Config, Identity};
 use ap_core::error::Code;
 use ap_core::outcome::{render_passthrough, DECISION_HEADER};
-use ap_core::policy::Verdict;
+use ap_core::policy::{Snapshot, Verdict};
 use axum::body::Body;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -112,17 +112,21 @@ impl PtApp {
 
     /// One step of the policy-reload watch (design 3.9), run about once a second. The policy is
     /// re-read if its file changed. A file that is gone or no longer valid drops every pending
-    /// hold; a valid file drops the holds of identities it no longer lists. Returns the number
-    /// dropped. Entries already approved are past the table and are not touched.
+    /// hold; a valid file drops every hold the new policy no longer yields `hold` for (identity,
+    /// route, method or path). Returns the number dropped. Entries already approved are past the table and are not touched.
     pub fn reload_tick(&self) -> usize {
         match self.policy.current() {
             None => self.hold.drop_all(),
-            Some(l) => {
-                let present: std::collections::HashSet<String> =
-                    l.cfg.identities.iter().map(|i| i.name.clone()).collect();
-                self.hold.drop_identities_missing(&present)
-            }
+            Some(l) => self
+                .hold
+                .drop_unless(|identity, req| still_held(&l.snap, identity, req)),
         }
+    }
+
+    /// The snapshot of the policy in force now, for the approval plane's re-check.
+    pub fn policy_source(self: &Arc<Self>) -> crate::approval::PolicySource {
+        let app = Arc::clone(self);
+        Arc::new(move || app.policy.current().map(|l| l.snap))
     }
 
     pub(crate) fn build(
@@ -145,6 +149,17 @@ impl PtApp {
             pause: pause::Pause::new(),
         })
     }
+}
+
+/// Whether `snap` still holds this request: the route exists and the identity's grants give
+/// `hold` for its method and route-relative path. Anything else (no grant, an allow, a deny)
+/// means the permission the owner reviewed is gone.
+pub(crate) fn still_held(snap: &Snapshot, identity: &str, req: &hold::HeldRequest) -> bool {
+    snap.route(&req.route).is_some()
+        && matches!(
+            snap.evaluate_verdict(identity, &req.route, &req.method, &req.path),
+            Ok(Verdict::Hold)
+        )
 }
 
 fn default_limits() -> hold::Limits {

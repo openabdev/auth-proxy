@@ -125,7 +125,7 @@ impl Plane {
         let cfg = ap_core::config::load(&text).expect("policy");
         let approval = cfg.approval.expect("approval block");
         Plane {
-            app: ApprovalApp::new(Arc::clone(&t.app.hold), &approval),
+            app: ApprovalApp::new(Arc::clone(&t.app.hold), &approval, t.app.policy_source()),
         }
     }
 

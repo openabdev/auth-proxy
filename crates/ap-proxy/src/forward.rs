@@ -20,11 +20,15 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder};
 
-/// Builder with the production client settings. Tests extend it with extra roots or a
+/// Builder with the production client settings (no proxy, HTTPS only, no redirects). Tests extend it with extra roots or a
 /// `resolve` override. Nothing else changes between production and tests.
 pub fn client_builder() -> ClientBuilder {
     Client::builder()
         .use_rustls_tls()
+        // The upstream is the route's fixed host. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+        // their lowercase forms and any system proxy setting must never carry the caller's
+        // request, the credential or the body to another endpoint. No setting turns this off.
+        .no_proxy()
         .https_only(true)
         .redirect(Policy::none())
         .tcp_nodelay(true)

@@ -207,3 +207,93 @@ fn secret_file_must_be_a_regular_nonempty_short_file() {
     let (_c, odd) = secret("sec-odd", 0o600, "two words");
     assert_eq!(read_secret_file(&odd).unwrap_err(), SecretError::Invalid);
 }
+
+// ---------------------------------------------------------------- ambient proxy variables
+
+const PROXY_VARS: [&str; 6] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Sets every proxy variable to `url` for the life of the value, then restores the old values.
+/// Holds a process-wide lock, because the environment is process-global.
+struct ProxyEnv {
+    old: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _g: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ProxyEnv {
+    fn set(url: &str) -> ProxyEnv {
+        let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = PROXY_VARS
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        for k in PROXY_VARS {
+            std::env::set_var(k, url);
+        }
+        std::env::remove_var("NO_PROXY");
+        std::env::remove_var("no_proxy");
+        ProxyEnv { old, _g: g }
+    }
+}
+
+impl Drop for ProxyEnv {
+    fn drop(&mut self) {
+        for (k, v) in &self.old {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_notifier_ignores_every_proxy_environment_variable() {
+    let (capture, seen, hits) = server(Some(ok())).await;
+    let _env = ProxyEnv::set(&capture);
+    // Control: a default client does honour the variables, so the capture listener can see a
+    // request and the assertions below mean something.
+    let control = reqwest::Client::builder().build().unwrap();
+    let _ = control
+        .post("http://notify.example.test/control")
+        .send()
+        .await;
+    assert!(
+        hits.load(Ordering::SeqCst) >= 1,
+        "the control client did not reach the capture proxy; the test proves nothing"
+    );
+    let before = hits.load(Ordering::SeqCst);
+    let before_seen = seen.lock().unwrap().len();
+
+    let n = NtfyNotifier::new("http://notify.example.test", TOPIC, Some(TOKEN)).unwrap();
+    let r = n.notify("id", TEXT, URL).await;
+    assert!(r.is_err(), "the name does not resolve, so the send fails");
+    assert_eq!(hits.load(Ordering::SeqCst), before, "the proxy was dialled");
+    let all = format!("{:?}", seen.lock().unwrap());
+    assert_eq!(seen.lock().unwrap().len(), before_seen);
+    for s in [TOKEN, TOPIC, URL] {
+        assert!(!all.contains(s), "{s} reached the proxy");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_upstream_clients_ignore_every_proxy_environment_variable() {
+    let (capture, _seen, hits) = server(Some(ok())).await;
+    let _env = ProxyEnv::set(&capture);
+    for c in [
+        crate::forward::client_builder().build().unwrap(),
+        crate::forward::held_client_builder().build().unwrap(),
+    ] {
+        let r = c.get("https://notify.example.test/x").send().await;
+        assert!(r.is_err());
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "the proxy was dialled");
+}

@@ -698,6 +698,10 @@ impl Config {
         }
 
         let mut route_hosts: HashMap<&str, &str> = HashMap::new();
+        // The upstream resource is `https://{host}:{port}{path}`, not the route name, so two
+        // passthrough routes on one authority would let the caller pick the route name that
+        // carries the weaker verdict. Refused outright.
+        let mut passthrough_authorities: HashMap<(String, u16), &str> = HashMap::new();
         for r in &self.routes {
             if !valid_slug(&r.name, 32) {
                 return Err(invalid(format!(
@@ -757,6 +761,14 @@ impl Config {
                     }
                 }
                 RouteMode::Passthrough => {
+                    let authority = (r.host.trim_end_matches('.').to_ascii_lowercase(), r.port);
+                    if let Some(first) = passthrough_authorities.insert(authority, r.name.as_str())
+                    {
+                        return Err(invalid(format!(
+                            "passthrough routes {first:?} and {:?} share one host and port; a held resource must have one route",
+                            r.name
+                        )));
+                    }
                     if r.name == "ap" {
                         return Err(invalid(format!(
                             "passthrough route name {:?} is reserved",
@@ -1748,6 +1760,43 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
         assert_eq!(p.max_held_per_identity, 4);
         assert_eq!(p.cooldown_secs, 60);
         assert!(cfg.approval.is_none() && cfg.notify.is_none());
+    }
+
+    fn second_route(host: &str, port: Option<u16>) -> String {
+        let port = port.map_or(String::new(), |p| format!("port = {p}\n"));
+        format!(
+            "{}\n[[route]]\nname = \"discord2\"\nhost = \"{host}\"\n{port}mode = \"passthrough\"\n\n[[grant]]\nidentity = \"muse-pilot\"\nroute = \"discord2\"\nmethods = [\"POST\"]\npaths = [\"/\"]\n",
+            hold_text()
+        )
+    }
+
+    #[test]
+    fn two_passthrough_routes_on_one_host_and_port_are_refused() {
+        // The reproduced bypass: `discord2` shares the authority and allows POST on `/`.
+        expect_invalid(
+            &second_route("discord.com", None),
+            "share one host and port",
+        );
+        // The default port spelled out is the same authority.
+        expect_invalid(
+            &second_route("discord.com", Some(443)),
+            "share one host and port",
+        );
+    }
+
+    #[test]
+    fn host_spellings_of_one_authority_are_still_refused() {
+        // Uppercase and a trailing dot never reach the authority check: the host rule refuses
+        // them first. Either way the config does not load.
+        for host in ["DISCORD.com", "discord.com."] {
+            assert!(load(&second_route(host, None)).is_err(), "{host}");
+        }
+    }
+
+    #[test]
+    fn passthrough_routes_on_different_ports_or_hosts_load() {
+        assert!(load(&second_route("discord.com", Some(8443))).is_ok());
+        assert!(load(&second_route("other.example.test", None)).is_ok());
     }
 
     #[test]

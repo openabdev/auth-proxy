@@ -81,8 +81,15 @@ single-use CSRF token.
 - Deny and expiry start the cooldown. Audit failures and notification failures do not.
 - Shutdown (SIGTERM) answers every waiting request 503 `shutdown` and lets approved forwards finish or
   reach `request_deadline_secs`.
-- Reload: removing an identity from the policy drops its holds (503 `dropped_on_reload`). If the policy
-  file disappears, every waiting request is answered 503 `dropped_on_reload` too.
+- Reload: every waiting request is checked again against the new policy about once a second. A hold whose
+  identity, route, method or path is no longer held (identity, route or hold grant removed, method removed,
+  pattern narrowed) is answered 503 `dropped_on_reload`, and so is every waiting request when the policy file
+  disappears or stops being valid. An approve is checked against the current policy too: it answers
+  `policy_changed` (410) and sends nothing if the grant is gone.
+- Proxies: the notifier and the upstream client ignore `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, their
+  lowercase forms and system proxy settings. There is no setting that turns this off. The notifier never
+  follows a redirect.
+- Two passthrough routes cannot share one host and port; the policy is refused at load.
 - Audit: `held` and `forward_started` are written before the action and are fail-closed. If the audit write
   fails the request is refused 503 `audit_unavailable`.
 

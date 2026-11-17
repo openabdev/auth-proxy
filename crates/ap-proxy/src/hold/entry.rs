@@ -139,6 +139,9 @@ pub enum ApproveResult {
     AuditUnavailable,
     /// Approved, but the upstream connection failed. Nothing was sent.
     ConnectFailed,
+    /// The current policy no longer holds this request (grant, route or identity removed or
+    /// narrowed). The entry is dropped and nothing is sent.
+    PolicyChanged,
     /// No such entry (never existed, or forgotten after it was decided).
     NotFound,
 }
@@ -157,6 +160,7 @@ impl ApproveResult {
             ApproveResult::ApprovedUnconfirmed => "approved_unconfirmed",
             ApproveResult::AuditUnavailable => "audit_unavailable",
             ApproveResult::ConnectFailed => "connect_failed",
+            ApproveResult::PolicyChanged => "policy_changed",
             ApproveResult::NotFound => "not_found",
         }
     }

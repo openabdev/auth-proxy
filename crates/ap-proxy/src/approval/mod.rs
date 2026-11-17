@@ -37,6 +37,8 @@ pub const FAIL_DELAY: Duration = Duration::from_millis(250);
 /// The state of the approval listener.
 pub struct ApprovalApp {
     table: Arc<Table>,
+    /// The policy in force now, read at each approve (`None`: no valid policy, which refuses).
+    policy: PolicySource,
     creds: auth::Credentials,
     csrf: csrf::Csrf,
     realm: String,
@@ -49,14 +51,23 @@ impl std::fmt::Debug for ApprovalApp {
     }
 }
 
+/// Where the approval plane reads the policy that an approve is checked against.
+pub type PolicySource = Arc<dyn Fn() -> Option<Arc<ap_core::policy::Snapshot>> + Send + Sync>;
+
 impl ApprovalApp {
-    pub fn new(table: Arc<Table>, cfg: &Approval) -> Arc<ApprovalApp> {
-        Self::build(table, cfg, FAIL_DELAY)
+    pub fn new(table: Arc<Table>, cfg: &Approval, policy: PolicySource) -> Arc<ApprovalApp> {
+        Self::build(table, cfg, FAIL_DELAY, policy)
     }
 
-    fn build(table: Arc<Table>, cfg: &Approval, fail_delay: Duration) -> Arc<ApprovalApp> {
+    fn build(
+        table: Arc<Table>,
+        cfg: &Approval,
+        fail_delay: Duration,
+        policy: PolicySource,
+    ) -> Arc<ApprovalApp> {
         Arc::new(ApprovalApp {
             table,
+            policy,
             creds: auth::Credentials::new(cfg),
             csrf: csrf::Csrf::new(),
             realm: cfg.realm.clone(),
@@ -308,7 +319,15 @@ async fn decide(
         return result(StatusCode::FORBIDDEN, json_wanted, "csrf_refused", None);
     }
     let (status, name, newest) = if approve {
-        approve_outcome(app.table.approve(id, approver).await)
+        let snap = (app.policy)();
+        approve_outcome(
+            app.table
+                .approve_if(id, approver, |identity, req| {
+                    snap.as_deref()
+                        .is_some_and(|s| crate::passthrough::still_held(s, identity, req))
+                })
+                .await,
+        )
     } else {
         deny_outcome(app.table.deny(id, approver))
     };
@@ -326,9 +345,10 @@ fn approve_outcome(r: ApproveResult) -> (StatusCode, &'static str, Option<String
         ApproveResult::AlreadyDecided | ApproveResult::ApprovedButAbandoned => {
             (StatusCode::CONFLICT, name, None)
         }
-        ApproveResult::Expired | ApproveResult::Dropped | ApproveResult::Gone => {
-            (StatusCode::GONE, name, None)
-        }
+        ApproveResult::Expired
+        | ApproveResult::Dropped
+        | ApproveResult::PolicyChanged
+        | ApproveResult::Gone => (StatusCode::GONE, name, None),
         ApproveResult::ApprovedUnconfirmed => (StatusCode::GATEWAY_TIMEOUT, name, None),
         ApproveResult::AuditUnavailable | ApproveResult::ConnectFailed => {
             (StatusCode::SERVICE_UNAVAILABLE, name, None)

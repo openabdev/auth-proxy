@@ -932,6 +932,174 @@ async fn the_reload_tick_drops_every_hold_when_the_policy_file_is_gone() {
     assert_eq!(mock.hits(), 0);
 }
 
+// ---------------------------------------------------------------- reload re-evaluates holds
+
+impl Ht {
+    /// Rewrite the policy file with `f`, which must change it.
+    fn rewrite(&self, f: impl FnOnce(String) -> String) {
+        let old = std::fs::read_to_string(&self.policy).unwrap();
+        let new = f(old.clone());
+        assert_ne!(old, new, "the rewrite changed nothing");
+        std::fs::write(&self.policy, new).unwrap();
+    }
+
+    /// Approve the way the approval listener does: checked against the policy in force now.
+    async fn approve_checked(&self, id: &str) -> ApproveResult {
+        let snap = (self.app.policy_source())();
+        self.app
+            .hold
+            .approve_if(id, "alice", |identity, req| {
+                snap.as_deref()
+                    .is_some_and(|s| still_held(s, identity, req))
+            })
+            .await
+    }
+
+    /// The caller of a dropped hold saw 503 `dropped_on_reload`, and nothing went upstream.
+    async fn assert_dropped(
+        &self,
+        h: tokio::task::JoinHandle<Result<(http::response::Parts, Bytes), ()>>,
+        mock: &Mock,
+    ) {
+        let (p, body) = h.await.unwrap().unwrap();
+        assert_eq!(
+            (p.status.as_u16(), decision(&p), code(&body)),
+            (503, "unavailable".into(), "dropped_on_reload".into())
+        );
+        assert_eq!(self.app.hold.pending_len(), 0);
+        assert_eq!(self.count("dropped_on_reload"), 1);
+        assert_eq!(mock.hits(), 0);
+    }
+}
+
+/// `text` without the grant block that starts with `head` (up to the next `[[grant]]` or the end).
+fn without_grant(text: &str, head: &str) -> String {
+    let start = text.find(head).expect("grant block");
+    let end = text[start + 2..]
+        .find("[[grant]]")
+        .map_or(text.len(), |n| start + 2 + n);
+    format!("{}{}", &text[..start], &text[end..])
+}
+
+const PILOT_HOLD: &str =
+    "[[grant]]\nidentity = \"muse-pilot\"\nroute = \"discord\"\nmethods = [\"POST\", \"PUT\"]";
+
+#[tokio::test]
+async fn removing_the_hold_grant_on_reload_drops_its_pending_hold() {
+    let mock = Mock::start().await;
+    let t = Ht::new("rl-grant", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let id = t.held(1).await;
+    assert_eq!(t.app.reload_tick(), 0);
+    t.rewrite(|s| without_grant(&s, PILOT_HOLD));
+    assert_eq!(t.app.reload_tick(), 1);
+    t.assert_dropped(h, &mock).await;
+    assert_eq!(t.app.hold.state(&id), Some(State::Dropped));
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Dropped
+    );
+}
+
+#[tokio::test]
+async fn removing_the_route_on_reload_drops_its_pending_hold() {
+    let mock = Mock::start().await;
+    let t = Ht::new("rl-route", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    t.held(1).await;
+    // A valid policy whose route has another name: the held route no longer exists.
+    t.rewrite(|s| s.replace("\"discord\"", "\"discord9\""));
+    assert_eq!(t.app.reload_tick(), 1);
+    t.assert_dropped(h, &mock).await;
+}
+
+#[tokio::test]
+async fn removing_the_identity_on_reload_drops_its_pending_hold() {
+    let mock = Mock::start().await;
+    let t = Ht::new("rl-ident", &mock.up).await;
+    let h = t.spawn(t.post_other("/discord/hold/ok", r#"{"n":1}"#));
+    t.held(1).await;
+    t.rewrite(|s| {
+        let s = without_grant(&s, "[[grant]]\nidentity = \"muse-other\"");
+        let a = s.find("[[identity]]\nname = \"muse-other\"").unwrap();
+        let b = s.find("[[route]]").unwrap();
+        format!("{}{}", &s[..a], &s[b..])
+    });
+    assert_eq!(t.app.reload_tick(), 1);
+    t.assert_dropped(h, &mock).await;
+}
+
+#[tokio::test]
+async fn narrowing_the_hold_pattern_on_reload_drops_the_hold_it_no_longer_covers() {
+    let mock = Mock::start().await;
+    let t = Ht::new("rl-narrow", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    t.held(1).await;
+    // `/hold/ok` matched `/hold/*`; the narrowed grant holds `/hold/*/messages` only, and no
+    // allow grant covers `/hold/ok`, so it is denied now.
+    t.rewrite(|s| s.replace("\"/hold/*\", \"/hold/*/messages\"", "\"/hold/*/messages\""));
+    assert_eq!(t.app.reload_tick(), 1);
+    t.assert_dropped(h, &mock).await;
+}
+
+#[tokio::test]
+async fn a_method_removed_from_the_hold_grant_drops_the_hold() {
+    let mock = Mock::start().await;
+    let t = Ht::new("rl-method", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    t.held(1).await;
+    t.rewrite(|s| s.replace("methods = [\"POST\", \"PUT\"]", "methods = [\"PUT\"]"));
+    assert_eq!(t.app.reload_tick(), 1);
+    t.assert_dropped(h, &mock).await;
+}
+
+#[tokio::test]
+async fn a_hold_that_the_new_policy_still_holds_survives_and_can_be_approved() {
+    let mock = Mock::start().await;
+    let t = Ht::new("rl-keep", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let id = t.held(1).await;
+    t.rewrite(|s| s.replace("\"/webhooks/*/*\"]", "\"/webhooks/*/*\", \"/extra/*\"]"));
+    assert_eq!(t.app.reload_tick(), 0);
+    assert_eq!(t.app.hold.pending_len(), 1);
+    assert_eq!(t.approve_checked(&id).await, ApproveResult::Success);
+    let (p, _) = h.await.unwrap().unwrap();
+    assert_eq!(p.status.as_u16(), 200);
+    assert_eq!(mock.hits(), 1);
+}
+
+#[tokio::test]
+async fn an_invalid_policy_replacing_the_file_fails_closed_for_holds_and_approvals() {
+    let mock = Mock::start().await;
+    let t = Ht::new("rl-invalid", &mock.up).await;
+    let a = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let id = t.held(1).await;
+    t.rewrite(|_| "version = 1\nthis is = not a valid policy\n".into());
+    // An approve that arrives before the tick is refused too: no valid policy, no approval.
+    assert_eq!(t.approve_checked(&id).await, ApproveResult::PolicyChanged);
+    t.assert_dropped(a, &mock).await;
+    let b = t.spawn(t.post("/discord/hold/ok", r#"{"n":2}"#));
+    let (p, _) = b.await.unwrap().unwrap();
+    assert_eq!(p.status.as_u16(), 503);
+    assert_eq!(mock.hits(), 0);
+}
+
+#[tokio::test]
+async fn an_approve_racing_a_reload_does_not_forward() {
+    let mock = Mock::start().await;
+    let t = Ht::new("rl-race", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let id = t.held(1).await;
+    // The file changed, the reload tick has not run: the approve itself re-reads the policy.
+    t.rewrite(|s| without_grant(&s, PILOT_HOLD));
+    assert_eq!(t.app.hold.pending_len(), 1);
+    assert_eq!(t.approve_checked(&id).await, ApproveResult::PolicyChanged);
+    t.assert_dropped(h, &mock).await;
+    // A later tick has nothing left to drop and nothing is sent.
+    assert_eq!(t.app.reload_tick(), 0);
+    assert_eq!(mock.hits(), 0);
+}
+
 #[tokio::test]
 async fn an_identical_retry_supersedes_and_one_approval_makes_one_request() {
     let mock = Mock::start().await;

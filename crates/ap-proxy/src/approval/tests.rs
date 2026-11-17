@@ -189,7 +189,8 @@ path_patterns = ["/hold/*", "/webhooks/*/*"]
         let approval = cfg.approval.clone().expect("approval block");
         let (sink, audit) = buffer_sink();
         let app = PtApp::new(policy, cfg, sink, client_for(&up));
-        let state = ApprovalApp::build(Arc::clone(&app.hold), &approval, delay);
+        let state =
+            ApprovalApp::build(Arc::clone(&app.hold), &approval, delay, app.policy_source());
         let l = crate::listener::bind_loopback("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
@@ -936,4 +937,25 @@ async fn a_slow_header_block_is_closed() {
         .unwrap_or(0);
     assert_eq!(n, 0);
     assert_eq!(env.get("/pending", "").await.status, 200);
+}
+
+#[tokio::test]
+async fn approving_after_the_hold_grant_is_removed_is_refused_and_sends_nothing() {
+    let env = Env::new("apr-grant-gone").await;
+    let (h, id) = env.hold("/discord/hold/1", br#"{"a":1}"#).await;
+    // The owner removes the hold grant. The one-second reload tick has not run yet.
+    let policy = env._s.path().join("policy.toml");
+    let text = std::fs::read_to_string(&policy).unwrap();
+    let cut = text
+        .find("[[grant]]\nidentity = \"muse-pilot\"\nroute = \"discord\"\nmethods = [\"POST\"]")
+        .unwrap();
+    std::fs::write(&policy, &text[..cut]).unwrap();
+    let r = env.approve(&id).await;
+    assert_eq!(r.status, 410, "{}", r.body);
+    assert_eq!(r.json()["result"], "policy_changed");
+    let (p, body) = h.await.unwrap().expect("answer");
+    assert_eq!(p.status.as_u16(), 503);
+    assert!(String::from_utf8_lossy(&body).contains("dropped_on_reload"));
+    assert_eq!(env.upstream_hits(), 0);
+    assert!(env.audit_text().contains("dropped_on_reload"));
 }

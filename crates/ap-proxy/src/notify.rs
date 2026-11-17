@@ -147,7 +147,12 @@ impl NtfyNotifier {
             }
             None => None,
         };
+        // `no_proxy` also turns off system proxy detection: the topic URL, the bearer token and
+        // the approval link go to the configured ntfy host and nowhere else. Redirects are never
+        // followed, so a reply cannot send them to another host either.
         let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(timeout)
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()

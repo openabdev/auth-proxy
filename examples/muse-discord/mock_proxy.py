@@ -1,336 +1,203 @@
 #!/usr/bin/env python3
-"""Mock auth-proxy -- CONTRACT SKETCH for issue #5, NOT the real proxy.
+"""Mock of the Muse gate, stage 1 -- NOT the real proxy.
 Requires Python 3.11+ (stdlib only).
 
-This mock is a contract sketch for the approval flow proposed in #5/#6.
-It is NOT a stand-in that verifies the real proxy: it deliberately omits
-canonicalization, policy evaluation, the session registry, audit and
-upstream forwarding (see "Simplifications" below). Tests that pass against
-this mock therefore say little about the real proxy in crates/ -- they only
-exercise caller.py against this sketched contract. Once #5 settles the
-approval contract, this mock should be re-derived from that spec, and a
-separate test should run the caller against the real proxy.
+This mock models the caller-facing contract of the passthrough gate that is
+merged on main (stage 1; crates/ap-proxy/src/passthrough.rs, design in
+docs/design/muse-gated-passthrough.md, measurements in
+docs/evidence/muse-stage1.md). It exists so caller.py can be exercised without
+a Rust build. It is not a stand-in that verifies the real gate: it omits
+canonicalization, the `Host` check, framing checks, body limits, audit and
+evidence lines, TLS and real upstream forwarding. A green run here says the
+caller follows the contract the mock sketches, nothing more.
 
-Implements just enough of the caller-facing shape to exercise caller.py:
+What it models, in the order the real gate applies it:
 
-  * /ap/<caller-key>/<route><path> addressing and caller-key checking
-    (sha256 compared, like crates/ap-proxy/src/pipeline.rs),
-  * the surrogate in "Authorization: Bearer aps_..." form,
-  * an allow-listed read answered with canned upstream data,
-  * the proposed approval flow: a write is parked with
-    "202 + X-Auth-Proxy-Approval: parked + request_id", and
-    GET /ap/<caller-key>/_approval/<request-id> reports
-    parked / executed / denied / expired. The poll segment is "_approval":
-    "_" is rejected by valid_slug for route names, so it cannot collide
-    with a configured route. A bare 202 without the marker
-    header is NOT a parked request (caller.py returns it as upstream data);
-    the fabricated upstream answers POST /api/v10/async-accepted with a
-    bare 202 so tests can exercise that path. The fabricated upstream also
-    answers /api/v10/redirect-me (GET or POST) with a 302 whose Location
-    is MOCK_REDIRECT_LOCATION, so tests can exercise the caller's
-    no-redirect transport: the caller must treat the 302 as an error and
-    must not make a second request to that Location.
+  1. Caller key from exactly one place: the X-AP-Caller-Key header, or the
+     /ap/<caller-key>/ path prefix (stripped before routing). Both present is
+     400 caller_key_ambiguous. A missing, malformed or unknown key is 401
+     caller_rejected. The key is compared by sha256.
+  2. Route name from the first path segment. An unknown route is 423
+     route_unknown.
+  3. More than one Authorization header is 400 authorization_duplicate.
+  4. Grant: the policy is read from deploy/muse/pilot-policy.example.toml
+     (override with MOCK_POLICY): a method match plus a raw starts_with on the
+     route-relative path. Anything not granted, writes included, is 423
+     no_grant. There is NO hold and NO approval flow: that is stage 2 and is
+     still in review, so it is deliberately absent here.
+  5. A granted request is answered by a fabricated upstream. The caller's
+     Authorization passes through unchanged; the caller-key header and every
+     x-ap-* header are not forwarded. /api/v10/users/@me echoes what the
+     upstream saw so tests can prove both.
 
-Simplifications, deliberately: one identity, one route, one registered
-surrogate, no canonicalization, no policy evaluation, no registry, no
-audit, and parked requests live in memory. The "upstream" is fabricated;
-no Discord call ever happens, and the mock "executes" a parked write by
-inventing the upstream response.
+Every refusal the mock generates carries X-AP-Decision and the two-field JSON
+body {"ap_decision": ..., "code": ...}, the same shape as the real gate
+(ap_core::outcome::render_passthrough). Discord's own answers carry no
+X-AP-Decision.
 
-No reusable credential material is committed in this file. The caller key
-and surrogate are ephemeral: test_caller.py generates them with
-secrets.token_hex(32) and passes them in via the environment; a manual run
-generates fresh ones at startup and prints them.
-
-Test-only admin endpoints (NOT part of the proposed contract; they stand in
-for the owner's approval plane):
-
-  POST /_mock/approve/<request-id>     approve and "execute" the parked write
-  POST /_mock/deny/<request-id>        deny it
-  POST /_mock/revoke/<surrogate-sha256>  unregister a surrogate and drop
-                                       every request it parked
-  GET  /_mock/parked                   ids of currently parked requests, so
-                                       tests can discover ids instead of
-                                       sleeping and guessing them
-
-Every /_mock/ route requires the per-run admin token in the
-"X-Mock-Admin" header (compared in constant time). Without it, anything
-that can reach the caller listener could approve a parked write.
-
-Approval semantics sketched here (all still open in #5):
-
-  * Expiry is enforced under the lock before EVERY list, approve, deny
-    and outcome operation, so a request past its TTL can never be
-    approved, whether or not the caller is still polling.
-  * A parked request is bound to the surrogate (session) that created
-    it. Polling it with any other surrogate answers 404, the same as an
-    unknown id.
-  * Revoking a surrogate drops its parked requests.
-  * Request ids are unguessable (128 random bits), not a counter.
+No reusable credential material is committed: the caller key is generated
+at startup (or passed in MOCK_CALLER_KEY by the tests) and printed.
 
 Environment:
-  MOCK_TTL         seconds a parked request awaits a decision (default 60)
   MOCK_PORT        port to bind, 0 = ephemeral (default 0); the bound port is
                    printed as "MOCK_PORT=<port>" on stdout, followed by the
-                   ephemeral MOCK_CALLER_KEY / MOCK_SURROGATE in use.
+                   MOCK_CALLER_KEY in use.
   MOCK_CALLER_KEY  apk_... caller key to accept (default: generated)
-  MOCK_SURROGATE   aps_... surrogate to accept  (default: generated)
-  MOCK_SURROGATE_2 optional second aps_... surrogate (a second session),
-                   used by the two-session isolation tests
-  MOCK_ADMIN_TOKEN token required by /_mock/ routes (default: generated)
+  MOCK_POLICY      policy file to read grants from
   MOCK_REDIRECT_LOCATION  Location returned by the fabricated
-                   /api/v10/redirect-me endpoint (default:
-                   https://example.invalid/steal); tests point it at a
-                   local counting server to assert no second request.
+                   /api/v10/channels/redirect-me endpoint (default:
+                   https://example.invalid/steal); tests point it at a local
+                   counting server to assert the caller makes no second
+                   request.
 """
 
 import hashlib
-import hmac
 import json
 import os
 import re
 import secrets
-import threading
-import time
+import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# Ephemeral key material only -- nothing reusable is committed here.
-EXAMPLE_CALLER_KEY = os.environ.get("MOCK_CALLER_KEY") or ("apk_" + secrets.token_hex(32))
-EXAMPLE_SURROGATE = os.environ.get("MOCK_SURROGATE") or ("aps_" + secrets.token_hex(32))
-CALLER_SHA256 = hashlib.sha256(EXAMPLE_CALLER_KEY.encode()).hexdigest()
-EXAMPLE_SURROGATE_2 = os.environ.get("MOCK_SURROGATE_2") or ""
-ADMIN_TOKEN = os.environ.get("MOCK_ADMIN_TOKEN") or secrets.token_hex(32)
-SURROGATE_FORM = re.compile(r"^Bearer (aps_[0-9a-f]{64})$")
-CHANNEL_MESSAGES = re.compile(r"^/api/v10/channels/(\d+)/messages$")
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_POLICY = os.path.join(HERE, "..", "..", "deploy", "muse", "pilot-policy.example.toml")
 
-TTL = float(os.environ.get("MOCK_TTL", "60"))
+CALLER_KEY = os.environ.get("MOCK_CALLER_KEY") or ("apk_" + secrets.token_hex(32))
+CALLER_SHA256 = hashlib.sha256(CALLER_KEY.encode()).hexdigest()
+KEY_RE = re.compile(r"^apk_[0-9a-f]{64}$")
+KEY_HEADER = "x-ap-caller-key"
 REDIRECT_LOCATION = os.environ.get("MOCK_REDIRECT_LOCATION", "https://example.invalid/steal")
-_lock = threading.Lock()
-_parked: dict[str, dict] = {}
-# Registered surrogates (sha256 hex), the mock's stand-in for the registry.
-_surrogates: set[str] = {hashlib.sha256(EXAMPLE_SURROGATE.encode()).hexdigest()}
-if EXAMPLE_SURROGATE_2:
-    _surrogates.add(hashlib.sha256(EXAMPLE_SURROGATE_2.encode()).hexdigest())
+
+# (status, X-AP-Decision), as in ap_core::outcome::passthrough_outcome.
+OUTCOMES = {
+    "no_grant": (423, "denied"),
+    "route_unknown": (423, "denied"),
+    "caller_rejected": (401, "rejected"),
+    "caller_key_ambiguous": (400, "denied"),
+    "authorization_duplicate": (400, "denied"),
+}
 
 
-# Test seam: called between the caller check and the park critical section so
-# a test can interleave a revoke deterministically. None in normal runs.
-_after_caller_check = None
+def load_grants(path: str) -> list[dict]:
+    with open(path, "rb") as fh:
+        return tomllib.load(fh).get("grant", [])
 
 
-def _expire_locked(now: float) -> None:
-    """The one deadline transition. Callers hold _lock and call this before
-    any list, approve, deny or outcome operation."""
-    for entry in _parked.values():
-        if entry["status"] == "parked" and now > entry["expires_at"]:
-            entry["status"] = "expired"
+GRANTS = load_grants(os.environ.get("MOCK_POLICY") or DEFAULT_POLICY)
+ROUTES = {"discord"}
 
 
-def _json(handler: BaseHTTPRequestHandler, status: int, payload, extra_headers: dict | None = None) -> None:
-    body = json.dumps(payload).encode()
+def granted(route: str, method: str, path: str) -> bool:
+    """Policy::evaluate for a passthrough grant: route and method match, and the
+    route-relative path starts with one of the grant's paths (raw starts_with).
+    The mock has one identity, so the identity column is not modelled."""
+    return any(
+        g["route"] == route
+        and method in g["methods"]
+        and any(path.startswith(p) for p in g["paths"])
+        for g in GRANTS
+    )
+
+
+def _send(handler: BaseHTTPRequestHandler, status: int, body: bytes, headers: dict) -> None:
     handler.send_response(status)
-    handler.send_header("Content-Type", "application/json")
-    handler.send_header("Content-Length", str(len(body)))
-    for key, value in (extra_headers or {}).items():
+    for key, value in headers.items():
         handler.send_header(key, value)
+    handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
 
 
-def _redirect(handler: BaseHTTPRequestHandler, location: str) -> None:
-    handler.send_response(302)
-    handler.send_header("Location", location)
-    handler.send_header("Content-Length", "0")
-    handler.end_headers()
+def refuse(handler: BaseHTTPRequestHandler, code: str) -> None:
+    status, decision = OUTCOMES[code]
+    body = json.dumps({"ap_decision": decision, "code": code}, separators=(",", ":")).encode()
+    _send(handler, status, body, {"Content-Type": "application/json", "X-AP-Decision": decision})
+
+
+def upstream_json(handler: BaseHTTPRequestHandler, status: int, payload) -> None:
+    # A fabricated Discord answer: no X-AP-Decision.
+    _send(handler, status, json.dumps(payload).encode(), {"Content-Type": "application/json"})
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # keep test output clean
         pass
 
-    # -- helpers ---------------------------------------------------------
-    def _read_json(self) -> dict:
+    def _handle(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
-        if not length:
-            return {}
-        try:
-            return json.loads(self.rfile.read(length) or b"{}")
-        except ValueError:
-            return {}
+        if length:
+            self.rfile.read(length)  # drained; the gate never looks at the body
+        split = self.path.split("?", 1)
+        path = split[0]
 
-    def _check_caller(self, caller_key: str) -> str | None:
-        """Return the session id (surrogate sha256) or None after answering."""
-        digest = hashlib.sha256(caller_key.encode()).hexdigest()
-        if digest != CALLER_SHA256:
-            _json(self, 403, {"code": "caller_rejected"})
-            return None
-        match = SURROGATE_FORM.match(self.headers.get("Authorization") or "")
-        if not match:
-            _json(self, 403, {"code": "surrogate_malformed"})
-            return None
-        session = hashlib.sha256(match.group(1).encode()).hexdigest()
-        with _lock:
-            registered = session in _surrogates
-        if not registered:
-            _json(self, 403, {"code": "surrogate_unknown"})
-            return None
-        return session
+        # 1. Caller key from exactly one place.
+        header_keys = self.headers.get_all(KEY_HEADER) or []
+        path_form = path.startswith("/ap/")
+        if header_keys and path_form:
+            return refuse(self, "caller_key_ambiguous")
+        if path_form:
+            _empty, _ap, key, *_ = (path.split("/", 3) + ["", ""])[:4]
+            path = path[len("/ap/") + len(key):]
+        elif len(header_keys) == 1:
+            key = header_keys[0]
+        else:
+            return refuse(self, "caller_rejected")
+        if not KEY_RE.match(key) or hashlib.sha256(key.encode()).hexdigest() != CALLER_SHA256:
+            return refuse(self, "caller_rejected")
 
-    def _check_admin(self) -> bool:
-        supplied = self.headers.get("X-Mock-Admin") or ""
-        if not hmac.compare_digest(supplied.encode(), ADMIN_TOKEN.encode()):
-            _json(self, 403, {"code": "admin_rejected"})
-            return False
-        return True
+        # 2. Route name in the path.
+        segments = path.split("/", 2)  # ["", route, rest]
+        route = segments[1] if len(segments) > 1 else ""
+        rel = "/" + segments[2] if len(segments) > 2 else "/"
+        if route not in ROUTES:
+            return refuse(self, "route_unknown")
 
-    # -- routing ---------------------------------------------------------
-    def do_POST(self):  # noqa: N802 (http.server naming)
-        if self.path.startswith("/_mock/"):
-            if not self._check_admin():
-                return
-            return self._admin(self.path)
-        parts = self.path.split("/", 4)
-        if len(parts) < 5 or parts[1] != "ap":
-            return _json(self, 404, {"code": "route_unknown"})
-        _empty, _ap, caller_key, route, rest = parts
-        session = self._check_caller(caller_key)
-        if session is None:
+        # 3. One Authorization header at most.
+        authorization = self.headers.get_all("Authorization") or []
+        if len(authorization) > 1:
+            return refuse(self, "authorization_duplicate")
+
+        # 4. Grant. Everything not granted is 423 no_grant (no hold on main).
+        if not granted(route, self.command, rel):
+            return refuse(self, "no_grant")
+
+        # 5. Fabricated upstream. The caller's Authorization is forwarded as is.
+        if rel == "/api/v10/channels/redirect-me":
+            self.send_response(302)
+            self.send_header("Location", REDIRECT_LOCATION)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
-        upstream_path = "/" + rest.split("?")[0]
-        if route == "discord" and upstream_path == "/api/v10/redirect-me":
-            # Fabricated upstream endpoint that answers 302 with an
-            # external Location: the caller must not follow it (its
-            # surrogate Authorization header would leave the proxy).
-            return _redirect(self, REDIRECT_LOCATION)
-        if route == "discord" and upstream_path == "/api/v10/async-accepted":
-            # Fabricated upstream endpoint that legitimately answers a bare
-            # 202 (no approval marker): the caller must return it as data.
-            return _json(self, 202, {"status": "accepted", "via": "mock-upstream"})
-        if route == "discord" and upstream_path == "/api/v10/marker-collision":
-            # Fabricated HOSTILE upstream: it answers 202 with the same
-            # marker header and a request id of its choosing. Nothing in
-            # this mock strips it. The real proxy must (see README, #5).
-            return _json(self, 202, {"request_id": "req_" + "ab" * 16, "status": "parked"},
-                         extra_headers={"X-Auth-Proxy-Approval": "parked"})
-        match = CHANNEL_MESSAGES.match(upstream_path) if route == "discord" else None
-        if not match:
-            return _json(self, 404, {"code": "route_unknown"})
-        body = self._read_json()
-        if _after_caller_check is not None:
-            _after_caller_check()
-        with _lock:
-            # Registration is re-checked in the same critical section that
-            # inserts the entry, so a revoke cannot slip in between.
-            if session not in _surrogates:
-                return _json(self, 403, {"code": "surrogate_unknown"})
-            _expire_locked(time.monotonic())
-            request_id = "req_" + secrets.token_hex(16)
-            _parked[request_id] = {
-                "session": session,
-                "status": "parked",
-                "channel_id": match.group(1),
-                "body": body,
-                "expires_at": time.monotonic() + TTL,
-                "result": None,
-            }
-        # Proposed #5 marker: parked responses carry the proxy-owned header
-        # in addition to the 202 status, so a bare upstream 202 is not
-        # mistaken for a parked request.
-        return _json(self, 202, {"request_id": request_id, "status": "parked"},
-                     extra_headers={"X-Auth-Proxy-Approval": "parked"})
-
-    def do_GET(self):  # noqa: N802
-        if self.path.startswith("/_mock/"):
-            return self._admin_get(self.path)
-        parts = self.path.split("/", 4)
-        if len(parts) < 4 or parts[1] != "ap":
-            return _json(self, 404, {"code": "route_unknown"})
-        caller_key, route = parts[2], parts[3]
-        session = self._check_caller(caller_key)
-        if session is None:
-            return
-        if route == "_approval":
-            request_id = parts[4] if len(parts) > 4 else ""
-            return self._outcome(request_id, session)
-        if route != "discord" or len(parts) < 5:
-            return _json(self, 404, {"code": "route_unknown"})
-        upstream_path = "/" + parts[4].split("?")[0]
-        if upstream_path == "/api/v10/redirect-me":
-            return _redirect(self, REDIRECT_LOCATION)
-        if CHANNEL_MESSAGES.match(upstream_path):
-            return _json(self, 200, [{
+        forwarded_names = [k for k in self.headers.keys() if not k.lower().startswith("x-ap-")]
+        if rel == "/api/v10/users/@me":
+            return upstream_json(self, 200, {
+                "upstream_saw_authorization": authorization[0] if authorization else None,
+                # The gate removes the caller-key header and every x-ap-* header.
+                "upstream_saw_caller_key_header": any(
+                    k.lower().startswith("x-ap-") for k in forwarded_names),
+                "upstream_saw_key_in_path": "apk_" in rel,
+            })
+        match = re.match(r"^/api/v10/channels/(\d+)/messages$", rel)
+        if match and not authorization:
+            # Discord's own 401; it carries no X-AP-Decision.
+            return upstream_json(self, 401, {"message": "401: Unauthorized", "code": 0})
+        if match:
+            return upstream_json(self, 200, [{
                 "id": "1570000000000000000",
-                "channel_id": upstream_path.split("/")[4],
+                "channel_id": match.group(1),
                 "content": "canned message from the mock upstream",
                 "author": {"id": "9999999999999999001", "username": "mock-bot"},
             }])
-        return _json(self, 404, {"code": "route_unknown"})
+        return upstream_json(self, 404, {"message": "404: Not Found", "code": 0})
 
-    # -- approval outcome + test-only admin ------------------------------
-    def _admin_get(self, path: str) -> None:
-        if not self._check_admin():
-            return
-        if path.strip("/") == "_mock/parked":
-            with _lock:
-                _expire_locked(time.monotonic())
-                ids = [rid for rid, e in _parked.items() if e["status"] == "parked"]
-            return _json(self, 200, {"parked": ids})
-        return _json(self, 404, {"code": "admin_unknown"})
-
-    def _outcome(self, request_id: str, session: str) -> None:
-        with _lock:
-            _expire_locked(time.monotonic())
-            entry = _parked.get(request_id)
-            # Another session's id answers exactly like an unknown id.
-            if entry is None or entry["session"] != session:
-                return _json(self, 404, {"code": "request_unknown"})
-            payload = {"request_id": request_id, "status": entry["status"]}
-            if entry["status"] == "executed":
-                payload["result"] = entry["result"]
-            return _json(self, 200, payload)
-
-    def _admin(self, path: str) -> None:
-        bits = path.strip("/").split("/")
-        if len(bits) != 3 or bits[1] not in ("approve", "deny", "revoke"):
-            return _json(self, 404, {"code": "admin_unknown"})
-        action, request_id = bits[1], bits[2]
-        if action == "revoke":
-            with _lock:
-                _surrogates.discard(request_id)
-                for rid in [r for r, e in _parked.items() if e["session"] == request_id]:
-                    del _parked[rid]
-            return _json(self, 200, {"revoked": request_id})
-        with _lock:
-            _expire_locked(time.monotonic())
-            entry = _parked.get(request_id)
-            if entry is None or entry["status"] != "parked" or entry["session"] not in _surrogates:
-                return _json(self, 409, {"code": "not_parked"})
-            if action == "deny":
-                entry["status"] = "denied"
-            else:
-                sent = entry["body"] if isinstance(entry["body"], dict) else {}
-                content, reference = sent.get("content", ""), sent.get("message_reference")
-                entry["status"] = "executed"
-                entry["result"] = {
-                    "status": 201,
-                    "body": {
-                        "id": "1570000000000000001",
-                        "channel_id": entry["channel_id"],
-                        "content": content,
-                        "message_reference": reference,
-                        "via": "mock-upstream",
-                    },
-                }
-        return _json(self, 200, {"request_id": request_id, "status": entry["status"]})
+    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _handle  # noqa: N815
 
 
 def main() -> None:
     port = int(os.environ.get("MOCK_PORT", "0"))
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"MOCK_PORT={server.server_address[1]}", flush=True)
-    print(f"MOCK_CALLER_KEY={EXAMPLE_CALLER_KEY}", flush=True)
-    print(f"MOCK_SURROGATE={EXAMPLE_SURROGATE}", flush=True)
-    print(f"MOCK_ADMIN_TOKEN={ADMIN_TOKEN}", flush=True)
+    print(f"MOCK_CALLER_KEY={CALLER_KEY}", flush=True)
     server.serve_forever()
 
 

@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
-"""Policy check: the shipped identity.toml against ap-core's matching rules.
+"""Policy check: the shipped pilot policy against the gate's matching rules.
 
-This is a line-by-line Python MIRROR of two small functions in
-crates/ap-core -- valid_path (src/config.rs) and Policy::evaluate's
-method + raw starts_with path match (src/policy.rs) -- run against the
-caller's real request paths. It exists because the mock in this directory
-does no policy evaluation at all: without this check, the example's own
-tests happily accept a grant shape the real policy would deny (round-2
-review F1/F3). The mirror is deliberately tiny and cites its sources;
-if config.rs or policy.rs change their rules, this file must change with
-them. It does NOT replace running the caller against the real proxy.
+This is a Python MIRROR of two small pieces of crates/ap-core, run against the
+paths this caller actually uses: valid_prefix_path (src/config.rs, the path
+rule for passthrough grants) and Policy::evaluate's method match plus raw
+starts_with on the route-relative path (src/policy.rs). The mock does not
+evaluate policy independently of this file's source (it reads the same TOML),
+so this check pins what that policy does and does not authorize. If config.rs
+or policy.rs change their rules, this file must change with them. It does NOT
+replace running the caller against the real gate.
+
+The policy is deploy/muse/pilot-policy.example.toml (stage 1, reads only).
 
 What it pins down:
 
-  1. every grant path in the shipped identity.toml passes valid_path,
-  2. the shipped read grants authorize the caller's read paths,
-  3. the documented write trap: the /messages/ prefix grant (the only
-     per-message prefix valid_path accepts) can NEVER authorize the
-     create-message request, whose path has no trailing slash -- while
-     it WOULD authorize sub-paths such as threads and crossposts,
-  4. the whole-channel prefix is the only Phase 1 grant shape that
-     authorizes create-message -- and it also authorizes the
-     bulk-delete, webhooks and invites endpoints under the channel
-     (the blast radius that implies), while NOT authorizing
-     DELETE/PATCH on the channel path itself (no trailing slash).
+  1. every grant path passes valid_prefix_path and no grant carries a
+     credential or a hold decision (stage 1 grants are allow only),
+  2. the read grants authorize the caller's read paths,
+  3. create-message and every other write is NOT authorized: the gate answers
+     423 no_grant in stage 1,
+  4. the read-side blast radius of the raw prefixes: GET .../channels/<id>/webhooks
+     and the guild reads are authorized too.
 
 Run: python3 test_policy.py   (stdlib only, no network)
 """
@@ -33,6 +30,7 @@ import sys
 import tomllib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+POLICY = os.path.join(HERE, "..", "..", "deploy", "muse", "pilot-policy.example.toml")
 CHANNEL = "1111111111111111111"
 
 failures = []
@@ -44,100 +42,63 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         failures.append(name)
 
 
-# -- mirrors of crates/ap-core -------------------------------------------
-def valid_path(p: str) -> bool:
-    """Mirror of valid_path in crates/ap-core/src/config.rs."""
-    if not p.startswith("/"):
-        return False
-    if "%" in p:
-        return False
-    if "//" in p:
-        return False
-    if any(seg in (".", "..") for seg in p.split("/")):
-        return False
-    if not p.endswith("/"):
-        return False
-    return True
+def valid_prefix_path(p: str) -> bool:
+    """Mirror of valid_prefix_path in crates/ap-core/src/config.rs."""
+    return (
+        p.startswith("/")
+        and "%" not in p
+        and "//" not in p
+        and not any(seg in (".", "..") for seg in p.split("/"))
+    )
 
 
-def evaluate(grants: list[dict], method: str, path: str) -> bool:
-    """Mirror of Policy::evaluate in crates/ap-core/src/policy.rs:
-    a grant matches when the method matches and the request path starts
-    with any of the grant's path prefixes (raw starts_with, no segment
-    boundary)."""
+def evaluate(grants: list[dict], route: str, method: str, path: str) -> bool:
+    """Mirror of Policy::evaluate for a passthrough grant."""
     return any(
-        method in g["methods"] and any(path.startswith(prefix) for prefix in g["paths"])
+        g["route"] == route and method in g["methods"] and any(path.startswith(p) for p in g["paths"])
         for g in grants
     )
 
 
 def main() -> int:
-    with open(os.path.join(HERE, "identity.toml"), "rb") as fh:
+    with open(POLICY, "rb") as fh:
         config = tomllib.load(fh)
-    shipped = config.get("grant", [])
+    grants = config.get("grant", [])
 
-    # 1. shipped grant paths are loadable by the real config validation
-    check("shipped grant paths pass valid_path",
-          all(valid_path(p) for g in shipped for p in g["paths"]),
-          str([p for g in shipped for p in g["paths"] if not valid_path(p)]))
+    check("the policy has at least one grant", bool(grants))
+    check("every grant path passes valid_prefix_path",
+          all(valid_prefix_path(p) for g in grants for p in g["paths"]))
+    check("stage 1 grants are allow-only and carry no credential",
+          all(g.get("decision") == "allow" and "credential" not in g for g in grants))
+    check("stage 1 grants are reads only", all(g["methods"] == ["GET"] for g in grants))
 
-    # 2. shipped read grants authorize the caller's read paths
-    check("read grant matches message history path",
-          evaluate(shipped, "GET", f"/api/v10/channels/{CHANNEL}/messages"))
-    check("read grant does NOT cover guild reads (caller.py does not use them)",
-          not evaluate(shipped, "GET", f"/api/v10/guilds/{CHANNEL}/channels"))
-    # /users/@me/guilds is the real "list my guilds" endpoint. It is NOT
-    # under the granted prefixes, so the example does not claim it.
-    check("read grant does NOT cover /users/@me/guilds",
-          not evaluate(shipped, "GET", "/api/v10/users/@me/guilds"))
+    ok = lambda m, p: evaluate(grants, "discord", m, p)  # noqa: E731
+    check("GET channel messages is authorized", ok("GET", f"/api/v10/channels/{CHANNEL}/messages"))
+    check("GET users/@me is authorized", ok("GET", "/api/v10/users/@me"))
 
-    # M-1: the default read grant is a prefix and cannot be narrowed to
-    # messages only (valid_path forbids the exact path). It therefore
-    # DOES authorize listing webhooks, which returns webhook tokens when
-    # the bot holds Manage Webhooks. Documented in README/identity.toml;
-    # pinned here so a change in either direction is noticed.
-    check("DOCUMENTED RISK: read grant authorizes GET .../webhooks (tokens if bot has Manage Webhooks)",
-          evaluate(shipped, "GET", f"/api/v10/channels/{CHANNEL}/webhooks"))
-    check("guild webhooks are not covered",
-          not evaluate(shipped, "GET", f"/api/v10/guilds/{CHANNEL}/webhooks"))
+    check("POST create-message is NOT authorized (423 no_grant in stage 1)",
+          not ok("POST", f"/api/v10/channels/{CHANNEL}/messages"))
+    for method, path in [
+        ("PUT", f"/api/v10/channels/{CHANNEL}/pins/1"),
+        ("PATCH", f"/api/v10/channels/{CHANNEL}/messages/1"),
+        ("DELETE", f"/api/v10/channels/{CHANNEL}/messages/1"),
+        ("POST", f"/api/v10/channels/{CHANNEL}/messages/bulk-delete"),
+        ("POST", f"/api/v10/channels/{CHANNEL}/webhooks"),
+        ("POST", f"/api/v10/channels/{CHANNEL}/invites"),
+    ]:
+        check(f"{method} {path.split(CHANNEL)[-1] or path} is NOT authorized", not ok(method, path))
 
-    # 3. the documented write trap (round-2 F1/F2)
-    narrow = [{"methods": ["POST"], "paths": [f"/api/v10/channels/{CHANNEL}/messages/"]}]
-    check("narrow /messages/ prefix passes valid_path (it loads fine)",
-          valid_path(narrow[0]["paths"][0]))
-    check("...but can NEVER authorize create-message (no trailing slash)",
-          not evaluate(narrow, "POST", f"/api/v10/channels/{CHANNEL}/messages"))
-    check("...while it WOULD authorize thread creation from a message",
-          evaluate(narrow, "POST", f"/api/v10/channels/{CHANNEL}/messages/1570000000000000000/threads"))
-    check("...and crossposting a message",
-          evaluate(narrow, "POST", f"/api/v10/channels/{CHANNEL}/messages/1570000000000000000/crosspost"))
-    check("exact create-message path is rejected by valid_path",
-          not valid_path(f"/api/v10/channels/{CHANNEL}/messages"))
+    # Raw prefixes are broader than message history: a read grant on
+    # /api/v10/channels/ also reaches the webhooks list, which returns webhook
+    # tokens if the bot holds Manage Webhooks. Not narrowable in stage 1.
+    check("READ-SIDE RISK: GET .../webhooks is authorized by the channel prefix",
+          ok("GET", f"/api/v10/channels/{CHANNEL}/webhooks"))
+    check("READ-SIDE RISK: GET guild reads are authorized by the guild prefix",
+          ok("GET", "/api/v10/guilds/1/members"))
+    check("the read prefix does not cover other trees", not ok("GET", "/api/v10/applications/@me"))
+    check("an unknown route is not authorized", not evaluate(grants, "nowhere", "GET", "/api/v10/users/@me"))
 
-    # 4. the only Phase 1 shape that authorizes create-message
-    broad = [{"methods": ["POST"], "paths": [f"/api/v10/channels/{CHANNEL}/"]}]
-    check("whole-channel prefix authorizes create-message",
-          evaluate(broad, "POST", f"/api/v10/channels/{CHANNEL}/messages"))
-    # ...and its blast radius (round-3 F1): the same POST grant also
-    # authorizes destructive and proxy-escaping endpoints under the
-    # channel. bulk-delete needs Discord's Manage Messages permission
-    # and webhooks need Manage Webhooks, so the README/identity.toml
-    # advice is to grant the bot neither (nor Create Instant Invite).
-    check("whole-channel prefix also authorizes bulk-delete",
-          evaluate(broad, "POST", f"/api/v10/channels/{CHANNEL}/messages/bulk-delete"))
-    check("whole-channel prefix also authorizes webhook creation (mints a proxy-bypassing token)",
-          evaluate(broad, "POST", f"/api/v10/channels/{CHANNEL}/webhooks"))
-    check("whole-channel prefix also authorizes invite creation",
-          evaluate(broad, "POST", f"/api/v10/channels/{CHANNEL}/invites"))
-    # ...but not the channel itself: /api/v10/channels/<id> has no
-    # trailing slash, so it does not start with the prefix.
-    broad_rw = [{"methods": ["POST", "PATCH", "DELETE"], "paths": [f"/api/v10/channels/{CHANNEL}/"]}]
-    check("whole-channel prefix does NOT authorize DELETE on the channel itself",
-          not evaluate(broad_rw, "DELETE", f"/api/v10/channels/{CHANNEL}"))
-    check("whole-channel prefix does NOT authorize PATCH on the channel itself",
-          not evaluate(broad_rw, "PATCH", f"/api/v10/channels/{CHANNEL}"))
-
-    print(f"\n{'ALL PASS' if not failures else 'FAILURES: ' + ', '.join(failures)}")
+    print(f"\n{'ALL PASSED' if not failures else 'FAILED: ' + ', '.join(failures)}")
     return 1 if failures else 0
 
 

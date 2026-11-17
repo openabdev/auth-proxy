@@ -437,6 +437,8 @@ Follow-ups attached to the decision:
   Done for kiro-cli 3.3.0, one call each, no real request [M, `docs/evidence/xamz-target.md`].
   Re-check after a kiro-cli upgrade.
 - The combined Option A rule set is measured in one pod before release.
+- The credential Secret's at-rest requirements (etcd encryption, RBAC, backups, mount rules) are in the
+  README section "Credential Secret at-rest requirements"; its pre-release checklist applies.
 
 Remaining risk, accepted: the agent can still send data to allowlisted hosts such as github.com,
 and tools that ignore the proxy variables fail slowly.

@@ -231,3 +231,87 @@ flowchart TB
   iptables owner match is what separates them.
 - **Names come from `deploy/k8s/pod.yaml`:** container, volume and port names match that file.
   Image references are placeholders until a release pins digests.
+
+### Credential Secret at-rest requirements
+
+The real credential lives in the Secret `auth-proxy-kiro`. The file the proxy reads is not a plain
+file on a persistent volume, but the Secret's protection at rest is the cluster's, so these are
+deployment requirements. Evidence tags: **[doc]** is stated by the linked Kubernetes or k3s page,
+**[M]** was measured in this repo, **[untested]** is the repo's own rule that nothing here has
+verified against a cluster.
+
+**Mount**
+
+- The Secret is mounted only into the `proxy` container, as a `secret` volume, `readOnly: true`
+  (`deploy/k8s/validate_manifests.py` enforces this). **[M]** manifest checks, **[untested]** on a
+  live cluster beyond the runs in the section above.
+- For a Secret mounted into a Pod, the kubelet keeps the copy in a tmpfs, so the data is not
+  written to durable storage ([Secrets][k8s-secret]). **[doc]**
+- Never a PVC, and never a volume the agent mounts. The validator fails on a PVC, projected or any
+  other non-`secret` volume that names the Secret, on any mount outside `proxy` (including init
+  containers), and on `env` or `envFrom` references to the Secret from any container. **[M]**
+- `defaultMode` is `0444` (decimal 292), with no `fsGroup`. This is the measured rule from the k3s
+  validation ([docs/design/phase1.md](docs/design/phase1.md), store backend S1). **[M]**
+- "Mode 0400 owned by the proxy UID" is **not achievable** with a Kubernetes Secret volume in
+  this design. Group ownership of volume files is set by the Pod's `fsGroup`, which the design
+  forbids, and user ownership of `secret` volume files is an alpha feature (gate
+  `AtomicWriteVolumeUserFields`, Kubernetes v1.37, off by default) ([Volumes][k8s-volumes]). **[doc]**
+  Mode 0400 without that ownership would make the file unreadable by the proxy. Access is
+  limited instead by mounting the volume only into `proxy`, with one UID per container and
+  `shareProcessNamespace: false`. The mode check in the validator pins `0444`; a deployment that
+  enables the alpha feature and moves to 0400 must change the manifest, the validator and a k3s
+  re-run together. **[untested]** (the alpha feature has not been tried here)
+
+**Cluster**
+
+- Enable encryption at rest for Secrets in etcd. Kubernetes stores Secrets unencrypted in etcd by
+  default ([Secrets][k8s-secret]). **[doc]**
+  - Mechanism: an `EncryptionConfiguration` for the API server with a `kms` (v2) or `secretbox`
+    provider for the `secrets` resource; the `identity` provider does not encrypt
+    ([Encrypting Confidential Data at Rest][k8s-encrypt]). **[doc]**
+  - k3s: start the server with `--secrets-encryption` ([k3s secrets-encrypt][k3s-enc]). **[doc]**
+  - Managed clusters: use the provider's setting. This repo names no provider setting.
+    **[untested]**
+  - A Secret written before encryption was enabled stays unencrypted until it is rewritten
+    (`kubectl get secrets --all-namespaces -o json | kubectl replace -f -` in the same page).
+    **[doc]** Rewrite `auth-proxy-kiro` after enabling.
+  - Not verified here: that a cluster has it on. Check it per cluster before real credentials go in.
+    **[untested]**
+- RBAC on `secrets`: `get`, `list` and `watch` on Secrets each let a subject read Secret contents
+  ([RBAC good practices][k8s-rbac]), and `list` or `watch` reach every Secret in the namespace, not
+  only the ones a Pod references ([Secrets][k8s-secret]). **[doc]** So:
+  - Grant `get` on `auth-proxy-kiro` only, using `resourceNames`, to the minimum set of principals.
+    Grant `list` and `watch` on `secrets` in the `auth-proxy` namespace to nobody who is not already
+    trusted with every Secret there. **[untested]** (the `resourceNames` form is not in the repo's
+    manifests.)
+  - No wildcard verbs, resources or roles on `secrets`; the RBAC page advises against wildcard
+    permissions ([RBAC good practices][k8s-rbac]). **[doc]**
+  - Anyone who can create a Pod in the namespace can mount the Secret, so keep Pod creation in
+    `auth-proxy` equally restricted ([Secrets][k8s-secret]). **[doc]**
+- Backups and snapshots: etcd snapshots, Velero-style namespace backups and node disk snapshots
+  must be encrypted, or must exclude `auth-proxy-kiro`. This is repo policy and no cited page
+  states it. **[untested]**
+
+**Upstream credential scope**
+
+- Issue each upstream credential with the smallest permission set that serves the grants in the
+  identity file, one credential per upstream, and rotate it on suspected exposure. Per-upstream
+  guidance lives in the recipes (for example [docs/recipes/kiro-cli.md](docs/recipes/kiro-cli.md)).
+  Repo policy. **[untested]**
+
+**Before release**
+
+- [ ] `python3 deploy/k8s/validate_manifests.py` passes (credential mount, volume type, mode,
+      read-only and env rules).
+- [ ] Etcd encryption at rest is on for `secrets` in the target cluster, and `auth-proxy-kiro` was
+      written or rewritten after it was enabled.
+- [ ] RBAC on `secrets` in `auth-proxy` reviewed: no wildcard, `get` on the credential limited to
+      named principals, Pod creation in the namespace restricted.
+- [ ] Backup and snapshot targets for the cluster are encrypted, or exclude the Secret.
+- [ ] The upstream credential carries the smallest permission set for its grants.
+
+[k8s-secret]: https://kubernetes.io/docs/concepts/configuration/secret/
+[k8s-volumes]: https://kubernetes.io/docs/concepts/storage/volumes/
+[k8s-encrypt]: https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/
+[k8s-rbac]: https://kubernetes.io/docs/concepts/security/rbac-good-practices/
+[k3s-enc]: https://docs.k3s.io/cli/secrets-encrypt

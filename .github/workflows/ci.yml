@@ -20,6 +20,12 @@ jobs:
           python3 --version
           openssl version
 
+      - name: Kubernetes manifest validator and its mutation tests
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --user pyyaml
+          python3 deploy/k8s/validate_manifests.py
+          python3 deploy/k8s/test_validate_manifests.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -43,7 +49,7 @@ jobs:
         run: cargo test -p ap-proxy --features stage1-probe --lib
 
       - name: Release build (default features; the matrix-upstream feature stays off)
-        run: cargo build --release -p ap-proxy -p ap-egress -p ap-runtime-shim
+        run: cargo build --release -p ap-proxy -p ap-egress -p ap-runtime-shim -p ap-netprobe
 
       - name: Release binaries carry no test hooks
         run: |

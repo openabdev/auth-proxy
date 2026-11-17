@@ -12,6 +12,7 @@ pub mod hold;
 pub mod listener;
 #[cfg(feature = "matrix-upstream")]
 pub mod matrix_hooks;
+pub mod netguard;
 pub mod notify;
 pub mod passthrough;
 pub mod pipeline;
@@ -34,6 +35,7 @@ use axum::Router;
 use tokio::signal::unix::{signal, SignalKind};
 
 use audit_sink::AuditSink;
+use netguard::NetfilterOpts;
 use pipeline::App;
 
 #[cfg(test)]
@@ -45,7 +47,10 @@ mod tests;
 
 /// Command-line usage, printed with every argument error.
 pub const USAGE: &str = "usage: auth-proxy --config <path> [--session-socket <path>] \
-[--admin-socket <path>] [--secret-root <dir>] [--token-dir <dir>] [--expiry-store <file>]";
+[--admin-socket <path>] [--secret-root <dir>] [--token-dir <dir>] [--expiry-store <file>] \
+[--netfilter-rules-status <file> --netfilter-probe-status <file> [--netfilter-interval-secs <n>] \
+[--netfilter-rules-uid <uid>] [--netfilter-probe-uid <uid>]]\n\
+       auth-proxy --check-ready [--admin-socket <path>]";
 
 /// Where the process reads its config, binds its sockets, and finds its secrets and tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +63,9 @@ pub struct Options {
     /// Session expiry store file. `None` means `<token_dir>/session-expiry.v1`, the default
     /// location. The pod puts it on its own durable volume.
     pub expiry_store: Option<PathBuf>,
+    /// The per-UID netfilter self-check (sidecar profile only). `None` leaves the proxy as it
+    /// was: no gate, and the readiness endpoint always reports ready.
+    pub netfilter: Option<NetfilterOpts>,
 }
 
 /// Parse the arguments after the program name. `--config` is required. The other paths default
@@ -72,6 +80,11 @@ where
     let mut secret_root = PathBuf::from("/var/run/auth-proxy/secrets");
     let mut token_dir = PathBuf::from("/run/auth-proxy-private/tokens");
     let mut expiry_store = None;
+    let mut rules_status = None;
+    let mut probe_status = None;
+    let mut interval = None;
+    let mut rules_uid = netguard::DEFAULT_RULES_UID;
+    let mut probe_uid = netguard::DEFAULT_PROBE_UID;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let value = args
@@ -84,10 +97,48 @@ where
             "--secret-root" => secret_root = PathBuf::from(value),
             "--token-dir" => token_dir = PathBuf::from(value),
             "--expiry-store" => expiry_store = Some(PathBuf::from(value)),
+            "--netfilter-rules-status" => rules_status = Some(PathBuf::from(value)),
+            "--netfilter-probe-status" => probe_status = Some(PathBuf::from(value)),
+            "--netfilter-interval-secs" => match value.parse::<u64>() {
+                Ok(n) if (1..=3600).contains(&n) => interval = Some(n),
+                _ => {
+                    return Err(format!(
+                        "--netfilter-interval-secs must be 1 to 3600\n{USAGE}"
+                    ))
+                }
+            },
+            "--netfilter-rules-uid" => {
+                rules_uid = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("--netfilter-rules-uid must be a number\n{USAGE}"))?
+            }
+            "--netfilter-probe-uid" => {
+                probe_uid = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("--netfilter-probe-uid must be a number\n{USAGE}"))?
+            }
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
     }
     let config = config.ok_or_else(|| format!("--config is required\n{USAGE}"))?;
+    let netfilter = match (rules_status, probe_status) {
+        (Some(rules_status), Some(probe_status)) => Some(NetfilterOpts {
+            rules_status,
+            probe_status,
+            interval: std::time::Duration::from_secs(
+                interval.unwrap_or(netguard::DEFAULT_INTERVAL_SECS),
+            ),
+            rules_uid,
+            probe_uid,
+        }),
+        (None, None) if interval.is_none() => None,
+        _ => {
+            return Err(format!(
+                "the netfilter self-check needs both --netfilter-rules-status and \
+--netfilter-probe-status\n{USAGE}"
+            ))
+        }
+    };
     Ok(Options {
         config,
         session_socket,
@@ -95,6 +146,7 @@ where
         secret_root,
         token_dir,
         expiry_store,
+        netfilter,
     })
 }
 
@@ -184,10 +236,26 @@ pub async fn run(opts: Options) -> i32 {
         }
     };
 
+    // The gate starts closed. The agent listener answers 503 until both checkers report healthy.
+    let gate = opts.netfilter.clone().map(|nf| {
+        let gate = netguard::Gate::new();
+        netguard::spawn_monitor(nf, Arc::clone(&gate), Arc::clone(&app));
+        gate
+    });
     let agent_app = Arc::clone(&app);
+    let agent_gate = gate.clone();
     let agent_router = Router::new().fallback(move |req: Request| {
         let app = Arc::clone(&agent_app);
-        async move { agent_response(app, req).await }
+        let gate = agent_gate.clone();
+        async move {
+            if let Some(refused) = gate
+                .as_deref()
+                .and_then(|g| netguard::refusal(g, &app.audit))
+            {
+                return refused;
+            }
+            agent_response(app, req).await
+        }
     });
     // axum does not set TCP_NODELAY on accepted sockets. Without it a streamed response
     // (head, then body) waits on the client's delayed ACK.
@@ -200,7 +268,8 @@ pub async fn run(opts: Options) -> i32 {
     .into_future();
     let session =
         session_http::serve_unix(session_listener, session_http::router(Arc::clone(&app)));
-    let admin = session_http::serve_unix(admin_listener, admin_http::router(Arc::clone(&app)));
+    let admin_router = admin_http::router(Arc::clone(&app)).merge(netguard::ready_router(gate));
+    let admin = session_http::serve_unix(admin_listener, admin_router);
 
     eprintln!("auth-proxy: listening");
     tokio::select! {
@@ -220,6 +289,13 @@ async fn agent_response(app: Arc<App>, req: Request) -> Response {
 /// A passthrough-only deployment (the Muse gate). It needs no expiry store, broker, session
 /// socket or admin socket, so none is read or bound, and the sidecar flags are ignored.
 async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
+    if opts.netfilter.is_some() {
+        eprintln!(
+            "auth-proxy: the netfilter self-check applies to the sidecar profile; \
+a passthrough-only config has no per-UID rules"
+        );
+        return 2;
+    }
     if cfg.probe.enabled && !cfg!(feature = "stage1-probe") {
         eprintln!("auth-proxy: [probe] is enabled but this build lacks the stage1-probe feature");
         return 2;

@@ -16,7 +16,8 @@ use std::process::Command;
 
 /// Directory holding the built binaries. `CARGO_BIN_EXE_auth-proxy` is set by cargo for this
 /// package's binaries, so it holds up when cargo keeps test executables in a separate build
-/// directory (the old "parent of `deps`" rule then points at the wrong place).
+/// directory (Cargo 1.100 layout) and with the classic `target/<profile>/deps` layout. `ap-egress`
+/// is built into the same profile directory by the build step.
 fn bin_dir() -> PathBuf {
     Path::new(env!("CARGO_BIN_EXE_auth-proxy"))
         .parent()
@@ -64,7 +65,7 @@ fn matrix() {
         "matrix reported a FAIL row"
     );
     assert!(
-        stdout.contains("summary: 48 PASS of 48 rows"),
+        stdout.contains("summary: 59 PASS of 59 rows"),
         "not every registered row passed:\n{stdout}"
     );
 }

@@ -291,6 +291,22 @@ fn csrf_field(headers: &HeaderMap, body: &[u8]) -> Result<Option<String>, ()> {
         .map(|(_, v)| v.to_string()))
 }
 
+/// Approve `id` against the policy in force at the moment of the transition: `policy` is read
+/// inside the table's critical section, by the same callback that decides, so no snapshot taken
+/// earlier can be used. A grant removed after that read is caught by the start claim.
+pub(crate) async fn approve_checked(
+    table: &Table,
+    policy: &PolicySource,
+    id: &str,
+    approver: &str,
+) -> ApproveResult {
+    table
+        .approve_if(id, approver, |identity, req| {
+            policy().is_some_and(|s| crate::passthrough::still_held(&s, identity, req))
+        })
+        .await
+}
+
 async fn decide(
     app: &ApprovalApp,
     approver: &str,
@@ -319,15 +335,7 @@ async fn decide(
         return result(StatusCode::FORBIDDEN, json_wanted, "csrf_refused", None);
     }
     let (status, name, newest) = if approve {
-        let snap = (app.policy)();
-        approve_outcome(
-            app.table
-                .approve_if(id, approver, |identity, req| {
-                    snap.as_deref()
-                        .is_some_and(|s| crate::passthrough::still_held(s, identity, req))
-                })
-                .await,
-        )
+        approve_outcome(approve_checked(&app.table, &app.policy, id, approver).await)
     } else {
         deny_outcome(app.table.deny(id, approver))
     };

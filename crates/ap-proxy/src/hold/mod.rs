@@ -28,8 +28,8 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 pub use entry::{
-    ApproveResult, Confirm, ConfirmTx, Decision, DenyResult, HeldRequest, State, View, ViewContent,
-    ViewHeader,
+    ApproveResult, Confirm, ConfirmTx, Decision, DenyResult, HeldRequest, State, Upstream, View,
+    ViewContent, ViewHeader,
 };
 use entry::{Done, Entry};
 
@@ -269,7 +269,8 @@ impl Table {
     }
 
     /// Like [`Table::approve`], but `still_held(identity, request)` is asked first, under the
-    /// table lock. When it answers `false` the entry is dropped (the caller gets
+    /// table lock. The callback must read the policy itself, when it is called: a snapshot
+    /// taken before the call is a view the table lock does not protect. When it answers `false` the entry is dropped (the caller gets
     /// `dropped_on_reload`, nothing is sent upstream) and the result is `PolicyChanged`, so an
     /// approval can never run a permission the policy no longer gives.
     pub async fn approve_if(
@@ -310,6 +311,7 @@ impl Table {
             Ok(Ok(Confirm::Abandoned)) | Ok(Err(_)) => ApproveResult::ApprovedButAbandoned,
             Ok(Ok(Confirm::AuditUnavailable)) => ApproveResult::AuditUnavailable,
             Ok(Ok(Confirm::ConnectFailed)) => ApproveResult::ConnectFailed,
+            Ok(Ok(Confirm::PolicyChanged)) => ApproveResult::PolicyChanged,
             Err(_) => ApproveResult::ApprovedUnconfirmed,
         }
     }
@@ -490,6 +492,7 @@ impl Table {
                 content: Some(ViewContent {
                     method: req.method.clone(),
                     route: req.route.clone(),
+                    upstream: req.upstream.authority(),
                     path: redact_path(&req.path),
                     query: req.query.clone(),
                     content_type,

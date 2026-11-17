@@ -85,7 +85,11 @@ single-use CSRF token.
   identity, route, method or path is no longer held (identity, route or hold grant removed, method removed,
   pattern narrowed) is answered 503 `dropped_on_reload`, and so is every waiting request when the policy file
   disappears or stops being valid. An approve is checked against the current policy too: it answers
-  `policy_changed` (410) and sends nothing if the grant is gone.
+  `policy_changed` (410) and sends nothing if the grant is gone, and it is checked once more just before
+  the first upstream byte, so a reload between the approve and the send also sends nothing.
+- A hold remembers the upstream (scheme, host, port) its route named, shown on the approval page as "Sent
+  to" and in the `held` audit record. Changing a route's host or port (or its `keep_auth_headers`) drops the
+  holds on it with `dropped_on_reload`; an approve for such a hold answers `policy_changed`.
 - Proxies: the notifier and the upstream client ignore `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, their
   lowercase forms and system proxy settings. There is no setting that turns this off. The notifier never
   follows a redirect.

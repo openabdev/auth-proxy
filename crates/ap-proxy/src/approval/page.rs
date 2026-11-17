@@ -91,6 +91,7 @@ fn content_table(v: &View, c: &ViewContent) -> String {
     t.push_str(&row("Identity", &escape(&v.identity)));
     t.push_str(&row("Method", &escape(&c.method)));
     t.push_str(&row("Route", &escape(&c.route)));
+    t.push_str(&row("Sent to", &escape(&c.upstream)));
     t.push_str(&row("Path", &escape(&c.path)));
     t.push_str(&row(
         "Query",
@@ -221,6 +222,7 @@ pub fn entry_json(v: &View, csrf: Option<&str>) -> Value {
             .collect();
         map.insert("method".into(), json!(c.method));
         map.insert("route".into(), json!(c.route));
+        map.insert("upstream".into(), json!(c.upstream));
         map.insert("path".into(), json!(c.path));
         map.insert("query".into(), json!(c.query));
         map.insert("content_type".into(), json!(c.content_type));
@@ -251,6 +253,7 @@ mod tests {
             content: Some(ViewContent {
                 method: "POST".into(),
                 route: "discord".into(),
+                upstream: "https://discord.example.test:443".into(),
                 path: "/webhooks/1/<redacted>".into(),
                 query: Some("wait=true".into()),
                 content_type: Some("application/json".into()),
@@ -289,6 +292,15 @@ mod tests {
         assert!(html.contains("present (value not shown)"));
         assert!(html.contains("name=\"csrf\" value=\"tok\""));
         assert!(!html.contains("<style") && !html.contains(" style="));
+    }
+
+    #[test]
+    fn the_page_and_the_json_name_the_upstream_the_request_goes_to() {
+        let v = pending("{}");
+        let html = entry(&v, None);
+        assert!(html.contains("Sent to") && html.contains("https://discord.example.test:443"));
+        let j = entry_json(&v, None);
+        assert_eq!(j["upstream"], "https://discord.example.test:443");
     }
 
     #[test]

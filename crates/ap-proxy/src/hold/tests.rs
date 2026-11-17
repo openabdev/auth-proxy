@@ -32,6 +32,13 @@ fn req(auth: &str, body: &str) -> Arc<HeldRequest> {
     Arc::new(HeldRequest {
         method: "POST".into(),
         route: "discord".into(),
+        upstream: Upstream {
+            scheme: "https".into(),
+            host: "discord.example.test".into(),
+            port: 443,
+            keep_auth: Vec::new(),
+        },
+        generation: 1,
         path: "/channels/1/messages".into(),
         query: Some("wait=true".into()),
         headers: vec![

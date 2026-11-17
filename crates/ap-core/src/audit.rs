@@ -89,6 +89,10 @@ pub struct HoldRec {
     pub duration_ms: u64,
     /// Whether the request carried an `Authorization` header.
     pub auth_present: bool,
+    /// `scheme://host:port` the request goes to, on the `held` record only.
+    pub upstream: Option<String>,
+    /// The policy generation the request was admitted under, on the `held` record only.
+    pub policy_generation: Option<u64>,
 }
 
 impl HoldRec {
@@ -206,6 +210,8 @@ mod tests {
             status: None,
             duration_ms: 3,
             auth_present: true,
+            upstream: Some("https://discord.example.test:443".into()),
+            policy_generation: Some(1),
         }
     }
 
@@ -226,10 +232,12 @@ mod tests {
                 "identity",
                 "method",
                 "path",
+                "policy_generation",
                 "request_id",
                 "route",
                 "status",
                 "transition",
+                "upstream",
             ]
         );
     }

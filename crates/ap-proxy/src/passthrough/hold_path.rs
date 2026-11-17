@@ -34,7 +34,7 @@ use super::{
 };
 use super::{Code, Duration, Instant, Response, StreamAudit};
 use crate::forward::{self, BufferError};
-use crate::hold::{Admission, Confirm, ConfirmTx, Decision, HeldRequest};
+use crate::hold::{Admission, Confirm, ConfirmTx, Decision, HeldRequest, Upstream};
 use ap_core::outcome::render_passthrough;
 use axum::body::Body;
 
@@ -46,6 +46,8 @@ pub(super) struct Request<'a> {
     pub body: Body,
     pub pt: &'a Passthrough,
     pub route: &'a Route,
+    /// The policy generation `route` came from.
+    pub generation: u64,
     pub rel: &'a str,
     pub identity: &'a str,
     pub drain: Drain,
@@ -86,6 +88,8 @@ impl Ctx {
             status,
             duration_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             auth_present: self.auth_present,
+            upstream: None,
+            policy_generation: None,
         }
     }
 }
@@ -280,6 +284,7 @@ impl Drop for Guard {
 /// milestones.
 struct HeldBody {
     app: Arc<PtApp>,
+    req: Arc<HeldRequest>,
     ctx: Ctx,
     id: String,
     digest: String,
@@ -289,7 +294,15 @@ struct HeldBody {
     started: Arc<Started>,
     audit_failed: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    policy_changed: Arc<AtomicBool>,
     failed: bool,
+}
+
+/// Why the start claim refused.
+enum ClaimError {
+    Audit,
+    /// The policy in force at the claim no longer holds this request for this upstream.
+    Policy,
 }
 
 impl Stream for HeldBody {
@@ -311,10 +324,16 @@ impl Stream for HeldBody {
                 .rec(&this.id, &this.digest, "forward_started", None, None, None);
             let audit = &this.app.audit;
             let app = &this.app;
+            let (req, identity) = (&this.req, &this.ctx.identity);
             let claim = app.hold.claim_start(|| {
                 #[cfg(any(test, feature = "matrix-upstream"))]
                 app.pause.in_claim();
-                audit.try_write_hold(&rec)
+                // The last look at the policy before the first upstream byte: read now, under the
+                // table lock, so a reload that landed after the approve is seen here.
+                if !app.still_holds(identity, req) {
+                    return Err(ClaimError::Policy);
+                }
+                audit.try_write_hold(&rec).map_err(|_| ClaimError::Audit)
             });
             match claim {
                 Ok(true) => {}
@@ -326,7 +345,15 @@ impl Stream for HeldBody {
                     }
                     return Poll::Ready(Some(Err(io::Error::other("shutdown"))));
                 }
-                Err(_) => {
+                Err(ClaimError::Policy) => {
+                    this.failed = true;
+                    this.policy_changed.store(true, Ordering::SeqCst);
+                    if let Some(c) = take_confirm(&this.confirm) {
+                        c.send(Confirm::PolicyChanged);
+                    }
+                    return Poll::Ready(Some(Err(io::Error::other("policy changed"))));
+                }
+                Err(ClaimError::Audit) => {
                     this.failed = true;
                     this.audit_failed.store(true, Ordering::SeqCst);
                     if let Some(c) = take_confirm(&this.confirm) {
@@ -398,6 +425,7 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
         body,
         pt,
         route,
+        generation,
         rel,
         identity,
         drain,
@@ -442,6 +470,8 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
     let req = Arc::new(HeldRequest {
         method: parts.method.as_str().to_string(),
         route: route.name.clone(),
+        upstream: Upstream::from_route(route),
+        generation,
         path: rel.to_string(),
         query: query.clone(),
         headers: headers
@@ -461,8 +491,10 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
 
     // 6. Admission. The `held` record is written under the table lock, before anything changes.
     let admission = app.hold.admit(identity, Arc::clone(&req), |id, digest| {
-        app.audit
-            .try_write_hold(&ctx.rec(id, digest, "held", None, None, None))
+        let mut rec = ctx.rec(id, digest, "held", None, None, None);
+        rec.upstream = Some(req.upstream.authority());
+        rec.policy_generation = Some(req.generation);
+        app.audit.try_write_hold(&rec)
     });
     let held = match admission {
         Admission::Refused(code) => return Ok(refuse(&app, &trail, code)),
@@ -527,6 +559,7 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
             guard.phase = Phase::Approved;
             forward_approved(Forward {
                 app,
+                req,
                 trail,
                 guard,
                 confirm,
@@ -565,6 +598,7 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
 
 struct Forward<'a> {
     app: Arc<PtApp>,
+    req: Arc<HeldRequest>,
     trail: Trail,
     guard: Guard,
     confirm: ConfirmTx,
@@ -583,6 +617,7 @@ enum Sent {
 async fn forward_approved(f: Forward<'_>) -> Result<Response<Body>, ConnAbort> {
     let Forward {
         app,
+        req,
         trail,
         mut guard,
         confirm,
@@ -599,8 +634,10 @@ async fn forward_approved(f: Forward<'_>) -> Result<Response<Body>, ConnAbort> {
 
     let audit_failed = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
+    let policy_changed = Arc::new(AtomicBool::new(false));
     let stream = HeldBody {
         app: Arc::clone(&app),
+        req,
         ctx: guard.ctx.clone(),
         id: guard.id.clone(),
         digest: guard.digest.clone(),
@@ -610,6 +647,7 @@ async fn forward_approved(f: Forward<'_>) -> Result<Response<Body>, ConnAbort> {
         started: Arc::clone(&guard.started),
         audit_failed: Arc::clone(&audit_failed),
         shutdown: Arc::clone(&shutdown),
+        policy_changed: Arc::clone(&policy_changed),
         failed: false,
     };
     let send = app
@@ -638,6 +676,16 @@ async fn forward_approved(f: Forward<'_>) -> Result<Response<Body>, ConnAbort> {
                     Some(503),
                 );
                 return Ok(finish(&app, &trail, Code::AuditUnavailable));
+            }
+            if policy_changed.load(Ordering::SeqCst) {
+                // The policy changed between the approve and the send: nothing was sent.
+                guard.write(
+                    "dropped_on_reload",
+                    None,
+                    Some("dropped_on_reload"),
+                    Some(503),
+                );
+                return Ok(finish(&app, &trail, Code::DroppedOnReload));
             }
             if shutdown.load(Ordering::SeqCst) {
                 // Approved just before shutdown, refused at the start claim: nothing was sent.

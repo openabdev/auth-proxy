@@ -12,12 +12,49 @@ use tokio::sync::oneshot;
 
 use super::digest::Fingerprint;
 
+/// Where an approved request goes and which forwarding settings of its route shaped it, as the
+/// route said when the request was held. A policy change to any of it makes the hold stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    /// The route's `keep_auth_headers`, sorted: they decided which headers were forwarded.
+    pub keep_auth: Vec<String>,
+}
+
+impl Upstream {
+    pub fn from_route(route: &ap_core::config::Route) -> Upstream {
+        let mut keep_auth: Vec<String> = route
+            .keep_auth_headers
+            .iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
+        keep_auth.sort();
+        Upstream {
+            scheme: "https".into(),
+            host: route.host.clone(),
+            port: route.port,
+            keep_auth,
+        }
+    }
+
+    /// `scheme://host:port`, as the approval page and the `held` audit record show it.
+    pub fn authority(&self) -> String {
+        format!("{}://{}:{}", self.scheme, self.host, self.port)
+    }
+}
+
 /// The complete outbound semantic request of a held entry. Immutable once admitted: the entry id
 /// names exactly these bytes.
 #[derive(Clone)]
 pub struct HeldRequest {
     pub method: String,
     pub route: String,
+    /// The upstream the route named at admission. The request is sent there or not at all.
+    pub upstream: Upstream,
+    /// The policy generation the request was admitted under.
+    pub generation: u64,
     /// Route-relative raw path, as matched by policy and forwarded.
     pub path: String,
     /// Raw query without the `?`.
@@ -103,6 +140,9 @@ pub enum Confirm {
     AuditUnavailable,
     /// The upstream connection could not be established; nothing was sent.
     ConnectFailed,
+    /// The policy no longer gives the hold (or names another upstream) at the start claim;
+    /// nothing was sent.
+    PolicyChanged,
 }
 
 /// The handler's end of the approve confirmation. Dropping it without sending reads as
@@ -233,6 +273,8 @@ pub struct ViewHeader {
 pub struct ViewContent {
     pub method: String,
     pub route: String,
+    /// `scheme://host:port` the request goes to.
+    pub upstream: String,
     /// Path with `webhooks`/`interactions` token segments redacted.
     pub path: String,
     pub query: Option<String>,

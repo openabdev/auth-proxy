@@ -553,9 +553,17 @@ passthrough mode adds fields and transitions, and keeps that property:
   An entry whose identity, route, method or path no longer yields `hold` (identity removed, route removed or
   renamed, hold grant removed, method removed, pattern narrowed, or a policy that is invalid or gone) moves to
   `Dropped`, is answered 503 `unavailable`, and nothing is sent. Entries that still yield `hold` are untouched.
-  An approve checks the current policy the same way before it takes effect; if the grant is gone the entry is
-  dropped the same way and the approve answers `policy_changed` (HTTP 410), so a race between a reload and an
-  approve cannot forward.
+  An entry also records the upstream its route named when it was held (scheme, host, port, and the route's
+  `keep_auth_headers`); the `held` record carries `upstream` and `policy_generation`, and the approval page
+  shows "Sent to". A route that now names another host or port (or other kept headers) drops the entry the
+  same way, so an approval never sends to an authority the current policy does not name.
+  The approve reads the policy inside the hold table's critical section, in the same step that takes the
+  entry out of the table, and the start claim reads it once more under the same lock immediately before
+  `forward_started` and the first upstream byte. If either read no longer yields `hold` for the recorded
+  upstream, nothing is sent: the entry is dropped (503 `dropped_on_reload`), and the approve answers
+  `policy_changed` (HTTP 410). A reload that lands at any point before that claim therefore either leaves a
+  hold that is approved under the policy in force at send time, or refuses with nothing sent. The claim
+  opens the upstream connection first and writes no request byte until it passes.
 - `auth_present` (boolean). It gives stage 1 evidence that Muse's swap happened without logging the token.
 - Path redaction. Discord paths can carry secrets: the token segment of `/webhooks/{id}/{token}...` and
   `/interactions/{id}/{token}/...` is replaced by `<redacted>` in the audit record, on the approval page

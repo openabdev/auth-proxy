@@ -147,6 +147,8 @@ mod tests {
             status: None,
             duration_ms: 0,
             auth_present: true,
+            upstream: None,
+            policy_generation: None,
         }
     }
 

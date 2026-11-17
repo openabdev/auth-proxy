@@ -127,12 +127,20 @@ impl Fingerprinter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hold::Upstream;
     use bytes::Bytes;
 
     fn req() -> HeldRequest {
         HeldRequest {
             method: "POST".into(),
             route: "discord".into(),
+            upstream: Upstream {
+                scheme: "https".into(),
+                host: "discord.example.test".into(),
+                port: 443,
+                keep_auth: Vec::new(),
+            },
+            generation: 1,
             path: "/channels/1/messages".into(),
             query: Some("wait=true".into()),
             headers: vec![

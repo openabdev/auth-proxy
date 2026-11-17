@@ -24,6 +24,7 @@ use tokio_rustls::TlsAcceptor;
 
 use super::pause::Gate;
 use super::*;
+use crate::approval::PolicySource;
 use crate::hold::{ApproveResult, DenyResult, Limits, State};
 use crate::notify::{MockNotifier, TEXT};
 use crate::test_support::{
@@ -940,19 +941,60 @@ impl Ht {
         let old = std::fs::read_to_string(&self.policy).unwrap();
         let new = f(old.clone());
         assert_ne!(old, new, "the rewrite changed nothing");
+        // The file stamp is the mtime and the length; keep two rewrites apart on coarse clocks.
+        std::thread::sleep(Duration::from_millis(20));
         std::fs::write(&self.policy, new).unwrap();
     }
 
     /// Approve the way the approval listener does: checked against the policy in force now.
     async fn approve_checked(&self, id: &str) -> ApproveResult {
-        let snap = (self.app.policy_source())();
-        self.app
-            .hold
-            .approve_if(id, "alice", |identity, req| {
-                snap.as_deref()
-                    .is_some_and(|s| still_held(s, identity, req))
-            })
-            .await
+        self.approve_with(id, self.app.policy_source()).await
+    }
+
+    /// Approve through the listener's own function, reading the policy from `source`.
+    async fn approve_with(&self, id: &str, source: PolicySource) -> ApproveResult {
+        crate::approval::approve_checked(&self.app.hold, &source, id, "alice").await
+    }
+
+    /// The policy source with `gate` placed before or after its read of the policy. The listener
+    /// calls it inside the table's critical section, so the gate holds the table lock.
+    fn gated_source(&self, gate: Arc<Gate>, after_read: bool) -> PolicySource {
+        let inner = self.app.policy_source();
+        Arc::new(move || {
+            if !after_read {
+                gate.pass_blocking();
+            }
+            let snap = inner();
+            if after_read {
+                gate.pass_blocking();
+            }
+            snap
+        })
+    }
+
+    /// The mock upstream port the policy names for the route.
+    fn port(&self) -> String {
+        let text = std::fs::read_to_string(&self.policy).unwrap();
+        let head = format!("host = \"{HOST}\"\nport = ");
+        let at = text.find(&head).expect("route block") + head.len();
+        text[at..].lines().next().unwrap().to_string()
+    }
+
+    /// A policy rewrite that names `host` and `port` for the route `discord` instead. The old
+    /// port stays behind as a comment, so the file length always changes.
+    fn retarget(&self, host: &str, port: &str) -> impl FnOnce(String) -> String {
+        let (from_host, host, port) = (HOST.to_string(), host.to_string(), port.to_string());
+        move |s: String| {
+            let head = format!("host = \"{from_host}\"\nport = ");
+            let at = s.find(&head).expect("route block") + head.len();
+            let end = at + s[at..].find('\n').expect("port line");
+            format!(
+                "{}host = \"{host}\"\nport = {port}\n# was {}{}",
+                &s[..at - head.len()],
+                &s[at..end],
+                &s[end..]
+            )
+        }
     }
 
     /// The caller of a dropped hold saw 503 `dropped_on_reload`, and nothing went upstream.
@@ -1098,6 +1140,301 @@ async fn an_approve_racing_a_reload_does_not_forward() {
     // A later tick has nothing left to drop and nothing is sent.
     assert_eq!(t.app.reload_tick(), 0);
     assert_eq!(mock.hits(), 0);
+}
+
+// ------------------------------------------- approve and reload interleavings (same family)
+
+/// Where a reload lands relative to an approve.
+#[derive(Clone, Copy, Debug)]
+enum Point {
+    /// Before the approve call starts.
+    BeforeApprove,
+    /// Inside the table's critical section, before the policy is read.
+    InLockBeforeRead,
+    /// Inside the table's critical section, after the policy was read and before the verdict.
+    InLockAfterRead,
+    /// After the approve took the entry out of the table, before the first upstream byte.
+    ApprovedBeforeSend,
+    /// Inside the start claim, before the `forward_started` write.
+    InClaim,
+}
+
+const POINTS: [Point; 5] = [
+    Point::BeforeApprove,
+    Point::InLockBeforeRead,
+    Point::InLockAfterRead,
+    Point::ApprovedBeforeSend,
+    Point::InClaim,
+];
+
+/// Run one approve with the policy change `change` injected at `point`, and a reload tick racing
+/// it. Returns the fixture, the mock, the approve result, the caller's status and code, and the
+/// number of holds the racing tick dropped.
+async fn interleave(
+    tag: &str,
+    point: Point,
+    change: impl FnOnce(&Ht),
+) -> (Ht, Mock, ApproveResult, (u16, String), usize) {
+    let mock = Mock::start().await;
+    let t = Ht::new(tag, &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let id = t.held(1).await;
+    let gate = Gate::new();
+    let source = match point {
+        Point::InLockBeforeRead => t.gated_source(Arc::clone(&gate), false),
+        Point::InLockAfterRead => t.gated_source(Arc::clone(&gate), true),
+        _ => t.app.policy_source(),
+    };
+    match point {
+        Point::ApprovedBeforeSend => t.app.pause.set_after_approve(Arc::clone(&gate)),
+        Point::InClaim => t.app.pause.set_in_claim(Arc::clone(&gate)),
+        _ => {}
+    }
+    let mut change = Some(change);
+    if matches!(point, Point::BeforeApprove) {
+        (change.take().expect("once"))(&t);
+    }
+    let table = Arc::clone(&t.app.hold);
+    let approve = tokio::spawn(async move {
+        crate::approval::approve_checked(&table, &source, &id, "alice").await
+    });
+    let mut tick = 0;
+    if !matches!(point, Point::BeforeApprove) {
+        tokio::time::timeout(Duration::from_secs(5), gate.arrived())
+            .await
+            .expect("the handler reached the injection point");
+        (change.take().expect("once"))(&t);
+        // A reload tick racing the approve. Inside the table lock it cannot run at all.
+        let app = Arc::clone(&t.app);
+        let racing = tokio::task::spawn_blocking(move || app.reload_tick());
+        // Blocking sleep: a worker may be parked inside a gate and own the timer driver.
+        std::thread::sleep(Duration::from_millis(200));
+        let inside_lock = matches!(
+            point,
+            Point::InLockBeforeRead | Point::InLockAfterRead | Point::InClaim
+        );
+        let ran_early = racing.is_finished();
+        gate.release();
+        // Asserted after the release, so a failure cannot leave a thread parked in the gate.
+        assert!(
+            !(inside_lock && ran_early),
+            "{point:?}: a reload ran inside the approve's critical section"
+        );
+        tick = racing.await.unwrap();
+    }
+    let result = tokio::time::timeout(Duration::from_secs(10), approve)
+        .await
+        .expect("approve returned")
+        .unwrap();
+    let (p, body) = h.await.unwrap().unwrap();
+    let body_code = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["code"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    (t, mock, result, (p.status.as_u16(), body_code), tick)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_grant_never_forwards_whenever_the_reload_lands() {
+    for point in POINTS {
+        let tag = format!("il-revoke-{point:?}");
+        let (t, mock, result, (status, body), tick) = interleave(&tag, point, |t| {
+            t.rewrite(|s| without_grant(&s, PILOT_HOLD))
+        })
+        .await;
+        assert_eq!(result, ApproveResult::PolicyChanged, "{point:?}");
+        assert_eq!(
+            (status, body.as_str()),
+            (503, "dropped_on_reload"),
+            "{point:?}"
+        );
+        assert!(
+            mock.recorded().is_empty(),
+            "{point:?}: a request went upstream"
+        );
+        assert_eq!(t.count("forward_started"), 0, "{point:?}");
+        assert_eq!(t.count("dropped_on_reload"), 1, "{point:?}");
+        assert_eq!(t.app.hold.pending_len(), 0, "{point:?}");
+        // The tick has nothing left to drop in every case that raced it.
+        assert_eq!(tick, 0, "{point:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_that_stays_held_is_approved_under_the_policy_current_at_send_time() {
+    for point in POINTS {
+        let tag = format!("il-keep-{point:?}");
+        let (t, mock, result, (status, _), tick) = interleave(&tag, point, |t| {
+            t.rewrite(|s| s.replace("\"/webhooks/*/*\"]", "\"/webhooks/*/*\", \"/extra/*\"]"));
+        })
+        .await;
+        assert_eq!(result, ApproveResult::Success, "{point:?}");
+        assert_eq!(status, 200, "{point:?}");
+        assert_eq!(mock.recorded().len(), 1, "{point:?}");
+        assert_eq!(t.count("forward_started"), 1, "{point:?}");
+        assert_eq!(t.count("dropped_on_reload"), 0, "{point:?}");
+        assert_eq!(tick, 0, "{point:?}");
+    }
+}
+
+/// The reported schedule: the approve has read the policy, the grant is removed, and the approve
+/// carries on with the snapshot it already holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approve_that_read_the_policy_before_the_grant_was_removed_does_not_forward() {
+    let (t, mock, result, (status, body), tick) =
+        interleave("il-sol", Point::InLockAfterRead, |t| {
+            t.rewrite(|s| without_grant(&s, PILOT_HOLD));
+        })
+        .await;
+    assert_eq!(result, ApproveResult::PolicyChanged);
+    assert_eq!((status, body.as_str()), (503, "dropped_on_reload"));
+    assert!(mock.recorded().is_empty());
+    assert_eq!(
+        t.count("approved"),
+        1,
+        "the approve itself saw the old policy"
+    );
+    assert_eq!(t.count("forward_started"), 0);
+    assert_eq!(tick, 0);
+}
+
+// ------------------------------------------------ the upstream authority of a held request
+
+#[tokio::test]
+async fn a_held_request_records_its_upstream_in_the_held_record_and_the_view() {
+    let mock = Mock::start().await;
+    let t = Ht::new("auth-record", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let id = t.held(1).await;
+    let authority = format!("https://{HOST}:{}", mock.up.addr.port());
+    let held: Vec<_> = t
+        .lines()
+        .into_iter()
+        .filter(|v| v["transition"] == "held")
+        .collect();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0]["upstream"], authority.as_str());
+    assert_eq!(held[0]["policy_generation"], 1);
+    let view = t.app.hold.view(&id).and_then(|v| v.content).unwrap();
+    assert_eq!(view.upstream, authority);
+    t.app.hold.drop_all();
+    let _ = h.await;
+}
+
+/// Hold one request, apply `change`, and check what a reload tick and an approve do. `at_tick`
+/// runs the tick first (the entry is dropped there); otherwise the approve meets the change.
+async fn authority_case(tag: &str, at_tick: bool, change: impl FnOnce(&Ht)) {
+    let mock = Mock::start().await;
+    let t = Ht::new(tag, &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let id = t.held(1).await;
+    assert_eq!(
+        t.app.reload_tick(),
+        0,
+        "{tag}: unchanged policy keeps the hold"
+    );
+    change(&t);
+    if at_tick {
+        assert_eq!(t.app.reload_tick(), 1, "{tag}");
+    } else {
+        assert_eq!(
+            t.approve_checked(&id).await,
+            ApproveResult::PolicyChanged,
+            "{tag}"
+        );
+    }
+    t.assert_dropped(h, &mock).await;
+}
+
+#[tokio::test]
+async fn a_route_host_change_drops_the_hold_at_reload_and_at_approve() {
+    for at_tick in [true, false] {
+        let tag = format!("auth-host-{at_tick}");
+        authority_case(&tag, at_tick, |t| {
+            let port = t.port();
+            t.rewrite(t.retarget("other.example.test", &port));
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_route_port_change_drops_the_hold_at_reload_and_at_approve() {
+    for at_tick in [true, false] {
+        let tag = format!("auth-port-{at_tick}");
+        authority_case(&tag, at_tick, |t| t.rewrite(t.retarget(HOST, "9"))).await;
+    }
+}
+
+#[tokio::test]
+async fn a_route_rename_drops_the_hold_at_reload_and_at_approve() {
+    for at_tick in [true, false] {
+        let tag = format!("auth-rename-{at_tick}");
+        authority_case(&tag, at_tick, |t| {
+            t.rewrite(|s| s.replace("\"discord\"", "\"discord9\""));
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_change_to_the_routes_kept_auth_headers_drops_the_hold() {
+    for at_tick in [true, false] {
+        let tag = format!("auth-keep-{at_tick}");
+        authority_case(&tag, at_tick, |t| {
+            t.rewrite(|s| {
+                s.replace(
+                    "mode = \"passthrough\"\n",
+                    "mode = \"passthrough\"\nkeep_auth_headers = [\"x-api-key\"]\n",
+                )
+            });
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn an_unchanged_authority_keeps_the_hold_and_it_goes_to_that_upstream() {
+    let mock = Mock::start().await;
+    let t = Ht::new("auth-same", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let id = t.held(1).await;
+    // Everything else about the route and the grants changes; the authority does not.
+    t.rewrite(|s| s.replace("\"/webhooks/*/*\"]", "\"/webhooks/*/*\", \"/extra/*\"]"));
+    assert_eq!(t.app.reload_tick(), 0);
+    assert_eq!(t.approve_checked(&id).await, ApproveResult::Success);
+    let (p, _) = h.await.unwrap().unwrap();
+    assert_eq!(p.status.as_u16(), 200);
+    assert_eq!(mock.hits(), 1);
+}
+
+#[tokio::test]
+async fn a_policy_swap_that_changes_the_host_and_back_is_judged_when_it_is_seen() {
+    // Seen while changed: dropped, and it stays dropped when the policy goes back.
+    let mock = Mock::start().await;
+    let t = Ht::new("auth-swap-seen", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let id = t.held(1).await;
+    let port = t.port();
+    t.rewrite(t.retarget("other.example.test", &port));
+    assert_eq!(t.app.reload_tick(), 1);
+    t.rewrite(|s| s.replace("other.example.test", HOST));
+    assert_eq!(t.app.reload_tick(), 0);
+    assert_eq!(t.approve_checked(&id).await, ApproveResult::Dropped);
+    t.assert_dropped(h, &mock).await;
+
+    // Never seen while changed: the authority the owner reviewed is the one in force, so the
+    // approve goes to it.
+    let t = Ht::new("auth-swap-unseen", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let id = t.held(1).await;
+    let original = std::fs::read_to_string(&t.policy).unwrap();
+    t.rewrite(t.retarget("other.example.test", &port));
+    t.rewrite(|_| original);
+    assert_eq!(t.approve_checked(&id).await, ApproveResult::Success);
+    let (p, _) = h.await.unwrap().unwrap();
+    assert_eq!(p.status.as_u16(), 200);
+    assert_eq!(mock.hits(), 1);
 }
 
 #[tokio::test]

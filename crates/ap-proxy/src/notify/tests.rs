@@ -219,18 +219,17 @@ const PROXY_VARS: [&str; 6] = [
     "all_proxy",
 ];
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
 /// Sets every proxy variable to `url` for the life of the value, then restores the old values.
-/// Holds a process-wide lock, because the environment is process-global.
+///
+/// Only the isolated child processes below use this: they run one test each, so the change to
+/// the process environment cannot reach another test. The parent test binary never mutates
+/// its environment.
 struct ProxyEnv {
     old: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    _g: std::sync::MutexGuard<'static, ()>,
 }
 
 impl ProxyEnv {
     fn set(url: &str) -> ProxyEnv {
-        let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old = PROXY_VARS
             .iter()
             .map(|k| (*k, std::env::var_os(k)))
@@ -240,7 +239,7 @@ impl ProxyEnv {
         }
         std::env::remove_var("NO_PROXY");
         std::env::remove_var("no_proxy");
-        ProxyEnv { old, _g: g }
+        ProxyEnv { old }
     }
 }
 
@@ -255,8 +254,40 @@ impl Drop for ProxyEnv {
     }
 }
 
+/// Runs the `#[ignore]`d test `name` of this module alone, in a child copy of the test binary,
+/// and requires that it ran and passed. A test that needs process-wide environment changes goes
+/// through here, so no other test thread can observe them.
+fn run_isolated(name: &str) {
+    let module = module_path!().split_once("::").map_or("", |(_, rest)| rest);
+    let full = format!("{module}::{name}");
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([full.as_str(), "--exact", "--ignored", "--test-threads=1"])
+        .output()
+        .expect("spawn the isolated test");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && text.contains("1 passed"),
+        "isolated test {full} did not pass:\n{text}"
+    );
+}
+
+#[test]
+fn the_notifier_ignores_every_proxy_environment_variable() {
+    run_isolated("isolated_notifier_ignores_proxy_variables");
+}
+
+#[test]
+fn the_upstream_clients_ignore_every_proxy_environment_variable() {
+    run_isolated("isolated_upstream_clients_ignore_proxy_variables");
+}
+
+#[ignore = "runs in a child process, see run_isolated"]
 #[tokio::test(flavor = "multi_thread")]
-async fn the_notifier_ignores_every_proxy_environment_variable() {
+async fn isolated_notifier_ignores_proxy_variables() {
     let (capture, seen, hits) = server(Some(ok())).await;
     let _env = ProxyEnv::set(&capture);
     // Control: a default client does honour the variables, so the capture listener can see a
@@ -284,8 +315,9 @@ async fn the_notifier_ignores_every_proxy_environment_variable() {
     }
 }
 
+#[ignore = "runs in a child process, see run_isolated"]
 #[tokio::test(flavor = "multi_thread")]
-async fn the_upstream_clients_ignore_every_proxy_environment_variable() {
+async fn isolated_upstream_clients_ignore_proxy_variables() {
     let (capture, _seen, hits) = server(Some(ok())).await;
     let _env = ProxyEnv::set(&capture);
     for c in [

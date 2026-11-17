@@ -5,6 +5,7 @@
 //! until a valid file appears.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
@@ -32,6 +33,9 @@ fn stamp_of(path: &Path) -> Option<Stamp> {
 #[derive(Clone)]
 pub(crate) struct Loaded {
     stamp: Stamp,
+    /// Counts loads of this store: every successful (re)load gets the next number. A held
+    /// request records the generation it was admitted under.
+    pub(crate) generation: u64,
     pub(crate) cfg: Arc<Config>,
     pub(crate) snap: Arc<Snapshot>,
 }
@@ -39,6 +43,7 @@ pub(crate) struct Loaded {
 pub(crate) struct PolicyStore {
     path: PathBuf,
     slot: RwLock<Option<Loaded>>,
+    generation: AtomicU64,
 }
 
 impl PolicyStore {
@@ -47,12 +52,14 @@ impl PolicyStore {
         let snap = Arc::new(Snapshot::from_config(&cfg));
         let loaded = stamp_of(&path).map(|stamp| Loaded {
             stamp,
+            generation: 1,
             snap,
             cfg: Arc::new(cfg),
         });
         PolicyStore {
             path,
             slot: RwLock::new(loaded),
+            generation: AtomicU64::new(1),
         }
     }
 
@@ -74,6 +81,7 @@ impl PolicyStore {
             .and_then(|text| config::load(&text).ok())
             .map(|cfg| Loaded {
                 stamp,
+                generation: self.generation.fetch_add(1, Ordering::SeqCst) + 1,
                 snap: Arc::new(Snapshot::from_config(&cfg)),
                 cfg: Arc::new(cfg),
             });

@@ -123,6 +123,14 @@ impl PtApp {
         }
     }
 
+    /// Whether the policy in force now still holds `req` for `identity`, for the same upstream.
+    /// Reads the policy at the call. No valid policy answers `false`.
+    pub(crate) fn still_holds(&self, identity: &str, req: &hold::HeldRequest) -> bool {
+        self.policy
+            .current()
+            .is_some_and(|l| still_held(&l.snap, identity, req))
+    }
+
     /// The snapshot of the policy in force now, for the approval plane's re-check.
     pub fn policy_source(self: &Arc<Self>) -> crate::approval::PolicySource {
         let app = Arc::clone(self);
@@ -151,11 +159,13 @@ impl PtApp {
     }
 }
 
-/// Whether `snap` still holds this request: the route exists and the identity's grants give
-/// `hold` for its method and route-relative path. Anything else (no grant, an allow, a deny)
-/// means the permission the owner reviewed is gone.
+/// Whether `snap` still holds this request: the route exists, still names the upstream (scheme,
+/// host, port) and the forwarding settings the request was built with, and the identity's grants
+/// give `hold` for its method and route-relative path. Anything else (no grant, an allow, a
+/// deny, another destination) means the permission the owner reviewed is gone.
 pub(crate) fn still_held(snap: &Snapshot, identity: &str, req: &hold::HeldRequest) -> bool {
-    snap.route(&req.route).is_some()
+    snap.route(&req.route)
+        .is_some_and(|r| hold::Upstream::from_route(r) == req.upstream)
         && matches!(
             snap.evaluate_verdict(identity, &req.route, &req.method, &req.path),
             Ok(Verdict::Hold)
@@ -558,6 +568,7 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
             body,
             pt,
             route,
+            generation: policy.generation,
             rel: &rel,
             identity: &identity.name,
             drain,

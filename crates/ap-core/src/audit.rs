@@ -49,6 +49,60 @@ impl AuditRec {
     }
 }
 
+/// Transitions a held request can write (design 3.9). The record type has no free-text field.
+pub const HOLD_TRANSITIONS: &[&str] = &[
+    "held",
+    "approved",
+    "denied",
+    "expired",
+    "abandoned",
+    "superseded",
+    "dropped_on_reload",
+    "forward_started",
+    "completed",
+    "abandoned_after_approve",
+    "connect_failed",
+    "audit_unavailable",
+    "notify_failed",
+];
+
+/// One audit line for a transition of a held request. Every key is always present (null when it
+/// has no value), so the key set is fixed. There is no field for a header value, a query, a body,
+/// a key or a notification target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HoldRec {
+    /// The hold entry id, which names the request across its transitions.
+    pub request_id: String,
+    pub identity: String,
+    pub route: Option<String>,
+    pub method: String,
+    /// Route-relative path. Query and fragment are dropped and token segments redacted on write.
+    pub path: String,
+    /// Credential-blind digest of the outbound request (hex sha256).
+    pub digest: Option<String>,
+    /// One of [`HOLD_TRANSITIONS`].
+    pub transition: &'static str,
+    /// Approver identity, on decisions only.
+    pub approver: Option<String>,
+    pub code: Option<String>,
+    pub status: Option<u16>,
+    pub duration_ms: u64,
+    /// Whether the request carried an `Authorization` header.
+    pub auth_present: bool,
+}
+
+impl HoldRec {
+    /// Serialize as one JSON line with a trailing newline. The path is cut to its path part and
+    /// its `webhooks`/`interactions` token segments are redacted here, so no caller has to.
+    pub fn to_json_line(&self) -> String {
+        let mut rec = self.clone();
+        rec.path = crate::canon::redact_path(&path_only(&rec.path));
+        let mut line = serde_json::to_string(&rec).unwrap_or_else(|_| "{}".to_string());
+        line.push('\n');
+        line
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +190,68 @@ mod tests {
         assert_eq!(v["decision"], "deny");
         assert_eq!(v["code"], "policy_denied");
         assert!(v["aws_target"].is_null());
+    }
+
+    fn hold_sample() -> HoldRec {
+        HoldRec {
+            request_id: "0123abcd".into(),
+            identity: "muse".into(),
+            route: Some("discord".into()),
+            method: "POST".into(),
+            path: "/channels/1/messages?x=1".into(),
+            digest: Some("ab".repeat(32)),
+            transition: "held",
+            approver: None,
+            code: None,
+            status: None,
+            duration_ms: 3,
+            auth_present: true,
+        }
+    }
+
+    #[test]
+    fn hold_json_keys_are_exactly_the_allowed_set() {
+        let v: serde_json::Value =
+            serde_json::from_str(hold_sample().to_json_line().trim_end()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "approver",
+                "auth_present",
+                "code",
+                "digest",
+                "duration_ms",
+                "identity",
+                "method",
+                "path",
+                "request_id",
+                "route",
+                "status",
+                "transition",
+            ]
+        );
+    }
+
+    #[test]
+    fn hold_line_drops_query_and_redacts_tokens() {
+        let mut r = hold_sample();
+        r.path = "/webhooks/123/SECRETTOKEN/messages?wait=true#f".into();
+        let line = r.to_json_line();
+        assert!(!line.contains("SECRETTOKEN"));
+        assert!(!line.contains("wait=true"));
+        assert!(line.contains("/webhooks/123/<redacted>/messages"));
+        assert_eq!(line.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn every_hold_transition_serializes() {
+        for t in HOLD_TRANSITIONS {
+            let mut r = hold_sample();
+            r.transition = t;
+            let v: serde_json::Value = serde_json::from_str(r.to_json_line().trim_end()).unwrap();
+            assert_eq!(v["transition"], *t);
+        }
     }
 }

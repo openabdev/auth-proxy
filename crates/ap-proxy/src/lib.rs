@@ -7,6 +7,7 @@ pub mod admin_http;
 pub mod audit_sink;
 pub mod evidence;
 pub mod forward;
+pub mod hold;
 pub mod listener;
 #[cfg(feature = "matrix-upstream")]
 pub mod matrix_hooks;

@@ -56,6 +56,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ap-netprobe"
+version = "0.1.0"
+
+[[package]]
 name = "ap-proxy"
 version = "0.1.0"
 dependencies = [
@@ -72,6 +76,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "rcgen",
  "reqwest",
  "rustls",

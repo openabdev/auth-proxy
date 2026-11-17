@@ -51,6 +51,13 @@ EXPECTED_UIDS = {"agent": 1000, "proxy": 1001, "runtime": 1002, "egress": 1003}
 # Every app container sets runAsGroup to its UID, so no container runs with GID 0 by default.
 EXPECTED_GIDS = dict(EXPECTED_UIDS)
 APP_CONTAINERS = ("agent", "proxy", "runtime", "egress")
+# Netfilter self-check containers (issue #20). netcheck reads the rules and holds NET_ADMIN, so the
+# proxy never needs it. netprobe runs as the agent UID with no capability.
+CHECK_CONTAINERS = ("netcheck", "netprobe")
+RULES_VOL = "netcheck-rules"
+PROBE_VOL = "netcheck-probe"
+NETINIT_VOL = "netinit-run"
+STATUS_FILE = "status"
 
 
 def check(name, ok, detail=""):
@@ -138,7 +145,7 @@ def main():
     containers = {c.get("name"): c for c in spec.get("containers", [])}
     check(
         "containers-agent-proxy-runtime-egress",
-        set(containers) == set(EXPECTED_UIDS),
+        set(containers) == set(EXPECTED_UIDS) | set(CHECK_CONTAINERS),
         "containers are %s" % sorted(containers),
     )
     for name, uid in sorted(EXPECTED_UIDS.items()):
@@ -597,6 +604,222 @@ def main():
             re.search(r"^\s*runtime_pubkey = ", text, re.M) is not None,
             "an [[identity]] has no runtime_pubkey",
         )
+
+    # ---- Netfilter self-check (issue #20) ----
+    # Hard constraint: the proxy container gets no Linux capability. NET_ADMIN lives only in the
+    # init container netinit and the checker container netcheck. NET_RAW is nowhere.
+    def caps_added(c):
+        return list(c.get("securityContext", {}).get("capabilities", {}).get("add", []) or [])
+
+    for name in sorted(set(EXPECTED_UIDS) | {"netprobe"}):
+        check(
+            "no-capability-added-%s" % name,
+            caps_added(containers.get(name, {})) == [],
+            "%s adds %s" % (name, caps_added(containers.get(name, {}))),
+        )
+    net_admin_holders = sorted(
+        c.get("name") for c in all_ctrs if "NET_ADMIN" in caps_added(c)
+    )
+    check(
+        "net-admin-only-in-netinit-and-netcheck",
+        net_admin_holders == ["netcheck", "netinit"],
+        "NET_ADMIN is added by %s" % net_admin_holders,
+    )
+    net_raw_holders = sorted(
+        c.get("name") for c in all_ctrs
+        if {"NET_RAW", "SYS_ADMIN", "ALL"} & set(caps_added(c))
+    )
+    check("no-net-raw-sys-admin-or-all", not net_raw_holders, "added by %s" % net_raw_holders)
+
+    netcheck = containers.get("netcheck", {})
+    nsc = netcheck.get("securityContext", {})
+    check(
+        "netcheck-root-net-admin-only-hardened",
+        nsc.get("runAsUser") == 0
+        and nsc.get("capabilities", {}).get("drop") == ["ALL"]
+        and caps_added(netcheck) == ["NET_ADMIN"]
+        and nsc.get("allowPrivilegeEscalation") is False
+        and nsc.get("readOnlyRootFilesystem") is True,
+    )
+    check(
+        "netcheck-no-secret-and-no-port",
+        not (mount_names("netcheck") & set(secret_vols)) and not netcheck.get("ports"),
+    )
+    check(
+        "netcheck-mounts-only-snapshot-ro-and-its-status",
+        {
+            (m.get("name"), bool(m.get("readOnly")))
+            for m in netcheck.get("volumeMounts", [])
+        }
+        == {(NETINIT_VOL, True), (RULES_VOL, False)},
+        "netcheck mounts %s" % sorted(mount_names("netcheck")),
+    )
+    netprobe = containers.get("netprobe", {})
+    psc2 = netprobe.get("securityContext", {})
+    check(
+        "netprobe-runs-as-the-agent-uid-unprivileged",
+        psc2.get("runAsUser") == EXPECTED_UIDS["agent"]
+        and psc2.get("runAsGroup") == EXPECTED_GIDS["agent"]
+        and psc2.get("runAsNonRoot") is True
+        and psc2.get("capabilities", {}).get("drop") == ["ALL"]
+        and psc2.get("allowPrivilegeEscalation") is False
+        and psc2.get("readOnlyRootFilesystem") is True,
+    )
+    check(
+        "netprobe-no-secret-and-no-port",
+        not (mount_names("netprobe") & set(secret_vols)) and not netprobe.get("ports"),
+    )
+    check(
+        "netprobe-mounts-only-its-status",
+        [(m.get("name"), bool(m.get("readOnly"))) for m in netprobe.get("volumeMounts", [])]
+        == [(PROBE_VOL, False)],
+        "netprobe mounts %s" % sorted(mount_names("netprobe")),
+    )
+    # Status volumes: emptyDir, one writer each, read-only in the proxy, absent everywhere else.
+    for vol, writer in ((RULES_VOL, "netcheck"), (PROBE_VOL, "netprobe")):
+        check("%s-is-emptydir" % vol, "emptyDir" in volumes.get(vol, {}))
+        holders = sorted(
+            c.get("name") for c in all_ctrs if vol in mount_names_of(c)
+        )
+        check(
+            "%s-mounted-only-by-%s-and-proxy" % (vol, writer),
+            holders == sorted([writer, "proxy"]),
+            "%s is mounted by %s" % (vol, holders),
+        )
+        pm = [m for m in proxy_mounts if m.get("name") == vol]
+        check(
+            "%s-read-only-in-proxy" % vol,
+            len(pm) == 1 and pm[0].get("readOnly") is True and "subPath" not in pm[0],
+            "proxy mounts %s" % pm,
+        )
+    nr_holders = sorted(c.get("name") for c in all_ctrs if NETINIT_VOL in mount_names_of(c))
+    check(
+        "netinit-run-mounted-only-by-netinit-and-netcheck",
+        nr_holders == ["netcheck", "netinit"],
+        "netinit-run is mounted by %s" % nr_holders,
+    )
+    # The proxy flags point at the files the checkers write, and the interval agrees everywhere.
+    def mount_path_of(c, vol):
+        return next((m.get("mountPath") for m in c.get("volumeMounts", []) if m.get("name") == vol), None)
+
+    rules_flag = flag_value("--netfilter-rules-status")
+    probe_flag = flag_value("--netfilter-probe-status")
+    netcheck_env = {e["name"]: e.get("value") for e in netcheck.get("env", [])}
+    netprobe_args = netprobe.get("command", [])
+    proxy_ctr = containers.get("proxy", {})
+    rules_dir = mount_path_of(proxy_ctr, RULES_VOL)
+    probe_dir = mount_path_of(proxy_ctr, PROBE_VOL)
+    check(
+        "proxy-netfilter-flags-match-the-checker-status-files",
+        rules_dir is not None
+        and probe_dir is not None
+        and rules_flag == rules_dir + "/" + STATUS_FILE
+        and probe_flag == probe_dir + "/" + STATUS_FILE
+        and netcheck_env.get("STATUS") == mount_path_of(netcheck, RULES_VOL) + "/" + STATUS_FILE
+        and flag_value("--status", netprobe_args)
+        == (mount_path_of(netprobe, PROBE_VOL) or "") + "/" + STATUS_FILE,
+        "proxy flags %s %s; netcheck STATUS %s; netprobe --status %s"
+        % (rules_flag, probe_flag, netcheck_env.get("STATUS"), flag_value("--status", netprobe_args)),
+    )
+    intervals = {
+        flag_value("--netfilter-interval-secs"),
+        flag_value("--interval-secs", netprobe_args),
+        netcheck_env.get("INTERVAL"),
+    }
+    check(
+        "self-check-interval-agrees",
+        len(intervals) == 1 and None not in intervals and all(i.isdigit() and int(i) > 0 for i in intervals),
+        "intervals are %s" % sorted(str(i) for i in intervals),
+    )
+    check(
+        "netcheck-reads-the-netinit-snapshot",
+        netcheck_env.get("EXPECT_DIR") == mount_path_of(netcheck, NETINIT_VOL)
+        and mount_path_of(netinit, NETINIT_VOL) == "/run",
+        "EXPECT_DIR %s, netcheck mount %s, netinit mount %s"
+        % (netcheck_env.get("EXPECT_DIR"), mount_path_of(netcheck, NETINIT_VOL),
+           mount_path_of(netinit, NETINIT_VOL)),
+    )
+    # The proxy accepts a status file only from its writer's UID: root for netcheck, the agent UID
+    # for netprobe. The flags must agree with the container UIDs.
+    check(
+        "proxy-status-owner-uids-match-the-writers",
+        flag_value("--netfilter-rules-uid") == str(nsc.get("runAsUser"))
+        and flag_value("--netfilter-probe-uid") == str(psc2.get("runAsUser"))
+        and flag_value("--netfilter-probe-uid") == str(EXPECTED_UIDS["agent"]),
+        "flags %s %s; netcheck uid %s; netprobe uid %s"
+        % (flag_value("--netfilter-rules-uid"), flag_value("--netfilter-probe-uid"),
+           nsc.get("runAsUser"), psc2.get("runAsUser")),
+    )
+    # What the agent UID can and cannot write. It mounts neither status volume, so it cannot create,
+    # replace or link a file there; no fsGroup and no hostPath volume can widen that.
+    agent_rw = sorted(
+        m.get("name") for m in containers.get("agent", {}).get("volumeMounts", [])
+        if not m.get("readOnly")
+    )
+    check(
+        "agent-cannot-write-the-status-volumes",
+        not ({RULES_VOL, PROBE_VOL, NETINIT_VOL} & set(agent_rw))
+        and not ({RULES_VOL, PROBE_VOL} & {m.get("name") for c in all_ctrs
+                                           if c.get("name") not in ("netcheck", "netprobe", "proxy")
+                                           for m in c.get("volumeMounts", [])}),
+        "agent writable mounts: %s" % agent_rw,
+    )
+    check(
+        "no-fsgroup-and-no-hostpath-volumes",
+        "fsGroup" not in spec.get("securityContext", {})
+        and not any("hostPath" in v for v in spec.get("volumes", [])),
+    )
+    # The long-lived NET_ADMIN checker and the probe are hardened and run what they should.
+    check(
+        "pod-seccomp-runtime-default-and-no-container-override",
+        spec.get("securityContext", {}).get("seccompProfile", {}).get("type") == "RuntimeDefault"
+        and not any(
+            "seccompProfile" in c.get("securityContext", {}) for c in all_ctrs
+        ),
+    )
+    check(
+        "no-host-namespaces",
+        not any(spec.get(k) for k in ("hostNetwork", "hostPID", "hostIPC")),
+    )
+    check(
+        "netcheck-and-netprobe-run-the-expected-programs",
+        netcheck.get("command") == ["/bin/sh", "/usr/local/bin/netcheck.sh"]
+        and netprobe.get("command", [None])[0] == "ap-netprobe",
+        "netcheck %s; netprobe %s" % (netcheck.get("command"), netprobe.get("command")),
+    )
+    rp = containers.get("proxy", {}).get("readinessProbe", {}).get("exec", {}).get("command", [])
+    check(
+        "proxy-readiness-probe-asks-its-admin-socket",
+        rp[:2] == ["auth-proxy", "--check-ready"] and flag_value("--admin-socket", rp) == flag_value("--admin-socket"),
+        "readinessProbe command %s" % rp,
+    )
+    check(
+        "proxy-has-no-liveness-probe-on-the-self-check",
+        "livenessProbe" not in containers.get("proxy", {}),
+        "restarting the proxy cannot restore netfilter rules",
+    )
+    # The checker scripts and netinit agree on the snapshot file names.
+    with open(os.path.join(ROOT, "netinit", "netcheck.sh")) as f:
+        netcheck_text = f.read()
+    with open(os.path.join(ROOT, "netinit", "netinit.sh")) as f:
+        netinit_text = f.read()
+    check(
+        "netinit-writes-the-snapshot-netcheck-reads",
+        "iptables -S OUTPUT > /run/expected-iptables" in netinit_text
+        and "ip6tables -S OUTPUT > /run/expected-ip6tables" in netinit_text
+        and '"$EXPECT_DIR/expected-$tool"' in netcheck_text
+        and '"$tool" -S OUTPUT' in netcheck_text
+        and "for tool in iptables ip6tables" in netcheck_text,
+    )
+    check(
+        "netcheck-never-changes-rules",
+        not any(
+            re.search(r"(iptables|ip6tables|\$tool)\S*\s+(-[A-Z]\b|--(append|insert|delete|flush|new-chain))", l)
+            and "-S OUTPUT" not in l
+            for l in netcheck_text.splitlines()
+            if not l.lstrip().startswith("#")
+        ),
+    )
 
     # netinit.sh rule order (F1, F2, design Q3-E2, and the runtime rules)
     with open(os.path.join(ROOT, "netinit", "netinit.sh")) as f:

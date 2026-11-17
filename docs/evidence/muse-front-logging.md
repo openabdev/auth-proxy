@@ -4,7 +4,7 @@ Issue #22. The Muse connector can only carry the caller key in the URL path (`/a
 logs request URLs would record the key. This file measures the layers we operate. Redacted: no hostnames,
 addresses, logins, keys or the sentinel value.
 
-Tags: **[M]** measured by us. **[D]** documented by the vendor, not measured. **[M-reported]** not applicable here.
+Tags: **[M]** measured by us. **[D]** documented by the vendor, not measured.
 
 ## Setup
 
@@ -29,7 +29,7 @@ Tags: **[M]** measured by us. **[D]** documented by the vendor, not measured. **
 
 Method note: the first search passed the sentinel as a command-line argument. The system `sudo` auth log then
 recorded that command line, giving 1 hit in `/var/log` and 1 in process command lines (the search's own `grep`).
-Both are artifacts of the probe, not of the front. The repeat with `-f` removed them. Do not search for a
+Both are artifacts of the probe, not of the front. The repeat with `-f` did not add new hits; the auth log entry from the first search was discounted, not edited. Do not search for a
 secret with it on the command line.
 
 ## Results [M]
@@ -40,7 +40,7 @@ secret with it on the command line.
 | Journal of the Tailscale daemon unit | 0 |
 | Journal of the gate unit | 0 |
 | Kernel journal | 0 |
-| `/var/log` (all files) | 0 (after removing the probe's own `sudo` log line) |
+| `/var/log` (all files) | 0 apart from the probe's own `sudo` auth log entry (discounted, see the method note) |
 | Tailscale state directory | 0 |
 | Gate state directory (audit and evidence file) | 0 |
 | `/etc`, `/tmp`, `/run`, `/var/tmp` | 0 |
@@ -52,7 +52,7 @@ secret with it on the command line.
 The gate audit file did record the refusals themselves (`caller_rejected` lines), without the path prefix, as the
 design states.
 
-## Does the front have request logging? 
+## Does the front have request logging?
 
 - [M] `tailscale serve status --json` shows only the TCP/HTTPS ports and one `Handlers` entry per mount with a
   `Proxy` target. There is no logging field or option in the serve configuration.
@@ -73,6 +73,8 @@ design states.
 - This holds for the Tailscale version and the default logging configuration above. It can change with a Tailscale
   upgrade or if someone adds a different front (for example a reverse proxy with an access log). Re-run this
   measurement after either change.
+- Sample: 5 requests of two shapes, on one host, one Tailscale version. Only the path where the backend answered was
+  measured. Front error paths, such as the backend being down or timing out, were not.
 - Not measured, outside our control: logs on the calling platform (before and after its credential swap) and on
   any intermediate network. A key in a URL path is unsafe wherever such a log is kept. Treat the key as
   exposable and keep it rotatable: `docs/runbooks/muse-key-rotation.md`.

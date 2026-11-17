@@ -7,12 +7,16 @@ Background: `docs/runbooks/muse-stage1.md` section 2.
 The calling platform fixes where the key sits (the path placement `/ap/{}`) when the connector is registered, and
 the placement cannot be edited. Rotation therefore means registering the connector again with the new key.
 
-**The old key keeps working until you remove its hash from the policy.** Until step 6 an exposed key is still
+**The old key keeps working until you remove its hash from the policy.** Until step 7 an exposed key is still
 accepted. Do the steps in one sitting.
 
 All names below are placeholders. Do not commit real hosts, keys or hashes.
 
-## 1. Generate a new key (on the gate host)
+## 1. Generate a new key
+
+Best: generate the key on the machine where the connector is registered, and carry only the hash to the gate host.
+Otherwise generate it on the gate host, show it once in the terminal for copy and paste into the platform's secret
+field, then clear the scrollback. Never write it to a file in the repo, a ticket or a chat.
 
 ```
 umask 077
@@ -20,12 +24,12 @@ new_key="apk_$(openssl rand -hex 32)"
 printf '%s' "$new_key" | sha256sum | cut -d' ' -f1      # new hash (use `shasum -a 256` on macOS)
 ```
 
-Keep `$new_key` in the shell only. Do not write it to a file in the repo, a ticket or a chat.
+## 2. Add the new identity next to the old one, in a copy
 
-## 2. Add the new identity next to the old one
-
-Edit the policy file (the one passed as `--config`). An identity is a name and a hash; grants name the identity.
-Add a second identity and copy the old identity's grants under the new name:
+Do not edit the live policy file in place: the gate re-reads it whenever its mtime or size changes, so a half-saved
+file can be loaded. Edit a copy in the same directory (`policy.toml.new` next to the file passed as `--config`).
+An identity is a name and a hash; grants name the identity. Add a second identity and copy the old identity's
+grants under the new name:
 
 ```
 [[identity]]
@@ -44,47 +48,86 @@ paths = ["<prefix>"]
 decision = "allow"
 ```
 
-To replace instead of add, keep the same identity `name` and swap only `caller_key_sha256`. The old key then stops
-working at once, so register the new key on the platform first only if you accept a gap.
+Replacing in place (same identity `name`, new `caller_key_sha256`) always leaves an outage between the hash swap
+and the platform re-registration. The add-then-remove flow in steps 2 to 6 avoids it.
 
-## 3. Reload
+## 3. Validate the copy, then swap it in
 
-The policy file is checked on every read by mtime and size, so a saved edit is picked up with no restart or signal.
-Validate the file first: an invalid file makes every request fail 503 until it is fixed (a grant that names an
-unknown identity is invalid). Check the reload:
+There is no `--check` flag. The only validator is the binary's startup path, which reads and validates the file
+before it binds anything. Run the gate binary on the copy with the same other flags as the live unit (a throwaway
+run, ideally on a different listen address, or stopped right after it starts):
+
+- `auth-proxy: cannot read config` or a validation message, exit code 2: the copy is invalid. Fix it.
+- A bind failure (`cannot bind ...`) or `auth-proxy: listening`: the copy validated. Stop the throwaway.
+
+Then replace the live file atomically (same directory, same filesystem):
 
 ```
-journalctl -u <gate-unit> --no-pager -n 20      # no policy error lines
+mv policy.toml.new policy.toml
 ```
 
-## 4. Re-register the connector on the calling platform
+## 4. Reload and check it
+
+There is no reload command and no signal. The gate re-reads the file on the next request that needs the policy.
+A file that cannot be read or validated is not logged: the gate drops the policy and every request, with the old
+key too, gets 503 `policy_unavailable` until a valid file is in place (the refusal appears in the audit stream, not
+in the journal). So the request itself is the check. Run both commands in step 6 with the new key (step 6 expects
+the right-key request to pass the gate) and also with the old key. Required result:
+
+- the new key and the old key both pass the gate (no `X-AP-Decision` header, see step 6), and
+- no response is 503 `policy_unavailable`. If one is, restore the previous file at once (`mv` the saved copy back)
+  and look in the audit stream for `policy_unavailable` lines.
+
+The platform keeps working with the old key through this step, so a failure here is visible before step 5.
+
+## 5. Re-register the connector on the calling platform
 
 Register a new connector for the gate host with the placement `/ap/{}` and the new key (the old connector cannot
 be edited). Point the agent's helper at the new connector.
 
-## 5. Verify
+## 6. Verify
 
-- A request through the front with the new key and a granted read returns the upstream's response.
-- A request with the new key and a method outside the grants returns 423 `no_grant`.
-- The audit file shows the new identity name on those requests.
+The gate's own refusal and the upstream's 401 look alike by status, so tell them apart by the gate's marker. A
+gate refusal carries the header `X-AP-Decision: <decision>` and the body
+`{"ap_decision":"<decision>","code":"<code>"}`. An allowed passthrough answer carries neither: the body is the
+upstream's own, unchanged.
 
-```
-curl -sS -o /dev/null -w '%{http_code}\n' "https://<public-host>/ap/$new_key/<route>/<granted path>"
-```
-
-## 6. Remove the old identity
-
-Delete the old `[[identity]]` block and every `[[grant]]` that names it, in one edit (deleting only the identity
-leaves grants naming an unknown identity: the file stops validating and every request gets 503). Then check the
-old key is refused:
+Keep keys out of argv and shell history: `printf` is a shell builtin, and `read -rs` does not echo or record.
 
 ```
-curl -sS -o /dev/null -w '%{http_code}\n' "https://<public-host>/ap/<old key>/<route>/<granted path>"   # expect 401
+read -rs new_key                      # paste, then Enter
+# A. right key, dummy upstream credential: expect NO x-ap-decision header (the upstream answers, usually 401
+#    with its own body) and an audit line naming the new identity
+printf 'url = "https://<public-host>/ap/%s/<route>/<granted path>"\n' "$new_key" \
+  | curl -sS -K - -o /dev/null -D - -H 'Authorization: Bot dummy' | grep -i '^HTTP\|^x-ap-decision'
+
+# B. right key, a method outside the grants: expect 423, x-ap-decision: denied, code no_grant
+printf 'url = "https://<public-host>/ap/%s/<route>/<granted path>"\n' "$new_key" \
+  | curl -sS -K - -X POST -o - -D - | grep -i '^HTTP\|^x-ap-decision\|ap_decision'
 ```
 
-Remove the old connector registration on the calling platform, and clear any copy of the old key.
+Then check the old key is refused (step 7 removes it; run this after step 7):
 
-## 7. If a log held the old key
+```
+read -rs old_key
+printf 'url = "https://<public-host>/ap/%s/<route>/<granted path>"\n' "$old_key" \
+  | curl -sS -K - -o - -D - -H 'Authorization: Bot dummy' | grep -i '^HTTP\|^x-ap-decision\|ap_decision'
+# expect: 401, x-ap-decision: rejected, {"ap_decision":"rejected","code":"caller_rejected"}
+```
 
-Rotating makes the logged key useless once step 6 is done. Then delete or expire the log that held it if you can,
+A bare 401 without `x-ap-decision` means the request passed the gate: the key is still accepted.
+
+## 7. Remove the old identity
+
+Make the edit in a copy and swap it in as in step 3. Delete the old `[[identity]]` block and every `[[grant]]`
+that names it, in one edit (deleting only the identity leaves grants naming an unknown identity: the file stops
+validating and every request gets 503). Validate the copy, `mv` it over the live file, then run the old-key check
+from step 6 and the new-key check A again.
+
+Remove the old connector registration on the calling platform, and clear any copy of the old key. Clear `old_key`
+and `new_key` from the shell (`unset old_key new_key`).
+
+## 8. If a log held the old key
+
+Rotating makes the logged key useless once step 7 is done. Then delete or expire the log that held it if you can,
 and turn off URL logging in that layer.

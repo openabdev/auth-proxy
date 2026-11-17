@@ -1,0 +1,2 @@
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+eth0      UP             <pod-ip> fd00:a9::2/64 fe80::<link-local>/64 

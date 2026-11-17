@@ -149,6 +149,192 @@ class ValidatorTests(unittest.TestCase):
         copy.edit_pod(mutate)
         self.assert_fails(copy, "runtime-key-mode-0444")
 
+    def _mount_credential(self, copy, container, **extra):
+        def mutate(pod):
+            m = {"name": "kiro-secret", "mountPath": "/var/run/cred-copy", "readOnly": True}
+            m.update(extra)
+            copy.container(pod, container)["volumeMounts"].append(m)
+
+        copy.edit_pod(mutate)
+
+    def test_credential_mounted_in_the_runtime_is_refused(self):
+        copy = Copy(self)
+        self._mount_credential(copy, "runtime")
+        self.assert_fails(copy, "credential-mounted-only-by-proxy")
+
+    def test_credential_mounted_in_the_egress_is_refused(self):
+        copy = Copy(self)
+        self._mount_credential(copy, "egress")
+        self.assert_fails(copy, "credential-mounted-only-by-proxy")
+
+    def test_credential_mounted_in_the_agent_is_refused(self):
+        copy = Copy(self)
+        self._mount_credential(copy, "agent")
+        self.assert_fails(copy, "credential-mounted-only-by-proxy")
+
+    def test_credential_mounted_in_an_init_container_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["initContainers"][0]["volumeMounts"].append(
+                {"name": "kiro-secret", "mountPath": "/cred", "readOnly": True})
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-mounted-only-by-proxy")
+
+    def test_credential_on_a_pvc_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for v in pod["spec"]["volumes"]:
+                if v["name"] == "kiro-secret":
+                    del v["secret"]
+                    v["persistentVolumeClaim"] = {"claimName": "auth-proxy-kiro"}
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-volume-is-secret-type")
+
+    def test_credential_through_a_projected_volume_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for v in pod["spec"]["volumes"]:
+                if v["name"] == "kiro-secret":
+                    del v["secret"]
+                    v["projected"] = {"defaultMode": 292, "sources": [
+                        {"secret": {"name": "auth-proxy-kiro"}}]}
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-volume-is-secret-type")
+
+    def test_other_volume_under_the_credential_directory_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["volumes"].append({"name": "stray", "emptyDir": {}})
+            copy.container(pod, "proxy")["volumeMounts"].append(
+                {"name": "stray", "mountPath": "/var/run/auth-proxy/secrets/other"})
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-dir-only-holds-credential-volume")
+
+    def test_credential_with_the_wrong_mode_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for v in pod["spec"]["volumes"]:
+                if v["name"] == "kiro-secret":
+                    v["secret"]["defaultMode"] = 256  # 0400, unreadable to the proxy UID
+                    # Documented in README: a Secret volume file is not owned by the proxy UID.
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-secret-mode-0444")
+
+    def test_credential_mount_not_read_only_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for m in copy.container(pod, "proxy")["volumeMounts"]:
+                if m["name"] == "kiro-secret":
+                    m.pop("readOnly")
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-mount-read-only")
+
+    def test_credential_in_agent_env_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "agent")["env"].append({"name": "KEY", "valueFrom": {
+                "secretKeyRef": {"name": "auth-proxy-kiro", "key": "api_key"}}})
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-not-referenced-by-env")
+
+    def test_credential_in_runtime_envfrom_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "runtime")["envFrom"] = [{"secretRef": {"name": "auth-proxy-kiro"}}]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-not-referenced-by-env")
+
+    def _add_ephemeral(self, copy, **fields):
+        def mutate(pod):
+            c = {"name": "debugger", "image": "busybox"}
+            c.update(fields)
+            pod["spec"]["ephemeralContainers"] = [c]
+
+        copy.edit_pod(mutate)
+
+    def test_credential_mounted_in_an_ephemeral_container_is_refused(self):
+        copy = Copy(self)
+        self._add_ephemeral(copy, volumeMounts=[
+            {"name": "kiro-secret", "mountPath": "/cred", "readOnly": True}])
+        self.assert_fails(copy, "credential-mounted-only-by-proxy")
+
+    def test_credential_dir_mount_in_an_ephemeral_container_is_refused(self):
+        copy = Copy(self)
+        self._add_ephemeral(copy, volumeMounts=[
+            {"name": "home", "mountPath": "/var/run/auth-proxy/secrets/x"}])
+        self.assert_fails(copy, "credential-dir-only-holds-credential-volume")
+
+    def test_credential_secretkeyref_in_an_ephemeral_container_is_refused(self):
+        copy = Copy(self)
+        self._add_ephemeral(copy, env=[{"name": "KEY", "valueFrom": {
+            "secretKeyRef": {"name": "auth-proxy-kiro", "key": "api_key"}}}])
+        self.assert_fails(copy, "credential-not-referenced-by-env")
+
+    def test_credential_secretref_in_an_ephemeral_container_is_refused(self):
+        copy = Copy(self)
+        self._add_ephemeral(copy, envFrom=[{"secretRef": {"name": "auth-proxy-kiro"}}])
+        self.assert_fails(copy, "credential-not-referenced-by-env")
+
+    def test_credential_item_mode_override_is_refused(self):
+        for mode in (256, 511):
+            copy = Copy(self)
+
+            def mutate(pod, mode=mode):
+                for v in pod["spec"]["volumes"]:
+                    if v["name"] == "kiro-secret":
+                        v["secret"]["items"][0]["mode"] = mode
+
+            copy.edit_pod(mutate)
+            self.assert_fails(copy, "credential-secret-mode-0444")
+
+    def test_runtime_key_item_mode_override_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for v in pod["spec"]["volumes"]:
+                if v["name"] == "runtime-key":
+                    v["secret"]["items"][0]["mode"] = 256
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "runtime-key-mode-0444")
+
+    def test_hostpath_volume_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["volumes"].append(
+                {"name": "hp", "hostPath": {"path": "/var/lib/kubelet/pods"}})
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "no-hostpath-volumes")
+
+    def test_credential_subpath_mount_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for m in copy.container(pod, "proxy")["volumeMounts"]:
+                if m["name"] == "kiro-secret":
+                    m["subPath"] = "api_key"
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-mount-no-subpath")
+
     def test_netinit_without_the_runtime_rules_is_refused(self):
         copy = Copy(self)
         copy.edit_netinit(
@@ -164,6 +350,304 @@ class ValidatorTests(unittest.TestCase):
         with open(path, "w") as f:
             f.write(text.replace('    runtime_pubkey = "REPLACE"\n', ""))
         self.assert_fails(copy, "identity-has-runtime-pubkey")
+
+    # ---- netfilter self-check (issue #20) ----
+    def edit_script(self, copy, name, old, new):
+        path = os.path.join(copy.root, "netinit", name)
+        with open(path) as f:
+            text = f.read()
+        self.assertEqual(text.count(old), 1, "anchor not unique: " + old)
+        with open(path, "w") as f:
+            f.write(text.replace(old, new))
+
+    def test_proxy_with_net_admin_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "proxy")["securityContext"]["capabilities"]["add"] = ["NET_ADMIN"]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "no-capability-added-proxy")
+        code, out = run_validator(copy.root)
+        self.assertIn("FAIL net-admin-only-in-netinit-and-netcheck", out)
+
+    def test_proxy_with_net_raw_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "proxy")["securityContext"]["capabilities"]["add"] = ["NET_RAW"]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "no-capability-added-proxy")
+        code, out = run_validator(copy.root)
+        self.assertIn("FAIL no-net-raw-sys-admin-or-all", out)
+
+    def test_netprobe_with_a_capability_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "netprobe")["securityContext"]["capabilities"]["add"] = ["NET_ADMIN"]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "no-capability-added-netprobe")
+
+    def test_netprobe_running_as_another_uid_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "netprobe")["securityContext"]["runAsUser"] = 1003
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "netprobe-runs-as-the-agent-uid-unprivileged")
+
+    def test_netcheck_with_more_than_net_admin_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "netcheck")["securityContext"]["capabilities"]["add"] = [
+                "NET_ADMIN", "NET_RAW"]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "netcheck-root-net-admin-only-hardened")
+
+    def test_netcheck_mounting_a_secret_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "netcheck")["volumeMounts"].append(
+                {"name": "kiro-secret", "mountPath": "/k", "readOnly": True})
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "netcheck-no-secret-and-no-port")
+
+    def test_netcheck_snapshot_mount_must_be_read_only(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for m in copy.container(pod, "netcheck")["volumeMounts"]:
+                if m["name"] == "netinit-run":
+                    m.pop("readOnly", None)
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "netcheck-mounts-only-snapshot-ro-and-its-status")
+
+    def test_agent_mounting_a_status_volume_is_refused(self):
+        for vol in ("netcheck-rules", "netcheck-probe"):
+            copy = Copy(self)
+
+            def mutate(pod, vol=vol):
+                copy.container(pod, "agent")["volumeMounts"].append(
+                    {"name": vol, "mountPath": "/forge"})
+
+            copy.edit_pod(mutate)
+            self.assert_fails(copy, vol + "-mounted-only-by-" + (
+                "netcheck" if vol == "netcheck-rules" else "netprobe") + "-and-proxy")
+
+    def test_proxy_status_mount_must_be_read_only(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for m in copy.container(pod, "proxy")["volumeMounts"]:
+                if m["name"] == "netcheck-rules":
+                    m.pop("readOnly", None)
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "netcheck-rules-read-only-in-proxy")
+
+    def test_netprobe_sharing_the_rules_volume_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "netprobe")["volumeMounts"].append(
+                {"name": "netcheck-rules", "mountPath": "/r"})
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "netprobe-mounts-only-its-status")
+
+    def test_status_flag_pointing_at_the_wrong_file_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            cmd = copy.container(pod, "proxy")["command"]
+            cmd[cmd.index("--netfilter-probe-status") + 1] = "/run/auth-proxy-netcheck/probe/other"
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "proxy-netfilter-flags-match-the-checker-status-files")
+
+    def test_proxy_without_the_self_check_flags_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            cmd = copy.container(pod, "proxy")["command"]
+            i = cmd.index("--netfilter-rules-status")
+            del cmd[i:i + 2]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "proxy-netfilter-flags-match-the-checker-status-files")
+
+    def test_interval_mismatch_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for e in copy.container(pod, "netcheck")["env"]:
+                if e["name"] == "INTERVAL":
+                    e["value"] = "300"
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "self-check-interval-agrees")
+
+    def _flag(self, copy, flag, value):
+        def mutate(pod):
+            cmd = copy.container(pod, "proxy")["command"]
+            cmd[cmd.index(flag) + 1] = value
+        copy.edit_pod(mutate)
+
+    def test_wrong_rules_owner_uid_flag_is_refused(self):
+        copy = Copy(self)
+        self._flag(copy, "--netfilter-rules-uid", "1000")
+        self.assert_fails(copy, "proxy-status-owner-uids-match-the-writers")
+
+    def test_wrong_probe_owner_uid_flag_is_refused(self):
+        copy = Copy(self)
+        self._flag(copy, "--netfilter-probe-uid", "0")
+        self.assert_fails(copy, "proxy-status-owner-uids-match-the-writers")
+
+    def test_missing_owner_uid_flags_are_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            cmd = copy.container(pod, "proxy")["command"]
+            i = cmd.index("--netfilter-probe-uid")
+            del cmd[i:i + 2]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "proxy-status-owner-uids-match-the-writers")
+
+    def test_agent_mounting_a_status_volume_is_refused(self):
+        for vol in ("netcheck-rules", "netcheck-probe"):
+            copy = Copy(self)
+
+            def mutate(pod, vol=vol):
+                copy.container(pod, "agent")["volumeMounts"].append(
+                    {"name": vol, "mountPath": "/x"})
+
+            copy.edit_pod(mutate)
+            self.assert_fails(copy, "agent-cannot-write-the-status-volumes")
+
+    def test_fsgroup_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["securityContext"]["fsGroup"] = 1000
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "no-fsgroup-and-no-hostpath-volumes")
+
+    def test_hostpath_status_volume_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for v in pod["spec"]["volumes"]:
+                if v["name"] == "netcheck-probe":
+                    v.pop("emptyDir")
+                    v["hostPath"] = {"path": "/tmp/x"}
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "no-fsgroup-and-no-hostpath-volumes")
+
+    def test_unconfined_seccomp_on_netcheck_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "netcheck")["securityContext"]["seccompProfile"] = {
+                "type": "Unconfined"}
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "pod-seccomp-runtime-default-and-no-container-override")
+
+    def test_pod_without_seccomp_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["securityContext"].pop("seccompProfile")
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "pod-seccomp-runtime-default-and-no-container-override")
+
+    def test_host_namespaces_are_refused(self):
+        for key in ("hostNetwork", "hostPID", "hostIPC"):
+            copy = Copy(self)
+
+            def mutate(pod, key=key):
+                pod["spec"][key] = True
+
+            copy.edit_pod(mutate)
+            self.assert_fails(copy, "no-host-namespaces")
+
+    def test_netcheck_with_another_command_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "netcheck")["command"] = [
+                "/bin/sh", "-c", "while true; do echo state=ok > /run/netcheck/status; sleep 1; done"]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "netcheck-and-netprobe-run-the-expected-programs")
+
+    def test_netprobe_with_another_command_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "netprobe")["command"] = ["/bin/true"]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "netcheck-and-netprobe-run-the-expected-programs")
+
+    def test_proxy_without_the_readiness_probe_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "proxy").pop("readinessProbe")
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "proxy-readiness-probe-asks-its-admin-socket")
+
+    def test_liveness_probe_on_the_proxy_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "proxy")["livenessProbe"] = {
+                "exec": {"command": ["auth-proxy", "--check-ready"]}}
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "proxy-has-no-liveness-probe-on-the-self-check")
+
+    def test_netinit_without_the_snapshot_is_refused(self):
+        copy = Copy(self)
+        self.edit_script(copy, "netinit.sh",
+                         "ip6tables -S OUTPUT > /run/expected-ip6tables\n", "")
+        self.assert_fails(copy, "netinit-writes-the-snapshot-netcheck-reads")
+
+    def test_netcheck_that_changes_rules_is_refused(self):
+        copy = Copy(self)
+        self.edit_script(copy, "netcheck.sh", "  echo ok\n}", "  \"$tool\" -F OUTPUT\n  echo ok\n}")
+        self.assert_fails(copy, "netcheck-never-changes-rules")
+
+    def test_netcheck_that_reads_the_wrong_snapshot_name_is_refused(self):
+        copy = Copy(self)
+        self.edit_script(copy, "netcheck.sh", 'exp="$EXPECT_DIR/expected-$tool"',
+                         'exp="$EXPECT_DIR/rules-$tool"')
+        self.assert_fails(copy, "netinit-writes-the-snapshot-netcheck-reads")
+
+    def test_dropping_a_checker_container_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["containers"] = [
+                c for c in pod["spec"]["containers"] if c["name"] != "netprobe"]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "containers-agent-proxy-runtime-egress")
 
 
 if __name__ == "__main__":

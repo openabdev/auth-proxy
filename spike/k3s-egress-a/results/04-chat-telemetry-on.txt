@@ -1,0 +1,12 @@
+counters before: skuid 1000 counter packets 1;skuid 1000 counter packets 19;skuid 1000 counter packets 0;skuid 1000 counter packets 5;
+{"start_ms": 1794268584847, "rc": 0, "wall_s": 6.71, "first_stdout_s": 2.721, "stdout_reads": 10, "span_s": 0.064, "reply_chars": 111, "reply_head": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n1", "stderr_tail": ""}
+counters after: skuid 1000 counter packets 1;skuid 1000 counter packets 39;skuid 1000 counter packets 0;skuid 1000 counter packets 5;
+--- audit (new lines)
+{"caller":"agent-1","code":"forwarded","credential_id":"c-kiro","decision":"allow","impl":"a","method":"POST","ms":74,"path":"/","route":"cps","status":200,"t":1794268584990}
+{"caller":"agent-1","code":"forwarded","credential_id":"c-kiro","decision":"allow","impl":"a","method":"POST","ms":73,"path":"/","route":"cps","status":200,"t":1794268585137}
+{"caller":"agent-1","code":"forwarded","credential_id":"c-kiro","decision":"allow","impl":"a","method":"POST","ms":102,"path":"/","route":"cps","status":200,"t":1794268585247}
+{"caller":"agent-1","code":"forwarded","credential_id":"c-kiro","decision":"allow","impl":"a","method":"POST","ms":1859,"path":"/","route":"krs","status":200,"t":1794268587138}
+--- kiro-chat.log (ANSI stripped)
+2026-11-09T23:56:25.263558Z ERROR semantic_search_client::client::hosted_model_client: 154: HTTP request failed for URL: https://desktop-release.q.us-east-1.amazonaws.com/models/all-MiniLM-L6-v2.zip - Error: error sending request for url (https://desktop-release.q.us-east-1.amazonaws.com/models/all-MiniLM-L6-v2.zip)
+2026-11-09T23:56:25.270556Z ERROR semantic_search_client::client::hosted_model_client: 154: HTTP request failed for URL: https://desktop-release.q.us-east-1.amazonaws.com/models/all-MiniLM-L6-v2.zip - Error: error sending request for url (https://desktop-release.q.us-east-1.amazonaws.com/models/all-MiniLM-L6-v2.zip)
+2026-11-09T23:56:26.089566Z ERROR chat_cli::telemetry::legacy_sink: 356: Failed to post toolkit metric err=dispatch failure: other: an error occurred while loading credentials: dispatch failure: io error: an i/o error occurred: error sending request for url (https://cognito-identity.us-east-1.amazonaws.com/) (DispatchFailure(DispatchFailure { source: ConnectorError { kind: Other(None), source: Pro

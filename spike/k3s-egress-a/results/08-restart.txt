@@ -1,0 +1,33 @@
+=== baseline
+rules in pod netns (node view): 4 skuid-1000 rules; sandbox=91df7ce9154c
+restartCount: netinit=0 agent=0 proxy=0 
+agent egress: tcp:1.1.1.1:443=ECONNREFUSED udp53:<kube-dns>=EPERM tcp:127.0.0.1:18100=ok
+=== 8a: stop the agent container
+rules in pod netns (node view): 4 skuid-1000 rules; sandbox=91df7ce9154c
+restartCount: netinit=0 agent=1 proxy=0 
+agent egress: tcp:1.1.1.1:443=ECONNREFUSED udp53:<kube-dns>=EPERM tcp:127.0.0.1:18100=ok
+cli.json rewritten by the platform entrypoint on restart: ['api.codewhisperer.service', 'api.cps.service', 'api.krs.service', 'api.q.service']
+=== 8b: stop the proxy container
+rules in pod netns (node view): 4 skuid-1000 rules; sandbox=91df7ce9154c
+restartCount: netinit=0 agent=1 proxy=1 
+agent egress: tcp:1.1.1.1:443=ECONNREFUSED udp53:<kube-dns>=EPERM tcp:127.0.0.1:18100=ok
+proxy path (ListAvailableModels, control-plane call): 200
+=== 8c: delete and recreate the pod
+rules in pod netns (node view): 4 skuid-1000 rules; sandbox=f10d5cb42cb9
+restartCount: netinit=0 agent=0 proxy=0 
+agent egress: tcp:1.1.1.1:443=ECONNREFUSED udp53:<kube-dns>=EPERM tcp:127.0.0.1:18100=ok
+proxy path (ListAvailableModels, control-plane call): 200
+netinit log of the new pod:
+  == iptables iptables v1.8.10 (nf_tables)
+  -P OUTPUT ACCEPT
+  -A OUTPUT -o lo -p tcp -m tcp --dport 18190 -m owner --uid-owner 1000 -j REJECT --reject-with tcp-reset
+  -A OUTPUT ! -o lo -m owner --uid-owner 1000 -j REJECT --reject-with icmp-port-unreachable
+  == ip6tables
+  -P OUTPUT ACCEPT
+  -A OUTPUT -o lo -p tcp -m tcp --dport 18190 -m owner --uid-owner 1000 -j REJECT --reject-with tcp-reset
+  -A OUTPUT ! -o lo -m owner --uid-owner 1000 -j REJECT --reject-with icmp6-port-unreachable
+=== 8d: same pod without NET_ADMIN on the init container
+ap-c status: Init:0/1 ready: 0/2
+netinit log:
+  RTNETLINK answers: Operation not permitted
+agent container state: {"waiting":{"reason":"PodInitializing"}}

@@ -60,6 +60,105 @@ pub struct Config {
     pub grants: Vec<Grant>,
     #[serde(default)]
     pub egress: Egress,
+    /// Passthrough settings. Required when any route has `mode = "passthrough"`.
+    #[serde(default)]
+    pub passthrough: Option<Passthrough>,
+    #[serde(default)]
+    pub probe: Probe,
+}
+
+/// How a route treats the request credential.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RouteMode {
+    /// Phase 1: swap the surrogate for the stored credential.
+    #[default]
+    Swap,
+    /// Muse gate: the caller's own `Authorization` is forwarded unchanged.
+    Passthrough,
+}
+
+/// What a matching grant does. Stage 1 supports `allow` only.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Decision {
+    #[default]
+    Allow,
+    Hold,
+}
+
+/// Settings for the public passthrough listener (design 3.1, 3.2, 3.7).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Passthrough {
+    /// The `Host` the front passes to the loopback listener. Replaces `listen.proxy` in the Host check.
+    pub public_authority: String,
+    #[serde(default = "default_caller_key_header")]
+    pub caller_key_header: String,
+    /// Lowercase header names the front adds. A trailing `*` makes the entry a prefix.
+    #[serde(default = "default_front_strip_headers")]
+    pub front_strip_headers: Vec<String>,
+    /// Concurrent connections, 1..=65535.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// Header read timeout, 1..=300.
+    #[serde(default = "default_header_read_secs")]
+    pub header_read_secs: u64,
+    /// Per-chunk stall limit on request bodies, 1..=300.
+    #[serde(default = "default_body_read_secs")]
+    pub body_read_secs: u64,
+    /// First byte to last response byte, 1..=3600.
+    #[serde(default = "default_request_deadline_secs")]
+    pub request_deadline_secs: u64,
+    /// No byte from upstream, 1..=3600.
+    #[serde(default = "default_upstream_idle_secs")]
+    pub upstream_idle_secs: u64,
+}
+
+fn default_caller_key_header() -> String {
+    "x-ap-caller-key".to_string()
+}
+
+fn default_front_strip_headers() -> Vec<String> {
+    [
+        "forwarded",
+        "x-forwarded-*",
+        "x-real-ip",
+        "via",
+        "cf-*",
+        "tailscale-*",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+fn default_max_connections() -> usize {
+    256
+}
+
+fn default_header_read_secs() -> u64 {
+    10
+}
+
+fn default_body_read_secs() -> u64 {
+    15
+}
+
+fn default_request_deadline_secs() -> u64 {
+    300
+}
+
+fn default_upstream_idle_secs() -> u64 {
+    30
+}
+
+/// The stage 1 hold-tolerance probe. Off unless `enabled`, and only built with the
+/// `stage1-probe` feature of ap-proxy.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Probe {
+    pub enabled: bool,
 }
 
 /// The single loopback listener of the credential proxy.
@@ -133,6 +232,12 @@ pub struct Route {
     pub credential_header: String,
     #[serde(default)]
     pub pass_headers: Vec<String>,
+    #[serde(default)]
+    pub mode: RouteMode,
+    /// Passthrough routes only: members of `AUTH_HEADERS` (other than `authorization`) that are
+    /// forwarded. Default empty.
+    #[serde(default)]
+    pub keep_auth_headers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -148,12 +253,17 @@ pub struct Credential {
 #[serde(deny_unknown_fields)]
 pub struct Grant {
     pub identity: String,
+    /// Required on swap routes, forbidden on passthrough routes (empty).
+    #[serde(default)]
     pub credential: String,
     pub route: String,
     pub methods: Vec<String>,
     pub paths: Vec<String>,
     #[serde(default)]
     pub aws_targets: Vec<String>,
+    /// `allow` (default). `hold` is not supported in stage 1.
+    #[serde(default)]
+    pub decision: Decision,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -161,8 +271,6 @@ pub struct Grant {
 pub struct Egress {
     /// `host:port` entries read by ap-egress only.
     pub allow: Vec<String>,
-    /// Permit egress hosts that are also credential route hosts. Off by default.
-    pub allow_route_hosts: bool,
     /// Maximum CONNECT connections ap-egress serves at once, at least 1. Default 256. A
     /// connection accepted over the cap is closed at once.
     pub max_connections: usize,
@@ -172,7 +280,6 @@ impl Default for Egress {
     fn default() -> Self {
         Egress {
             allow: Vec::new(),
-            allow_route_hosts: false,
             max_connections: 256,
         }
     }
@@ -249,7 +356,86 @@ fn valid_path(p: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Passthrough grant paths are plain prefixes (`starts_with`), so no trailing `/` is required.
+/// Every other path rule still applies.
+fn valid_prefix_path(p: &str) -> Result<(), &'static str> {
+    if !p.starts_with('/') {
+        return Err("must start with /");
+    }
+    if p.contains('%') {
+        return Err("must not contain %");
+    }
+    if p.contains("//") {
+        return Err("must not contain //");
+    }
+    if p.split('/').any(|s| s == "." || s == "..") {
+        return Err("must not contain a dot segment");
+    }
+    Ok(())
+}
+
+/// A lowercase header token, or one followed by a single `*` (prefix match).
+fn valid_header_pattern(s: &str) -> bool {
+    let token = s.strip_suffix('*').unwrap_or(s);
+    valid_header_name(token)
+}
+
+fn validate_passthrough(p: &Passthrough) -> Result<(), ConfigError> {
+    let a = &p.public_authority;
+    if a.is_empty()
+        || a.len() > 255
+        || a.contains('@')
+        || a.contains('/')
+        || a.chars().any(char::is_whitespace)
+    {
+        return Err(invalid(
+            "passthrough.public_authority must be a non-empty host[:port] without @, / or whitespace",
+        ));
+    }
+    let h = &p.caller_key_header;
+    if !valid_header_name(h)
+        || AUTH_HEADERS.contains(&h.as_str())
+        || HOP_HEADERS.contains(&h.as_str())
+    {
+        return Err(invalid(
+            "passthrough.caller_key_header must be a lowercase header name that is not a credential or hop-by-hop header",
+        ));
+    }
+    if p.front_strip_headers.len() > 64 {
+        return Err(invalid(
+            "passthrough.front_strip_headers has too many entries",
+        ));
+    }
+    for e in &p.front_strip_headers {
+        if !valid_header_pattern(e) {
+            return Err(invalid(format!(
+                "passthrough.front_strip_headers entry {e:?} must be a lowercase header name, optionally ending in *"
+            )));
+        }
+    }
+    if !(1..=65535).contains(&p.max_connections) {
+        return Err(invalid("passthrough.max_connections must be in 1..=65535"));
+    }
+    for (field, v, max) in [
+        ("header_read_secs", p.header_read_secs, 300),
+        ("body_read_secs", p.body_read_secs, 300),
+        ("request_deadline_secs", p.request_deadline_secs, 3600),
+        ("upstream_idle_secs", p.upstream_idle_secs, 3600),
+    ] {
+        if !(1..=max).contains(&v) {
+            return Err(invalid(format!("passthrough.{field} must be in 1..={max}")));
+        }
+    }
+    Ok(())
+}
+
 impl Config {
+    /// True when every route is a passthrough route (and there is at least one). Such a
+    /// deployment runs without the session machinery.
+    pub fn is_passthrough_only(&self) -> bool {
+        !self.routes.is_empty() && self.routes.iter().all(|r| r.mode == RouteMode::Passthrough)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.version != 1 {
             return Err(invalid("version must be 1"));
@@ -347,7 +533,74 @@ impl Config {
                     )));
                 }
             }
+            match r.mode {
+                RouteMode::Swap => {
+                    if !r.keep_auth_headers.is_empty() {
+                        return Err(invalid(format!(
+                            "route {:?}: keep_auth_headers is only for passthrough routes",
+                            r.name
+                        )));
+                    }
+                }
+                RouteMode::Passthrough => {
+                    if r.name == "ap" {
+                        return Err(invalid(format!(
+                            "passthrough route name {:?} is reserved",
+                            r.name
+                        )));
+                    }
+                    if r.error_shape != ErrorShape::Generic {
+                        return Err(invalid(format!(
+                            "route {:?}: a passthrough route needs error_shape generic",
+                            r.name
+                        )));
+                    }
+                    if !r.pass_headers.is_empty() {
+                        return Err(invalid(format!(
+                            "route {:?}: a passthrough route must not set pass_headers",
+                            r.name
+                        )));
+                    }
+                    for h in &r.keep_auth_headers {
+                        if h == "authorization" || !AUTH_HEADERS.contains(&h.as_str()) {
+                            return Err(invalid(format!(
+                                "route {:?}: keep_auth_headers entry {h:?} must be a member of the credential header set other than authorization",
+                                r.name
+                            )));
+                        }
+                    }
+                }
+            }
             route_hosts.insert(r.name.as_str(), r.host.as_str());
+        }
+
+        let passthrough_routes: HashSet<&str> = self
+            .routes
+            .iter()
+            .filter(|r| r.mode == RouteMode::Passthrough)
+            .map(|r| r.name.as_str())
+            .collect();
+        if !passthrough_routes.is_empty() && passthrough_routes.len() != self.routes.len() {
+            return Err(invalid(
+                "swap and passthrough routes cannot be mixed in one config in stage 1",
+            ));
+        }
+        match (&self.passthrough, passthrough_routes.is_empty()) {
+            (None, false) => {
+                return Err(invalid(
+                    "a passthrough route needs a [passthrough] table with public_authority",
+                ))
+            }
+            (Some(_), true) => {
+                return Err(invalid(
+                    "[passthrough] is only valid with a passthrough route",
+                ))
+            }
+            (Some(p), false) => validate_passthrough(p)?,
+            (None, true) => {}
+        }
+        if self.probe.enabled && passthrough_routes.is_empty() {
+            return Err(invalid("[probe] needs a passthrough deployment"));
         }
 
         let mut credential_ids = HashSet::new();
@@ -376,6 +629,12 @@ impl Config {
             }
             let mut set = HashSet::new();
             for r in &c.routes {
+                if passthrough_routes.contains(r.as_str()) {
+                    return Err(invalid(format!(
+                        "credential {:?} lists passthrough route {r:?}",
+                        c.id
+                    )));
+                }
                 if !route_hosts.contains_key(r.as_str()) {
                     return Err(invalid(format!(
                         "credential {:?} names unknown route {r:?}",
@@ -402,19 +661,48 @@ impl Config {
                     g.identity
                 )));
             }
-            let routes = credential_routes
-                .get(g.credential.as_str())
-                .ok_or_else(|| {
-                    invalid(format!("grant names unknown credential {:?}", g.credential))
-                })?;
-            if !route_hosts.contains_key(g.route.as_str()) {
-                return Err(invalid(format!("grant names unknown route {:?}", g.route)));
+            let on_passthrough = passthrough_routes.contains(g.route.as_str());
+            if on_passthrough {
+                if !g.credential.is_empty() {
+                    return Err(invalid(format!(
+                        "grant on passthrough route {:?} must not name a credential",
+                        g.route
+                    )));
+                }
+                if !g.aws_targets.is_empty() {
+                    return Err(invalid(format!(
+                        "grant on passthrough route {:?} must not set aws_targets",
+                        g.route
+                    )));
+                }
+                if g.decision != Decision::Allow {
+                    return Err(invalid(
+                        "grant decision \"hold\" is not supported yet (stage 1 allows or denies)",
+                    ));
+                }
+            } else {
+                let routes = credential_routes
+                    .get(g.credential.as_str())
+                    .ok_or_else(|| {
+                        invalid(format!("grant names unknown credential {:?}", g.credential))
+                    })?;
+                if !route_hosts.contains_key(g.route.as_str()) {
+                    return Err(invalid(format!("grant names unknown route {:?}", g.route)));
+                }
+                if !routes.contains(g.route.as_str()) {
+                    return Err(invalid(format!(
+                        "grant route {:?} is not in the route set of credential {:?}",
+                        g.route, g.credential
+                    )));
+                }
+                if g.decision != Decision::Allow {
+                    return Err(invalid(
+                        "grant decision \"hold\" is not supported yet (stage 1 allows or denies)",
+                    ));
+                }
             }
-            if !routes.contains(g.route.as_str()) {
-                return Err(invalid(format!(
-                    "grant route {:?} is not in the route set of credential {:?}",
-                    g.route, g.credential
-                )));
+            if on_passthrough && !route_hosts.contains_key(g.route.as_str()) {
+                return Err(invalid(format!("grant names unknown route {:?}", g.route)));
             }
             if g.methods.is_empty() {
                 return Err(invalid("grant methods must not be empty"));
@@ -432,7 +720,12 @@ impl Config {
                 return Err(invalid("grant paths must not be empty"));
             }
             for p in &g.paths {
-                valid_path(p).map_err(|why| invalid(format!("grant path {p:?}: {why}")))?;
+                let checked = if on_passthrough {
+                    valid_prefix_path(p)
+                } else {
+                    valid_path(p)
+                };
+                checked.map_err(|why| invalid(format!("grant path {p:?}: {why}")))?;
             }
             for t in &g.aws_targets {
                 let ok = !t.is_empty() && t.len() <= 256 && t.bytes().all(|b| b.is_ascii_graphic());
@@ -466,9 +759,9 @@ impl Config {
                     )))
                 }
             }
-            if !self.egress.allow_route_hosts && credential_hosts.contains(host) {
+            if credential_hosts.contains(host) {
                 return Err(invalid(format!(
-                    "egress host {host:?} is a credential route host (set egress.allow_route_hosts = true to permit)"
+                    "egress host {host:?} is a credential route host"
                 )));
             }
         }
@@ -545,7 +838,6 @@ allow = ["github.com:443"]
         assert_eq!(cfg.sessions.authority_lease_secs, 90);
         assert_eq!(cfg.sessions.max_sessions, 64);
         assert_eq!(cfg.limits.max_body_bytes, 33_554_432);
-        assert!(!cfg.egress.allow_route_hosts);
     }
 
     #[test]
@@ -918,11 +1210,8 @@ allow = ["github.com:443"]
     }
 
     #[test]
-    fn allows_credential_route_host_in_egress_with_opt_in() {
-        let text = base()
-            .replace("github.com:443", "runtime.us-east-1.kiro.dev:443")
-            .replace("[egress]\n", "[egress]\nallow_route_hosts = true\n");
-        assert!(load(&text).is_ok());
+    fn rejects_removed_allow_route_hosts_key() {
+        expect_parse_error(&base().replace("[egress]\n", "[egress]\nallow_route_hosts = true\n"));
     }
 
     #[test]
@@ -1072,5 +1361,229 @@ allow = ["github.com:443"]
     #[test]
     fn rejects_invalid_toml_syntax() {
         expect_parse_error("version = ");
+    }
+
+    fn pt_base() -> String {
+        format!(
+            r#"version = 1
+
+[listen]
+proxy = "127.0.0.1:8443"
+
+[passthrough]
+public_authority = "gate.example.test"
+
+[[identity]]
+name = "muse-pilot"
+caller_key_sha256 = "{H64}"
+
+[[route]]
+name = "discord"
+host = "discord.com"
+mode = "passthrough"
+
+[[grant]]
+identity = "muse-pilot"
+route = "discord"
+methods = ["GET"]
+paths = ["/api/v10/channels/", "/api/v10/users/@me"]
+"#
+        )
+    }
+
+    #[test]
+    fn passthrough_only_config_loads() {
+        let cfg = load(&pt_base()).expect("valid");
+        assert!(cfg.is_passthrough_only());
+        let p = cfg.passthrough.as_ref().unwrap();
+        assert_eq!(p.caller_key_header, "x-ap-caller-key");
+        assert_eq!(p.max_connections, 256);
+        assert_eq!(p.header_read_secs, 10);
+        assert_eq!(p.body_read_secs, 15);
+        assert_eq!(p.request_deadline_secs, 300);
+        assert_eq!(p.upstream_idle_secs, 30);
+        assert!(p.front_strip_headers.iter().any(|h| h == "tailscale-*"));
+        assert_eq!(cfg.routes[0].mode, RouteMode::Passthrough);
+        assert_eq!(cfg.grants[0].decision, Decision::Allow);
+        assert!(cfg.grants[0].credential.is_empty());
+        assert!(!cfg.probe.enabled);
+    }
+
+    #[test]
+    fn swap_config_is_not_passthrough_only() {
+        assert!(!load(&base()).unwrap().is_passthrough_only());
+    }
+
+    #[test]
+    fn rejects_mixed_modes() {
+        let text = format!(
+            "{}\n[[route]]\nname = \"other\"\nhost = \"other.example.test\"\n",
+            pt_base()
+        );
+        expect_invalid(&text, "cannot be mixed");
+    }
+
+    #[test]
+    fn rejects_credential_listing_a_passthrough_route() {
+        let text = format!(
+            "{}\n[[credential]]\nid = \"c\"\nsource = \"k8s:a:b\"\nroutes = [\"discord\"]\n",
+            pt_base()
+        );
+        expect_invalid(&text, "lists passthrough route");
+    }
+
+    #[test]
+    fn rejects_passthrough_grant_with_credential() {
+        let text = pt_base().replace(
+            "methods = [\"GET\"]",
+            "credential = \"c\"\nmethods = [\"GET\"]",
+        );
+        expect_invalid(&text, "must not name a credential");
+    }
+
+    #[test]
+    fn rejects_hold_decision_in_stage_1() {
+        let text = pt_base().replace(
+            "methods = [\"GET\"]",
+            "decision = \"hold\"\nmethods = [\"GET\"]",
+        );
+        expect_invalid(&text, "not supported yet");
+    }
+
+    #[test]
+    fn rejects_unknown_decision_value() {
+        let text = pt_base().replace(
+            "methods = [\"GET\"]",
+            "decision = \"maybe\"\nmethods = [\"GET\"]",
+        );
+        expect_parse_error(&text);
+    }
+
+    #[test]
+    fn rejects_missing_passthrough_table() {
+        let text = pt_base().replace(
+            "[passthrough]\npublic_authority = \"gate.example.test\"\n",
+            "",
+        );
+        expect_invalid(&text, "needs a [passthrough] table");
+    }
+
+    #[test]
+    fn rejects_passthrough_table_without_passthrough_route() {
+        let text = format!(
+            "{}\n[passthrough]\npublic_authority = \"gate.example.test\"\n",
+            base()
+        );
+        expect_invalid(&text, "only valid with a passthrough route");
+    }
+
+    #[test]
+    fn rejects_unknown_key_under_passthrough() {
+        let text = pt_base().replace(
+            "public_authority = \"gate.example.test\"",
+            "public_authority = \"gate.example.test\"\nbogus = 1",
+        );
+        expect_parse_error(&text);
+    }
+
+    #[test]
+    fn passthrough_grant_path_needs_no_trailing_slash_but_swap_grant_does() {
+        assert!(load(&pt_base()).is_ok());
+        let swap = base().replace("paths = [\"/\"]", "paths = [\"/v1/x\"]");
+        expect_invalid(&swap, "must end with /");
+        let pt = pt_base().replace("\"/api/v10/users/@me\"", "\"/api/v10/a/../b\"");
+        expect_invalid(&pt, "dot segment");
+    }
+
+    #[test]
+    fn swap_grant_without_credential_is_invalid() {
+        let text = base().replace(
+            "credential = \"kiro\"\nroute = \"kiro-krs\"\nmethods",
+            "route = \"kiro-krs\"\nmethods",
+        );
+        expect_invalid(&text, "unknown credential");
+    }
+
+    #[test]
+    fn rejects_passthrough_limits_out_of_range() {
+        for (field, bad) in [
+            ("max_connections", "0"),
+            ("max_connections", "65536"),
+            ("header_read_secs", "0"),
+            ("header_read_secs", "301"),
+            ("body_read_secs", "301"),
+            ("request_deadline_secs", "3601"),
+            ("upstream_idle_secs", "0"),
+        ] {
+            let text = pt_base().replace(
+                "public_authority = \"gate.example.test\"",
+                &format!("public_authority = \"gate.example.test\"\n{field} = {bad}"),
+            );
+            expect_invalid(&text, field);
+        }
+    }
+
+    #[test]
+    fn rejects_bad_public_authority_and_headers() {
+        for bad in ["", "a@b", "a/b", "a b"] {
+            let text = pt_base().replace("gate.example.test", bad);
+            expect_invalid(&text, "public_authority");
+        }
+        let text = pt_base().replace(
+            "public_authority = \"gate.example.test\"",
+            "public_authority = \"gate.example.test\"\ncaller_key_header = \"authorization\"",
+        );
+        expect_invalid(&text, "caller_key_header");
+        let text = pt_base().replace(
+            "public_authority = \"gate.example.test\"",
+            "public_authority = \"gate.example.test\"\nfront_strip_headers = [\"Via\"]",
+        );
+        expect_invalid(&text, "front_strip_headers");
+    }
+
+    #[test]
+    fn rejects_bad_passthrough_route_fields() {
+        let text = pt_base().replace(
+            "mode = \"passthrough\"",
+            "mode = \"passthrough\"\nerror_shape = \"aws\"",
+        );
+        expect_invalid(&text, "error_shape generic");
+        let text = pt_base().replace(
+            "mode = \"passthrough\"",
+            "mode = \"passthrough\"\npass_headers = [\"x-a\"]",
+        );
+        expect_invalid(&text, "pass_headers");
+        let text = pt_base().replace(
+            "mode = \"passthrough\"",
+            "mode = \"passthrough\"\nkeep_auth_headers = [\"authorization\"]",
+        );
+        expect_invalid(&text, "keep_auth_headers");
+        let ok = pt_base().replace(
+            "mode = \"passthrough\"",
+            "mode = \"passthrough\"\nkeep_auth_headers = [\"x-api-key\"]",
+        );
+        assert!(load(&ok).is_ok());
+        let text = pt_base()
+            .replace("name = \"discord\"", "name = \"ap\"")
+            .replace("route = \"discord\"", "route = \"ap\"");
+        expect_invalid(&text, "reserved");
+    }
+
+    #[test]
+    fn probe_defaults_off_and_needs_passthrough() {
+        let on = format!("{}\n[probe]\nenabled = true\n", pt_base());
+        assert!(load(&on).unwrap().probe.enabled);
+        let bad = format!("{}\n[probe]\nenabled = true\n", base());
+        expect_invalid(&bad, "[probe]");
+    }
+
+    #[test]
+    fn pilot_example_policy_validates() {
+        let text = include_str!("../../../deploy/muse/pilot-policy.example.toml")
+            .replace("<64 lowercase hex, sha256 of the issued apk_ key>", H64);
+        let cfg = load(&text).expect("the committed example must validate");
+        assert!(cfg.is_passthrough_only());
+        assert!(cfg.probe.enabled);
+        assert_eq!(cfg.grants[0].methods, vec!["GET".to_string()]);
     }
 }

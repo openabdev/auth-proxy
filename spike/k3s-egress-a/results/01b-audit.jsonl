@@ -1,0 +1,3 @@
+{"caller":"agent-1","code":"forwarded","credential_id":"c-kiro","decision":"allow","impl":"a","method":"POST","ms":96,"path":"/","route":"cps","status":200,"t":1794268556285}
+{"caller":"agent-1","code":"forwarded","credential_id":"c-kiro","decision":"allow","impl":"a","method":"POST","ms":97,"path":"/","route":"cps","status":200,"t":1794268556389}
+{"caller":"agent-1","code":"forwarded","credential_id":"c-kiro","decision":"allow","impl":"a","method":"POST","ms":1466,"path":"/","route":"krs","status":200,"t":1794268557882}

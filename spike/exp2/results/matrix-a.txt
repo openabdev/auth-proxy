@@ -1,0 +1,27 @@
+PASS | R1 policy empty or unavailable → refuse | policy {"rules":[]} | status=403 code=policy_empty upstream_requests=0
+PASS | R1 policy empty or unavailable → refuse | policy file is 0 bytes | status=503 code=policy_unavailable upstream_requests=0 diagnosable=True
+PASS | R1 policy empty or unavailable → refuse | policy file deleted after a good load | before=200 after: status=503 code=policy_unavailable upstream_requests=0 diagnosable=True
+PASS | R1 policy empty or unavailable → refuse | policy file corrupt JSON | status=503 code=policy_unavailable upstream_requests=0 diagnosable=True
+PASS | R1 policy empty or unavailable → refuse | policy allows other path/method only | status=403 code=policy_denied upstream_requests=0
+PASS | R2 broker unreachable → refuse, no stale cache | success, then broker stopped, same surrogate | before=200 after: status=503 code=broker_unavailable upstream_requests=0 diagnosable=True
+PASS | R3 surrogate expired or revoked → explicit 4xx | expired (ttl 1 s) | status=401 code=surrogate_expired upstream_requests=0
+PASS | R3 surrogate expired or revoked → explicit 4xx | revoked after one good use | before=200 after: status=401 code=surrogate_revoked upstream_requests=0
+PASS | R3 surrogate expired or revoked → explicit 4xx | unknown / malformed / missing surrogate | unknown: status=401 code=surrogate_unknown upstream_requests=0; malformed: status=401 code=surrogate_malformed upstream_requests=0; missing: status=401 code=surrogate_missing upstream_requests=0
+PASS | R3 surrogate expired or revoked → explicit 4xx | aws-dialect route: refusal body has __type | status=401 code=surrogate_revoked upstream_requests=0 __type=AccessDeniedException
+PASS | X1 caller key and surrogate binding | wrong caller key / other caller's surrogate / other route's surrogate | bad key: status=403 code=caller_rejected upstream_requests=0; other caller: status=403 code=surrogate_wrong_caller upstream_requests=0; other route: status=403 code=surrogate_wrong_route upstream_requests=0
+PASS | R4 cross-host/port/scheme redirect → credential never forwarded | 302 to other host, other port, http:// | host: status=302 location_unchanged=True good=1 other=0; port: status=302 location_unchanged=True good=1 other=0; scheme: status=302 location_unchanged=True good=1 other=0; client follows: evil got real credential=False
+PASS | R5 userinfo, IP literal or ambiguous host → reject | client Host / request-target variants (raw) | [Host userinfo: 400/0] [Host foreign name: 400/0] [Host IPv4 short form: 400/0] [Host trailing dot: 400/0] [Host IPv6-mapped: 400/0] [two Host headers: 400/0] [no Host (HTTP/1.0): 400/0] [absolute-form foreign: 400/0] [absolute-form userinfo: 400/0]
+PASS | R5 userinfo, IP literal or ambiguous host → reject | upstream route host is IP literal / userinfo / trailing dot | [IPv4: exit=[2]] [IPv6: exit=[2]] [userinfo: exit=[2]] [trailing dot: exit=[2]] [IPv4 short: exit=[2]] [uppercase: exit=[2]]
+PASS | X2 path canonicalization | dot-segments, encoded dots/slashes, empty segments (raw) | [..: refused 400] [%2e%2e: refused 400] [%2f: refused 400] [//: refused 400] [route hop: refused 400] [%252e: refused 400]
+PASS | X3 CONNECT refused | CONNECT api.up.test:443 | status=405 upstream_requests=0
+PASS | R6 SNI/Host mismatch → reject | upstream sees SNI == Host == route host; client X-Forwarded-Host ignored | status=200 sni=api.up.test host=['api.up.test:18443']
+PASS | R6 SNI/Host mismatch → reject | cert name ≠ route host (SNI wrongname.up.test, cert other.up.test) | status=502 code=upstream_unavailable upstream_requests=0 handshake_fail={'wrongname': 1}
+PASS | R7 upstream TLS verification failure → refuse | cert from an untrusted CA | status=502 code=upstream_unavailable upstream_requests=0 handshake_fail={'badca': 1}
+PASS | R8 client auth stripped, exactly one upstream credential | bearer route + 6 junk auth headers + TokenType | status=200 auth_headers_upstream=['authorization'] real=True surrogate_seen=False junk_seen=False tokentype_kept=True caller_key_seen=False
+PASS | R8 client auth stripped, exactly one upstream credential | x-api-key route + junk Authorization | status=200 auth_headers_upstream=['x-api-key']
+PASS | R8 client auth stripped, exactly one upstream credential | two surrogate headers → reject | status=400 upstream_requests=0
+n/a  | X4 enforcement point down → refuse | B: ext_authz service stopped (failure_mode_allow=false) | n/a for A (single process: if it is down, nothing listens)
+PASS | X6 SSE streaming through the proxy (mock) | 20 events × 50 ms: not buffered | status=200 events=20 first=0.002s spread=0.959s
+PASS | X5 no secret in any log | real test credentials, surrogates, caller keys vs every work-dir file | files_with_secret=[] scanned=['ap-proxy.log', 'audit.jsonl', 'broker.log', 'config-bad.json', 'config.json', 'policy.json', 'upstream.log']
+
+a: 25 of 25 cases not failing; work dir /tmp/ap-exp2-a

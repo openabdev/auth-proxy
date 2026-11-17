@@ -1,0 +1,59 @@
+name: fuzz
+
+# Bounded cargo-fuzz runs for request canonicalization (issue #19). The default `ci` workflow is
+# manual only and never builds fuzz/; this one has its own triggers:
+#   - pull requests that touch canonicalization or the fuzz crate: a short run per target;
+#   - nightly: a longer run per target;
+#   - manual dispatch: the run time is an input.
+on:
+  pull_request:
+    paths:
+      - crates/ap-core/src/canon.rs
+      - crates/ap-core/tests/common/**
+      - fuzz/**
+      - .github/workflows/fuzz.yml
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per fuzz target
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [canon_path, canon_host, canon_origin, canon_headers]
+    env:
+      SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '45' || github.event.inputs.seconds || '300' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+
+      - name: Fuzz ${{ matrix.target }} for a bounded time
+        working-directory: fuzz
+        shell: bash
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time="$SECONDS_PER_TARGET" -timeout=10 -rss_limit_mb=2048 -max_len=4096 \
+            2>&1 | tee fuzz.log
+          # libFuzzer exits non-zero on a crash; the summary line is the evidence either way.
+          grep -E "^#[0-9]+.*(DONE|pulse)" fuzz.log | tail -1 || true
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}

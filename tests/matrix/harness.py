@@ -24,6 +24,7 @@ PORT_MAIN = 18100
 PORT_LEASE = 18101
 PORT_AUTHORITY = 18102
 PORT_RESTART = 18103
+PORT_NETFILTER = 18104
 PORT_EGRESS = 18110
 PORT_PROBE = 18120
 UPSTREAM_PORTS = dict(good=18443, evil=18444, badca=18445, wrongname=18446)
@@ -186,15 +187,29 @@ class UpstreamHandler(BaseHTTPRequestHandler):
         pass
 
     def _record(self):
-        n = int(self.headers.get("content-length") or 0)
-        if n:
-            self.rfile.read(n)
+        te = (self.headers.get("transfer-encoding") or "").lower()
+        body_len = 0
+        if "chunked" in te:
+            while True:
+                size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
+                if size == 0:
+                    while self.rfile.readline().strip():
+                        pass
+                    break
+                body_len += len(self.rfile.read(size))
+                self.rfile.readline()
+        else:
+            n = int(self.headers.get("content-length") or 0)
+            if n:
+                body_len = len(self.rfile.read(n))
         self.server.rec.add({
             "listener": self.server.name,
             "sni": getattr(self.connection, "ap_sni", None),
             "method": self.command,
             "path": self.path,
             "headers": [[k.lower(), v] for k, v in self.headers.items()],
+            "transfer_encoding": te,
+            "body_len": body_len,
         })
 
     def _send(self, code, body=b"", ctype="application/json", extra=()):
@@ -221,6 +236,11 @@ class UpstreamHandler(BaseHTTPRequestHandler):
                 time.sleep(0.05)
             self.wfile.write(b"0\r\n\r\n")
             return
+        if path == "/v1/xap":
+            return self._send(200, b"upstream-body", extra=[("x-ap-decision", "denied"), ("x-ap-other", "kept")])
+        if path == "/v1/hop":
+            return self._send(200, b"hop-body", extra=[("connection", "X-Hop"), ("x-hop", "value"),
+                                                       ("proxy-authenticate", "Basic realm=up"), ("x-kept", "ok")])
         if path == "/v1/redirect":
             import urllib.parse
             to = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("to", [""])[0]
@@ -405,7 +425,7 @@ class Env:
         return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": self.work,
                 "AP_TEST_UPSTREAM_CA": os.path.join(self.pki, "ca.pem"), "AP_TEST_RESOLVE": resolve}
 
-    def start_proxy(self, cfg_path, port, keep_tokens=False):
+    def start_proxy(self, cfg_path, port, keep_tokens=False, extra_args=()):
         """Start the proxy. A fresh instance gets a fresh token directory, because a restored
         authority hash holds a full lease and refuses hello (by design). A restart keeps it."""
         self.stop_proxy()
@@ -424,11 +444,28 @@ class Env:
         self.proc = subprocess.Popen(
             [os.path.join(self.bindir, "auth-proxy"), "--config", cfg_path,
              "--session-socket", self.session_sock, "--admin-socket", self.admin_sock,
-             "--secret-root", self.secrets_dir, "--token-dir", self.tokens_dir],
+             "--secret-root", self.secrets_dir, "--token-dir", self.tokens_dir, *extra_args],
             stdout=out, stderr=err, env=self._proxy_env())
         out.close()
         err.close()
         if not wait_port(port, self.proc) or not os.path.exists(self.session_sock):
+            raise RuntimeError(f"auth-proxy did not start on {port}; see proxy-{port}.log")
+
+    def start_passthrough(self, cfg_path, port, extra_env=None):
+        """Start the proxy on a passthrough-only config. No expiry store, no session or admin
+        socket, no secret root: the process must come up without any of them."""
+        self.stop_proxy()
+        self.port = port
+        self.cur_cfg = cfg_path
+        out = open(self.audit_file, "ab")
+        err = open(os.path.join(self.work, f"proxy-{port}.log"), "ab")
+        env = self._proxy_env()
+        env.update(extra_env or {})
+        self.proc = subprocess.Popen([os.path.join(self.bindir, "auth-proxy"), "--config", cfg_path],
+                                     stdout=out, stderr=err, env=env)
+        out.close()
+        err.close()
+        if not wait_port(port, self.proc):
             raise RuntimeError(f"auth-proxy did not start on {port}; see proxy-{port}.log")
 
     def stop_proxy(self):

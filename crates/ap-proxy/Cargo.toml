@@ -20,6 +20,7 @@ bytes = "1"
 ed25519-dalek = "2"
 futures-util = "0.3"
 http = "1"
+libc = "0.2"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
@@ -33,14 +34,22 @@ default = []
 # Test-only, off by default and never enabled in a release build. Lets the black-box matrix trust a
 # throwaway CA and resolve mock upstream names (crates/ap-proxy/src/matrix_hooks.rs).
 matrix-upstream = []
+# Stage 1 measurement only: the hold-tolerance probe route. Off by default, never in a stage 2 build.
+stage1-probe = []
 
 [[test]]
 name = "matrix"
 path = "tests/matrix.rs"
 required-features = ["matrix-upstream"]
 
+[[test]]
+name = "matrix_passthrough"
+path = "tests/matrix_passthrough.rs"
+required-features = ["matrix-upstream"]
+
 [dev-dependencies]
 base64 = "0.22"
+h2 = "0.4"
 getrandom = "0.2"
 http-body-util = "0.1"
 rcgen = "0.13"

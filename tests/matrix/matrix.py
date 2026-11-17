@@ -39,7 +39,10 @@ GATE_IDS = [
 ]
 P1_IDS = ["P1-01", "P1-02", "P1-03", "P1-04", "P1-05", "P1-06", "P1-07", "P1-08", "P1-09", "P1-10",
           "P1-11", "P1-12", "P1-13"]
-EXPECTED = GATE_IDS + P1_IDS
+# Canonicalization rows (issue #19): one per class of input, wire level, nothing reaches upstream
+# unless the forwarded path is byte-identical to the path the policy matched.
+CANON_IDS = ["C1-1", "C1-2", "C1-3", "C1-4", "C1-5", "C1-6", "C1-7"]
+EXPECTED = GATE_IDS + P1_IDS + CANON_IDS
 
 
 def case(cid, row, name, instance="main"):
@@ -754,6 +757,176 @@ def _(e):
     return st1 == 413 and st2 == 400, f"oversize_put={st1} invalid_session={st2}"
 
 
+# ================================================================ C1 canonicalization classes (issue #19)
+def audit_count(e):
+    return sum(1 for _ in open(e.audit_file, "rb")) if os.path.exists(e.audit_file) else 0
+
+
+def audit_paths_since(e, before):
+    with open(e.audit_file, "rb") as f:
+        new = f.read().splitlines()[before:]
+    return [json.loads(line).get("path") for line in new if line.strip()]
+
+
+def canon_probe(e, line, headers, raw=None):
+    """Send one request, return (status, code, upstream log, audit paths written by it)."""
+    e.ureset()
+    before = audit_count(e)
+    if raw is not None:
+        st, _, b = e.raw(raw)
+    else:
+        st, _, b = e.raw_req(line, headers)
+    return st, code_of(b), e.ulog(), audit_paths_since(e, before)
+
+
+def canon_refused(e, label, line, headers, codes=None, raw=None, statuses=range(400, 500)):
+    """Refused: a 4xx (a parse error from the HTTP layer counts), nothing at any upstream."""
+    st, code, lg, _ = canon_probe(e, line, headers, raw)
+    ok = st in statuses and not lg and (codes is None or code in codes)
+    return ok, f"[{label}: {st}/{code}/{len(lg)}]"
+
+
+def canon_forwarded_identical(e, label, line, headers, want_path):
+    """Forwarded: the upstream saw exactly `want_path`, and the audit line (what the policy
+    matched) carries the same bytes."""
+    st, _, lg, seen = canon_probe(e, line, headers)
+    got = lg[0]["path"].split("?")[0] if lg else None
+    audit_ok = bool(seen) and seen[-1] == want_path
+    ok = st == 200 and len(lg) == 1 and got == want_path and audit_ok
+    return ok, f"[{label}: {st} upstream={got!r} audit={seen[-1:]}]"
+
+
+def canon_run(checks):
+    ok_all, out = True, []
+    for ok, d in checks:
+        ok_all = ok_all and ok
+        out.append(d)
+    return ok_all, " ".join(out)
+
+
+@case("C1-1", "C1", "double-encoded, encoded slash and backslash, NUL: refused as path_ambiguous")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    au = [("Host", e.authority()), ("Authorization", f"Bearer {s}")]
+    paths = ["/v1/%252f", "/v1/%252F", "/v1/%252e%252e/x", "/v1/%255c", "/v1/%2500", "/v1/%25%32%66",
+             "/v1%2fecho", "/v1/%2Fecho", "/v1/a%5cb", "/v1/a%5Cb", "/v1/a%00b", "/v1/a\\b"]
+    return canon_run([canon_refused(e, p, f"GET {e.ap('up', p)} HTTP/1.1", au, {"path_ambiguous"})
+                      for p in paths])
+
+
+@case("C1-2", "C1", "`;` path parameters: on dot segments refused, on ordinary segments forwarded byte for byte")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    au = [("Host", e.authority()), ("Authorization", f"Bearer {s}")]
+    checks = [canon_refused(e, p, f"GET {e.ap('up', p)} HTTP/1.1", au, {"path_ambiguous"})
+              for p in ["/v1/..;/admin", "/v1/..;x/admin", "/v1/.;/x", "/v1/..;a=b/x"]]
+    for p in ["/v1/a;b=c", "/v1/a;b/echo", "/v1/;x/echo"]:
+        checks.append(canon_forwarded_identical(e, p, f"GET {e.ap('up', p)} HTTP/1.1", au, p))
+    return canon_run(checks)
+
+
+@case("C1-3", "C1", "Unicode and bytes the forwarder would rewrite are refused; percent-encoded UTF-8 is forwarded unchanged")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    au = [("Host", e.authority()), ("Authorization", f"Bearer {s}")]
+    checks = []
+    for label, p in [("e-acute", "/v1/caf\u00e9"), ("fullwidth dot", "/v1/\uff0e\uff0e/x"),
+                     ("combining", "/v1/e\u0301"), ("brace", "/v1/{x}"), ("quote", '/v1/a"b'),
+                     ("angle", "/v1/a<b>"), ("backtick", "/v1/a`b")]:
+        checks.append(canon_refused(e, label, f"GET {e.ap('up', p)} HTTP/1.1", au, None))
+    for p in ["/v1/caf%C3%A9", "/v1/%41", "/v1/100%25"]:
+        checks.append(canon_forwarded_identical(e, p, f"GET {e.ap('up', p)} HTTP/1.1", au, p))
+    return canon_run(checks)
+
+
+@case("C1-4", "C1", "Host spellings: case, trailing dot, IPv6, decimal/octal/hex IP, punycode, Unicode, empty")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    au = [("Authorization", f"Bearer {s}")]
+    line = f"GET {e.ap('up', '/v1/echo')} HTTP/1.1"
+    p = e.port
+    hosts = [("mixed case", f"LOCALHOST:{p}"), ("trailing dot", f"127.0.0.1.:{p}"),
+             ("IPv6 loopback", f"[::1]:{p}"), ("IPv4-mapped IPv6", f"[::ffff:127.0.0.1]:{p}"),
+             ("decimal IP", f"2130706433:{p}"), ("octal IP", f"0177.0.0.1:{p}"),
+             ("hex IP", f"0x7f.0.0.1:{p}"), ("hex tail IP", f"127.0.0.0x1:{p}"),
+             ("short IP", f"127.1:{p}"), ("punycode", f"xn--e1afmkfd.xn--p1ai:{p}"),
+             ("Unicode", f"b\u00fccher.example:{p}"), ("no port", "127.0.0.1"), ("empty", ""),
+             ("authority plus path", f"127.0.0.1:{p}/x"), ("comma list", f"127.0.0.1:{p},evil.test")]
+    return canon_run([canon_refused(e, label, line, [("Host", h)] + au, {"host_rejected"})
+                      for label, h in hosts])
+
+
+@case("C1-5", "C1", "absolute-form request target vs Host: refused whether it matches or not")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    a = e.authority()
+    au = [("Authorization", f"Bearer {s}")]
+    path = e.ap("up", "/v1/echo")
+    checks = []
+    for label, target, host in [
+            ("http matching", f"http://{a}{path}", a), ("https matching", f"https://{a}{path}", a),
+            ("foreign target", f"http://evil.test{path}", a), ("foreign Host", f"http://{a}{path}", "evil.test"),
+            ("target case", f"http://{a.upper()}{path}", a), ("userinfo", f"http://u@{a}{path}", a)]:
+        checks.append(canon_refused(e, label, f"GET {target} HTTP/1.1", [("Host", host)] + au, {"absolute_form"}))
+    checks.append(canon_refused(e, "authority-form //", f"GET //evil.test{path} HTTP/1.1", [("Host", a)] + au, None))
+    return canon_run(checks)
+
+
+@case("C1-6", "C1", "CRLF in values, obsolete folding, NUL and duplicate headers: refused, nothing upstream")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    a = e.authority()
+    req = e.ap("up", "/v1/echo")
+    base = f"GET {req} HTTP/1.1\r\nHost: {a}\r\n".encode()
+    sur = f"Authorization: Bearer {s}\r\n".encode()
+    checks = []
+    for label, extra in [("bare CR in value", b"X-A: a\rb\r\n"), ("NUL in value", b"X-A: a\x00b\r\n"),
+                         ("obs-fold continuation", b"X-A: a\r\n b\r\n"),
+                         ("obs-fold tab", b"X-A: a\r\n\tb\r\n"),
+                         ("space before colon", b"X-A : a\r\n"),
+                         ("fold on Host", b"Host: x\r\n y\r\n")]:
+        checks.append(canon_refused(e, label, None, None, raw=base + sur + extra + b"\r\n", statuses=range(400, 500)))
+    dup = [("two Authorization", [("Authorization", f"Bearer {s}"), ("Authorization", f"Bearer {s}")]),
+           ("two Host", [("Host", a), ("Host", a)]),
+           ("two Content-Length", [("Authorization", f"Bearer {s}"), ("Content-Length", "0"), ("Content-Length", "0")]),
+           ("CL and TE", [("Authorization", f"Bearer {s}"), ("Content-Length", "0"), ("Transfer-Encoding", "chunked")])]
+    for label, hs in dup:
+        hh = hs if any(k == "Host" for k, _ in hs) else [("Host", a)] + hs
+        checks.append(canon_refused(e, label, f"GET {req} HTTP/1.1", hh, None))
+    # Bare LF ends a header line for the parser, so what follows is a real header and is seen as
+    # one: the proxy parses once and forwards what it parsed, no second reading is possible.
+    e.ureset()
+    st, _, _ = e.raw(base + sur + b"X-A: a\nX-Injected: 1\r\n\r\n")
+    lg = e.ulog()
+    hs = dict(lg[0]["headers"]) if lg else {}
+    ok = (not lg and 400 <= st < 500) or (st == 200 and hs.get("x-a") == "a" and hs.get("x-injected") == "1")
+    checks.append((ok, f"[bare LF: {st}/{len(lg)} x-a={hs.get('x-a')!r}]"))
+    return canon_run(checks)
+
+
+@case("C1-7", "C1", "caller key path form: empty, reserved characters, repeated key and prefix, over-long segment")
+def _(e):
+    s = e.mint("agent-1", ("c-up",))
+    k = e.keys["agent-1"]
+    au = [("Host", e.authority()), ("Authorization", f"Bearer {s}")]
+    checks = []
+    for label, path in [("empty key", "/ap//up/v1/echo"), ("no key", "/ap/up/v1/echo"),
+                        ("key %2f", f"/ap/{k}%2f/up/v1/echo"), ("key ;", f"/ap/{k};x/up/v1/echo"),
+                        ("key ?", f"/ap/{k}?x/up/v1/echo"), ("key upper", f"/ap/{k.upper()}/up/v1/echo"),
+                        ("key short", f"/ap/{k[:-1]}/up/v1/echo"), ("key long", f"/ap/{k}0/up/v1/echo"),
+                        ("prefix case", f"/AP/{k}/up/v1/echo"), ("double prefix", f"/ap/ap/{k}/up/v1/echo")]:
+        checks.append(canon_refused(e, label, f"GET {path} HTTP/1.1", au, {"caller_rejected"}, statuses=[401]))
+    # The key and prefix appearing again later are plain path data: matched and forwarded as is.
+    again = f"/v1/echo/ap/{k}/up/x"
+    checks.append(canon_forwarded_identical(e, "repeated", f"GET {e.ap('up', again)} HTTP/1.1", au, again))
+    long_ok = "/v1/" + "a" * 4000
+    checks.append(canon_forwarded_identical(e, "4000-byte segment", f"GET {e.ap('up', long_ok)} HTTP/1.1", au, long_ok))
+    checks.append(canon_refused(e, "300000-byte segment", f"GET {e.ap('up', '/v1/' + 'a' * 300000)} HTTP/1.1", au,
+                                None, statuses=range(400, 500)))
+    return canon_run(checks)
+
+
+
 # ================================================================ driver
 def run_instance(e, instance, results):
     """Start the processes this instance needs, run its cases in table order, stop them."""
@@ -831,11 +1004,12 @@ def main():
     passed = sum(1 for r in results if r["verdict"] == "PASS")
     gate = sum(1 for r in results if r["id"] in GATE_IDS and r["verdict"] == "PASS")
     probe_target = sum(1 for r in results if r["id"] in P1_IDS and r["verdict"] == "PASS")
+    canon = sum(1 for r in results if r["id"] in CANON_IDS and r["verdict"] == "PASS")
     if a.json:
         with open(a.json, "w") as f:
             json.dump({"bin": bindir, "results": results, "missing": missing}, f, indent=1)
     print(f"\nrows: {len(results)} run, {len(EXPECTED)} expected, missing={missing or 'none'} extra={extra or 'none'}")
-    print(f"gate: {gate} PASS of {len(GATE_IDS)}; phase 1: {probe_target} PASS of {len(P1_IDS)}")
+    print(f"gate: {gate} PASS of {len(GATE_IDS)}; phase 1: {probe_target} PASS of {len(P1_IDS)}; canonicalization: {canon} PASS of {len(CANON_IDS)}")
     print(f"summary: {passed} PASS of {len(EXPECTED)} rows; work dir {work}")
     return 0 if (passed == len(EXPECTED) and not missing and not extra) else 1
 

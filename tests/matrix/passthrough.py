@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Black-box matrix for the Muse gated passthrough, stage 1 (docs/design/muse-gated-passthrough.md,
-section 7). Separate from matrix.py, whose 41 rows are unchanged.
+section 7). Separate from matrix.py, whose first 41 rows are unchanged.
 
   passthrough.py --bin DIR [--work DIR] [--json OUT]
 
@@ -34,7 +34,7 @@ KEY_HEADER = "x-ap-caller-key"
 
 CASES = []  # (id, row, name, instance, fn)
 EXPECTED = ["PT-01", "PT-02", "PT-03", "PT-04", "PT-05", "PT-06", "PT-07", "PT-08", "PT-09",
-            "PT-10a", "PT-12", "PT-13", "PT-14", "PT-15", "PT-16", "PT-17"]
+            "PT-10a", "PT-12", "PT-13", "PT-14", "PT-15", "PT-16", "PT-17", "PT-18", "PT-19"]
 
 
 def case(cid, row, name, instance="main"):
@@ -609,6 +609,88 @@ def pt14(c):
     finally:
         e.stop_proxy()
     return r["status"] == 200 and not socks, f"status={r['status']} sockets={socks}"
+
+
+def canon_refused(c, label, raw, codes=None, statuses=range(400, 500)):
+    """Refused: a 4xx (an HTTP-layer parse error counts) and nothing at the upstream."""
+    r = exchange(c.port, raw)
+    n = len(c.ulog())
+    ok = r["status"] in statuses and n == 0 and (codes is None or code_of(r) in codes)
+    return ok, f"[{label}: {r['status']}/{code_of(r)}/{n}]"
+
+
+def canon_identical(c, label, raw, want_path):
+    """Forwarded: the upstream saw exactly `want_path`, with the caller key nowhere in it."""
+    r = exchange(c.port, raw)
+    up = c.ulog()
+    got = up[0]["path"].split("?")[0] if up else None
+    ok = r["status"] == 200 and len(up) == 1 and got == want_path
+    return ok, f"[{label}: {r['status']} upstream={got!r}]"
+
+
+def run_all(checks):
+    ok = True
+    out = []
+    for good, d in checks:
+        ok &= good
+        out.append(d)
+    return ok, " ".join(out)
+
+
+@case("PT-18", "issue 19", "path forms with the caller key: encodings, `;`, Unicode, empty and reserved keys, repeated key; matched path is the forwarded path")
+def pt18(c):
+    k = c.key
+    key_hdr = [("Authorization", c.auth)]
+
+    def get(path, key=k):
+        return build("GET", f"/ap/{key}{path}", key_hdr)
+
+    checks = []
+    for p in ["/discord/v1/%252f", "/discord/v1/%255c", "/discord/v1/%2500", "/discord/v1%2fx",
+              "/discord/v1/%5cx", "/discord/v1/..;/x", "/discord/v1/.;/x", "/discord/v1/{x}", '/discord/v1/a"b',
+              "/discord/v1/caf\u00e9", "/discord/v1/\uff0e\uff0e/x"]:
+        checks.append(canon_refused(c, p, get(p), None if not p.isascii() else {"path_ambiguous"}))
+    for label, key in [("empty key", ""), ("key %2f", k + "%2f"), ("key ;", k + ";x"),
+                       ("key upper", k.upper()), ("key short", k[:-1]), ("key long", k + "0")]:
+        checks.append(canon_refused(c, label, build("GET", f"/ap/{key}/discord/v1/x", key_hdr), {"caller_rejected"},
+                                    statuses=[401]))
+    for p in ["/v1/a;b=c", "/v1/caf%C3%A9", f"/v1/echo/ap/{k}/discord/x", "/v1/" + "a" * 4000]:
+        checks.append(canon_identical(c, p[:24], get("/discord" + p), p))
+    n = len(c.ulog())
+    r = exchange(c.port, build("GET", f"/ap/{k}/discord/v1/" + "a" * 300000, key_hdr))
+    checks.append((400 <= r["status"] < 500 and len(c.ulog()) == n, f"[300000-byte segment: {r['status']}]"))
+    return run_all(checks)
+
+
+@case("PT-19", "issue 19", "public Host spellings, absolute form, CRLF and folded headers, duplicate and conflicting headers")
+def pt19(c):
+    path = "/discord/v1/x"
+    good = c.good()
+    checks = []
+    for label, host in [("mixed case", AUTHORITY.upper()), ("trailing dot", AUTHORITY + "."),
+                        ("with port", AUTHORITY + ":443"), ("IPv6", "[::1]"), ("IPv4-mapped", "[::ffff:127.0.0.1]"),
+                        ("decimal IP", "2130706433"), ("octal IP", "0177.0.0.1"), ("hex IP", "0x7f.0.0.1"),
+                        ("punycode", "xn--e1afmkfd.xn--p1ai"), ("Unicode", "b\u00fccher.example"),
+                        ("userinfo", "u@" + AUTHORITY), ("empty", "")]:
+        checks.append(canon_refused(c, label, build("GET", path, good, host=host), {"host_rejected"}))
+    for label, target, host in [("absolute matching", f"http://{AUTHORITY}{path}", AUTHORITY),
+                                ("absolute https", f"https://{AUTHORITY}{path}", AUTHORITY),
+                                ("absolute foreign", f"http://evil.test{path}", AUTHORITY),
+                                ("absolute foreign Host", f"http://{AUTHORITY}{path}", "evil.test")]:
+        checks.append(canon_refused(c, label, build("GET", target, good, host=host), {"absolute_form"}))
+    base = f"GET {path} HTTP/1.1\r\nHost: {AUTHORITY}\r\n{KEY_HEADER}: {c.key}\r\nAuthorization: {c.auth}\r\n".encode()
+    for label, extra in [("bare CR", b"X-A: a\rb\r\n"), ("NUL", b"X-A: a\x00b\r\n"),
+                         ("obs-fold", b"X-A: a\r\n b\r\n"), ("obs-fold tab", b"X-A: a\r\n\tb\r\n"),
+                         ("space before colon", b"X-A : a\r\n")]:
+        checks.append(canon_refused(c, label, base + extra + b"\r\n"))
+    for label, hs in [("two caller keys", [(KEY_HEADER, c.key), (KEY_HEADER, c.key)]),
+                      ("two Authorization", [(KEY_HEADER, c.key), ("Authorization", c.auth), ("Authorization", c.auth)]),
+                      ("two Content-Length", c.good([("Content-Length", "0"), ("Content-Length", "0")])),
+                      ("CL and TE", c.good([("Content-Length", "0"), ("Transfer-Encoding", "chunked")])),
+                      ("Connection nominates key", c.good([("Connection", KEY_HEADER)]))]:
+        checks.append(canon_refused(c, label, build("GET", path, hs)))
+    return run_all(checks)
+
 
 
 # ------------------------------------------------------------------ driver

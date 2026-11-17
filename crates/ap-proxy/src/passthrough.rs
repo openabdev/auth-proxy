@@ -66,6 +66,9 @@ pub struct PtApp {
     pub hold: Arc<hold::Table>,
     /// Told about each new distinct hold entry. `None` until a notifier is configured.
     pub notifier: Option<Arc<dyn Notifier>>,
+    /// `[approval].public_base_url` without a trailing slash: the notification link is
+    /// `{approval_base}/pending/{id}`.
+    pub(crate) approval_base: Option<String>,
     #[cfg(any(test, feature = "matrix-upstream"))]
     pub(crate) pause: pause::Pause,
 }
@@ -99,6 +102,14 @@ impl PtApp {
         Self::build(policy_path, cfg, audit, client, held_client, limits)
     }
 
+    /// Announce new hold entries through `notifier`, linking to `{base}/pending/{id}`. Called
+    /// right after construction, while this is the only handle.
+    pub(crate) fn set_notifier(app: &mut Arc<PtApp>, notifier: Arc<dyn Notifier>, base: &str) {
+        let inner = Arc::get_mut(app).expect("notifier is set before the app is shared");
+        inner.notifier = Some(notifier);
+        inner.approval_base = Some(base.trim_end_matches('/').to_string());
+    }
+
     pub(crate) fn build(
         policy_path: std::path::PathBuf,
         cfg: Config,
@@ -114,6 +125,7 @@ impl PtApp {
             held_client,
             hold: Arc::new(hold::Table::new(limits)),
             notifier: None,
+            approval_base: None,
             #[cfg(any(test, feature = "matrix-upstream"))]
             pause: pause::Pause::new(),
         })

@@ -90,6 +90,34 @@ impl Ctx {
     }
 }
 
+/// Longest a notification attempt may run, whatever the notifier does.
+const NOTIFY_CAP: Duration = Duration::from_secs(5);
+
+/// Fire-and-forget notification for a new entry: one attempt, no retry. The link carries only the
+/// entry id; the text is the fixed sentence. Nothing here waits for the result.
+fn announce(app: &Arc<PtApp>, ctx: &Ctx, id: &str, digest: &str) {
+    let (Some(notifier), Some(base)) = (app.notifier.clone(), app.approval_base.clone()) else {
+        return;
+    };
+    let app = Arc::clone(app);
+    let (ctx, id, digest) = (ctx.clone(), id.to_string(), digest.to_string());
+    tokio::spawn(async move {
+        let url = format!("{base}/pending/{id}");
+        let sent =
+            tokio::time::timeout(NOTIFY_CAP, notifier.notify(&id, crate::notify::TEXT, &url)).await;
+        if !matches!(sent, Ok(Ok(()))) {
+            app.audit.write_hold(&ctx.rec(
+                &id,
+                &digest,
+                "notify_failed",
+                None,
+                Some("notify_failed"),
+                None,
+            ));
+        }
+    });
+}
+
 /// What the response stream needs to write the `completed` line.
 pub(super) struct HeldEnd {
     ctx: Ctx,
@@ -419,7 +447,11 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
         Admission::Refused(code) => return Ok(refuse(&app, &trail, code)),
         Admission::Held(h) => h,
     };
-    // A notifier fires here for a new entry (`held.superseded.is_none()`).
+    // A new entry is announced once; a supersede is not. The entry's state does not depend on
+    // the outcome, so a failure only leaves a `notify_failed` line.
+    if held.superseded.is_none() {
+        announce(&app, &ctx, &held.id, &held.digest);
+    }
     let mut guard = Guard {
         app: Arc::clone(&app),
         ctx: ctx.clone(),

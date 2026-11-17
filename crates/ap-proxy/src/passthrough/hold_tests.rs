@@ -25,11 +25,13 @@ use tokio_rustls::TlsAcceptor;
 use super::pause::Gate;
 use super::*;
 use crate::hold::{ApproveResult, DenyResult, Limits, State};
+use crate::notify::{MockNotifier, TEXT};
 use crate::test_support::{
     buffer_sink, caller_key, client_for, tls_server_config, Scratch, Upstream, HOST,
 };
 use ap_broker::registry::sha256_hex;
 
+const NOTIFY_BASE: &str = "https://approve.example.test/";
 const AUTH: &str = "gate.example.test";
 const SENTINEL: &str = "SENTINEL-DISCORD-TOKEN-0001";
 const PATH_TOKEN: &str = "SENTINEL-PATH-TOKEN-0002";
@@ -243,6 +245,7 @@ struct Opts {
     tail: String,
     port: Option<u16>,
     sink: Option<Switch>,
+    notifier: Option<Arc<MockNotifier>>,
 }
 
 impl Default for Opts {
@@ -259,6 +262,7 @@ impl Default for Opts {
             tail: String::new(),
             port: None,
             sink: None,
+            notifier: None,
         }
     }
 }
@@ -346,7 +350,10 @@ path_patterns = ["/hold/*"]
             None => buffer_sink(),
         };
         let client = client_for(up);
-        let app = PtApp::build(policy.clone(), cfg, sink, client.clone(), client, o.limits);
+        let mut app = PtApp::build(policy.clone(), cfg, sink, client.clone(), client, o.limits);
+        if let Some(n) = &o.notifier {
+            PtApp::set_notifier(&mut app, n.clone(), NOTIFY_BASE);
+        }
         Ht {
             app,
             key,
@@ -1469,4 +1476,139 @@ async fn webhook_path_tokens_are_redacted_in_every_hold_record() {
     );
     assert!(t.text().contains("<redacted>"));
     t.assert_clean();
+}
+
+// ---------------------------------------------------------------- notification
+
+/// Wait until the notifier has been called `n` times.
+async fn calls_reach(n: &MockNotifier, count: usize) {
+    for _ in 0..250 {
+        if n.calls().len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("notifier saw {} calls, wanted {count}", n.calls().len());
+}
+
+#[tokio::test]
+async fn notify_once_per_distinct_entry_with_only_id_text_and_link() {
+    let mock = Mock::start().await;
+    let n = MockNotifier::new(false);
+    let o = Opts {
+        notifier: Some(Arc::clone(&n)),
+        ..Opts::default()
+    };
+    let t = Ht::with("notify-one", &mock.up, o).await;
+    let path = format!("/discord/hold/ok?channel=SENTINEL-CHANNEL-0003&{PATH_TOKEN}=1");
+    let body = r#"{"content":"SENTINEL-BODY-0004"}"#;
+    let first = t.spawn(t.post(&path, body));
+    let id1 = t.held(1).await;
+    calls_reach(&n, 1).await;
+    // Identical retries supersede the first entry and announce nothing.
+    let mut retries = Vec::new();
+    for k in 2..=4 {
+        retries.push(t.spawn(t.post(&path, body)));
+        t.held(k).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(n.calls().len(), 1, "a supersede does not notify again");
+    // A different request is a new distinct entry and notifies once.
+    let other = t.spawn(t.post("/discord/hold/other", r#"{"x":1}"#));
+    let id_other = t.held(5).await;
+    calls_reach(&n, 2).await;
+    let calls = n.calls();
+    assert_eq!(
+        calls[0],
+        (
+            id1.clone(),
+            TEXT.to_string(),
+            format!("https://approve.example.test/pending/{id1}")
+        )
+    );
+    assert_eq!(calls[1].0, id_other);
+    assert_eq!(calls[1].1, TEXT);
+    assert_eq!(
+        calls[1].2,
+        format!("https://approve.example.test/pending/{id_other}")
+    );
+    for (id, text, url) in &calls {
+        let all = format!("{id}{text}{url}");
+        for needle in [
+            "SENTINEL",
+            PATH_TOKEN,
+            "Bot",
+            "channel",
+            "content",
+            "muse-pilot",
+            &t.key,
+        ] {
+            assert!(!all.contains(needle), "payload leaks {needle}");
+        }
+    }
+    assert_eq!(t.count("notify_failed"), 0);
+    t.app.hold.deny(&id_other, "alice");
+    other.await.unwrap().unwrap();
+    let newest = t.held(4).await;
+    t.app.hold.deny(&newest, "alice");
+    first.await.unwrap().unwrap();
+    for r in retries {
+        r.await.unwrap().unwrap();
+    }
+    assert_eq!(mock.hits(), 0);
+    t.assert_clean();
+}
+
+#[tokio::test]
+async fn notify_failure_leaves_the_entry_to_expire_and_sends_nothing() {
+    let mock = Mock::start().await;
+    let n = MockNotifier::new(true);
+    let mut o = Opts {
+        notifier: Some(Arc::clone(&n)),
+        ..Opts::default()
+    };
+    o.limits.hold = Duration::from_millis(900);
+    let t = Ht::with("notify-fail", &mock.up, o).await;
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    calls_reach(&n, 1).await;
+    for _ in 0..100 {
+        if t.count("notify_failed") == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(t.count("notify_failed"), 1);
+    assert_eq!(
+        t.app.hold.pending_len(),
+        1,
+        "the failure does not change the entry"
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!((p.status.as_u16(), code(&b)), (410, "expired".into()));
+    assert_eq!(mock.hits(), 0);
+    assert_eq!(t.transitions(), ["held", "notify_failed", "expired"]);
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Expired
+    );
+    let line = t
+        .lines()
+        .into_iter()
+        .find(|v| v["transition"] == "notify_failed")
+        .unwrap();
+    assert_eq!(line["code"], "notify_failed");
+    t.assert_clean();
+}
+
+#[tokio::test]
+async fn notify_absent_means_the_hold_just_waits() {
+    let mock = Mock::start().await;
+    let t = Ht::new("notify-none", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(t.count("notify_failed"), 0);
+    t.app.hold.deny(&id, "alice");
+    h.await.unwrap().unwrap();
 }

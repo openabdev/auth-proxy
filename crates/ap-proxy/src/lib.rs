@@ -259,19 +259,50 @@ async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
         None => None,
     };
     let approval_cfg = cfg.approval.clone();
+    let notify_cfg = cfg.notify.clone();
     // A panic line carries the source location only, never the payload, which could hold a
     // header value.
     std::panic::set_hook(Box::new(|info| match info.location() {
         Some(l) => eprintln!("auth-proxy: panic at {}:{}", l.file(), l.line()),
         None => eprintln!("auth-proxy: panic"),
     }));
-    let app = passthrough::PtApp::with_held_client(
+    let mut app = passthrough::PtApp::with_held_client(
         opts.config.clone(),
         cfg,
         AuditSink::stdout(),
         client,
         held_client,
     );
+    if let Some(n) = notify_cfg {
+        let Some(a) = &approval_cfg else {
+            eprintln!("auth-proxy: [notify] needs an [approval] block to link to");
+            return 2;
+        };
+        let topic = match notify::read_secret_file(std::path::Path::new(&n.topic_file)) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("auth-proxy: notify topic file: {e}");
+                return 2;
+            }
+        };
+        let token = match n.token_file.as_deref().map(std::path::Path::new) {
+            Some(p) => match notify::read_secret_file(p) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("auth-proxy: notify token file: {e}");
+                    return 2;
+                }
+            },
+            None => None,
+        };
+        match notify::NtfyNotifier::new(&n.base_url, &topic, token.as_deref()) {
+            Ok(nt) => passthrough::PtApp::set_notifier(&mut app, Arc::new(nt), &a.public_base_url),
+            Err(e) => {
+                eprintln!("auth-proxy: cannot build the notifier: {e}");
+                return 2;
+            }
+        }
+    }
     let limits = listener::public::PublicLimits {
         max_connections: pt.max_connections,
         header_read: std::time::Duration::from_secs(pt.header_read_secs),

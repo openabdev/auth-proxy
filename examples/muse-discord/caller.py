@@ -45,10 +45,11 @@ Environment:
 
 Exit codes: 0 success, 2 transport error (cannot connect, TLS failure,
 timeout, the gate closed the connection without answering, a malformed or
-truncated HTTP answer), upstream error, malformed gate answer or a response
-over the size cap, 3 refused by the gate (denied or rejected), 4 gate decision
-"expired", 5 gate unavailable (503, retry later), 64 usage/config error
-(including a malformed AP_BASE), 70 unexpected internal error.
+truncated HTTP answer), upstream error, malformed gate answer (including an
+unknown refusal code) or a response over the size cap, 3 refused by the gate
+(denied or rejected), 4 gate decision "expired", 5 gate unavailable (503,
+retry later), 64 usage/config error (including a malformed AP_BASE), 70
+unexpected internal error, 130 interrupted (SIGINT).
 Code 4 is part of the design but stage 2 (in review). Main sends "expired"
 only from its stage 1 measurement probe, which this caller cannot reach; no
 production path sends it.
@@ -58,18 +59,40 @@ is the abort signal for an upstream failure after the request was sent, so the
 write may have reached Discord. Do not treat it as "nothing was sent".
 
 Key safety: the caller key travels in the request path in the default form, so
-every error message here is fixed text. No message, exception string or
-traceback ever contains a URL, the /ap/<key> prefix or the key. AP_BASE is
-validated before any URL holding the key is built, and every exception raised
-while building or sending the request is mapped to a fixed message.
+every diagnostic here is fixed text. No message, exception string or traceback
+ever contains a URL, the /ap/<key> prefix or the key, and an invalid command,
+channel id, method, placement, route or header name is never echoed back.
+AP_BASE is validated before any URL holding the key is built, and every
+exception raised while building or sending the request is mapped to a fixed
+message.
+
+Single output path: everything written to stdout or stderr goes through
+_emit(). It removes the configured key in every form it can take (raw,
+percent-encoded in either hex case, JSON \\u00XX and HTML entity escapes,
+case-mixed), any "/ap/..." prefix, any "apk_..." token, any 64-hex run and any
+run of 40 or more token characters (which also covers the key's hex and
+base64 forms); it replaces
+control and other non-printable characters with "?" (newline and tab are kept);
+and it truncates to MAX_STDOUT_CHARS (stdout) or MAX_STDERR_CHARS (stderr).
+run() also replaces sys.stdout and sys.stderr with guards that call _emit(), so
+even a stray print() is scrubbed; test_caller.py fails the build if the source
+holds a bare print or a direct stream write. This covers channels the caller
+does not control: a server or reverse proxy that echoes the request target in
+an error body, in a gate-shaped body's "code", or in a 2xx body. The
+redaction is a last line of defence, not a reason to send the key to the wrong
+host: a misdirected AP_BASE has already received it, so rotate the key.
 
 Bounds: a response body is capped at MAX_RESPONSE_BYTES (8 MiB). A declared
 Content-Length over the cap is rejected before reading, and reads stop at
 cap + 1 bytes on both the success and the HTTP error path (exit 2). A body
 shorter than its declared Content-Length is a transport error (exit 2). An
-upstream error body is echoed to stderr truncated to MAX_SHOWN_CHARS. The whole
-exchange has a wall-clock budget of TOTAL_TIMEOUT_SECS (60 s), checked
-between reads, on top of the 30 s per-socket-operation timeout.
+upstream error body is echoed to stderr scrubbed and truncated to
+MAX_SHOWN_CHARS. The whole exchange (connect, headers and body) has a hard
+wall-clock budget of TOTAL_TIMEOUT_SECS (60 s) enforced with a SIGALRM interval
+timer that interrupts a blocked read, so a peer that drips one byte at a time
+cannot extend it; the 30 s per-socket-operation timeout still applies inside
+it. Where setitimer is unavailable (non-POSIX, or off the main thread) the
+budget is only checked between reads.
 
 Transport hardening: all requests go through an explicit opener with no
 redirect following and no ambient proxy. The gate forwards without following
@@ -83,6 +106,7 @@ import http.client
 import json
 import os
 import re
+import signal
 import socket
 import ssl
 import sys
@@ -91,17 +115,28 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-KEY_RE = re.compile(r"^apk_[0-9a-f]{64}$")
-SNOWFLAKE_RE = re.compile(r"^\d+$")
-ROUTE_RE = re.compile(r"^[a-z0-9-]+$")
-HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9-]+$")
+# fullmatch with ASCII classes: "$" would accept a trailing newline, \d a non-ASCII digit.
+KEY_RE = re.compile(r"apk_[0-9a-f]{64}")
+SNOWFLAKE_RE = re.compile(r"[0-9]+")
+ROUTE_RE = re.compile(r"[a-z0-9-]+")
+HEADER_NAME_RE = re.compile(r"[A-Za-z0-9-]+")
 DECISIONS = {"denied", "rejected", "unavailable", "expired"}
+# Every code ap_core::outcome::render_passthrough can send, plus the stage 2
+# "expired". Any other code is a malformed gate answer, never echoed.
+KNOWN_CODES = {
+    "no_grant", "route_unknown", "caller_rejected", "path_ambiguous", "host_rejected",
+    "absolute_form", "framing_refused", "authorization_duplicate", "connect_refused",
+    "websocket_unsupported", "body_too_large", "policy_unavailable", "body_read_timeout",
+    "connect_failed", "probe_params", "caller_key_ambiguous", "expired",
+}
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 SOCKET_TIMEOUT_SECS = 30
 MAX_SHOWN_CHARS = 2048  # of an upstream error body echoed to stderr
+MAX_STDOUT_CHARS = MAX_RESPONSE_BYTES  # one success body is never cut below the response cap
+MAX_STDERR_CHARS = 4096  # any single diagnostic, after the body was cut to MAX_SHOWN_CHARS
 TOTAL_TIMEOUT_SECS = 60
 # scheme://host[:port] only: a bracketed IPv6 literal, or a DNS name / IPv4.
-BASE_RE = re.compile(r"^(https?)://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?/?$")
+BASE_RE = re.compile(r"(https?)://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?/?")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -121,18 +156,94 @@ class _TooLarge(Exception):
     """A response body went over MAX_RESPONSE_BYTES."""
 
 
-class _Deadline(Exception):
-    """The wall-clock budget for one exchange ran out."""
+class _Deadline(BaseException):
+    """The wall-clock budget for one exchange ran out. A BaseException so that
+    no `except Exception` inside http.client or urllib can swallow it."""
+
+
+# ---- the one output path -------------------------------------------------
+
+_secret_values: list[str] = []
+_scrub_re: "re.Pattern[str] | None" = None
+# Control characters (newline and tab kept), line/paragraph separators, bidi
+# overrides, surrogates and private-use characters.
+_NONPRINTABLE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069\ud800-\udfff\ue000-\uf8ff]")
+_GENERIC_SCRUB = re.compile(
+    r"/ap/[^\s\"'<>,}\]]*"            # an /ap/<key> prefix, and what follows it up to a delimiter
+    r"|apk_[A-Za-z0-9_%\\-]*"          # any caller-key-shaped token
+    r"|[0-9A-Fa-f]{64}"                 # any 64-hex value (a key body, a sha256)
+    r"|[A-Za-z0-9_-]{40,}"              # any other token-shaped run
+)
+REDACTED = "[redacted]"
+
+
+def _char_pattern(ch: str) -> str:
+    """One character of a secret, as itself, %XX, \\u00XX, &#N; or &#xHH;."""
+    n = ord(ch)
+    alts = [re.escape(ch), f"%{n:02x}", f"\\\\u{n:04x}", f"&#{n};", f"&#x{n:x};"]
+    return "(?:" + "|".join(alts) + ")"
+
+
+def register_secrets(*values: str) -> None:
+    """Set the values _emit() must never print, and compile the scrubber."""
+    global _scrub_re
+    _secret_values[:] = [v for v in values if v and len(v) >= 8]
+    parts = ["".join(_char_pattern(c) for c in v) for v in _secret_values]
+    _scrub_re = re.compile("|".join(parts), re.IGNORECASE) if parts else None
+
+
+def scrub(text: str, limit: int) -> str:
+    """Remove secrets and token-shaped values, replace non-printable
+    characters, then truncate to `limit` characters (marker included)."""
+    text = str(text)
+    if _scrub_re is not None:
+        text = _scrub_re.sub(REDACTED, text)
+    text = _GENERIC_SCRUB.sub(REDACTED, text)
+    text = _NONPRINTABLE.sub("?", text)
+    if len(text) > limit:
+        text = text[:max(0, limit - 14)] + "...(truncated)"
+    return text
+
+
+_raw_streams: dict[bool, object] = {}
+
+
+def _emit(text: str, err: bool = True, newline: bool = True) -> None:
+    """The only function that writes to stdout or stderr."""
+    raw = _raw_streams.get(err) or (sys.stderr if err else sys.stdout)
+    out = scrub(text, MAX_STDERR_CHARS if err else MAX_STDOUT_CHARS) + ("\n" if newline else "")
+    enc = getattr(raw, "encoding", None) or "utf-8"
+    raw.write(out.encode(enc, "replace").decode(enc, "replace"))
+
+
+class _Guard:
+    """Stands in for sys.stdout / sys.stderr so that any write, even a stray
+    print(), passes through _emit()."""
+
+    def __init__(self, err: bool) -> None:
+        self.err = err
+
+    def write(self, text: str) -> int:
+        _emit(text, self.err, newline=False)
+        return len(text)
+
+    def flush(self) -> None:
+        raw = _raw_streams.get(self.err)
+        if raw is not None:
+            raw.flush()
+
+    def isatty(self) -> bool:
+        return False
 
 
 def die(message: str, code: int = 64) -> "SystemExit":
-    print(f"caller: {message}", file=sys.stderr)
+    _emit(f"caller: {message}")
     raise SystemExit(code)
 
 
 def _require_snowflake(value: str, what: str) -> str:
-    if not SNOWFLAKE_RE.match(value or ""):
-        die(f"{what} must be a numeric (snowflake) id, got {value!r}")
+    if not SNOWFLAKE_RE.fullmatch(value or ""):
+        die(f"{what} must be a numeric (snowflake) id")
     return value
 
 
@@ -144,14 +255,14 @@ def _validate_internal_path(path: str) -> str:
     # Internal call sites may use a query string (e.g. ?limit=), but a
     # fragment or control characters are never legitimate.
     if not path.startswith("/") or "#" in path or _has_control(path):
-        die(f"path must be an origin-form path starting with '/' with no fragment or control characters, got {path!r}")
+        die("path must be an origin-form path starting with '/' with no fragment or control characters")
     return path
 
 
 def _validate_user_path(path: str) -> str:
     # User-supplied `request` paths: no query or fragment injection either.
     if not path.startswith("/") or "#" in path or "?" in path or _has_control(path) or " " in path:
-        die(f"path must be an origin-form path starting with '/' with no query, fragment, space or control characters, got {path!r}")
+        die("path must be an origin-form path starting with '/' with no query, fragment, space or control characters")
     return path
 
 
@@ -163,7 +274,7 @@ def _validate_base(raw: str) -> str:
     bad = "AP_BASE must be http:// or https:// followed by a host and an optional port only (no path, query, fragment, userinfo, whitespace or control characters)"
     if not raw.isascii() or _has_control(raw) or " " in raw or "\\" in raw:
         die(bad)
-    m = BASE_RE.match(raw)
+    m = BASE_RE.fullmatch(raw)
     if not m:
         die(bad)
     try:
@@ -172,7 +283,7 @@ def _validate_base(raw: str) -> str:
         host = parts.hostname
     except ValueError:
         die(bad)
-    if not host or parts.query or parts.fragment or "?" in raw or "#" in raw or "@" in raw:
+    if not host or parts.query or parts.fragment or "?" in raw or "#" in raw:
         die(bad)
     if port is not None and not 0 < port < 65536:
         die(bad)
@@ -204,14 +315,14 @@ class Caller:
         self.key_header = os.environ.get("AP_KEY_HEADER", "X-AP-Caller-Key")
         self.route = os.environ.get("AP_ROUTE", "discord")
         self.authorization = os.environ.get("AP_AUTHORIZATION", "")
-        if not KEY_RE.match(self.caller_key):
+        if not KEY_RE.fullmatch(self.caller_key):
             die("AP_CALLER_KEY must be apk_ followed by 64 lowercase hex characters")
         if self.placement not in ("path", "header"):
-            die(f"AP_KEY_PLACEMENT must be 'path' or 'header', got {self.placement!r}")
-        if not HEADER_NAME_RE.match(self.key_header):
-            die(f"AP_KEY_HEADER is not a valid header name: {self.key_header!r}")
-        if not ROUTE_RE.match(self.route):
-            die(f"AP_ROUTE must be lowercase letters, digits and '-', got {self.route!r}")
+            die("AP_KEY_PLACEMENT must be 'path' or 'header'")
+        if not HEADER_NAME_RE.fullmatch(self.key_header):
+            die("AP_KEY_HEADER is not a valid header name")
+        if not ROUTE_RE.fullmatch(self.route):
+            die("AP_ROUTE must be lowercase letters, digits and '-'")
         if _has_control(self.authorization):
             die("AP_AUTHORIZATION must not contain control characters")
 
@@ -230,7 +341,19 @@ class Caller:
         """Return (status, text) or a fixed failure message. Never raises and
         never formats the URL, the exception text or the exception chain."""
         deadline = time.monotonic() + TOTAL_TIMEOUT_SECS
+        old_handler = old_timer = None
         try:
+            # Hard total budget: an interval timer interrupts a blocked read,
+            # which a between-reads check cannot (a peer dripping one byte at a
+            # time stays inside the per-operation timeout forever).
+            if hasattr(signal, "setitimer"):
+                def _on_alarm(_signum, _frame):
+                    raise _Deadline
+                try:
+                    old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+                    old_timer = signal.setitimer(signal.ITIMER_REAL, TOTAL_TIMEOUT_SECS)
+                except ValueError:  # not the main thread: fall back to the between-reads check
+                    old_handler = old_timer = None
             data = json.dumps(body).encode() if body is not None else None
             req = urllib.request.Request(url, data=data, method=method)
             if self.placement == "header":
@@ -251,6 +374,12 @@ class Caller:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
             return _failure_message(exc)
+        finally:
+            if old_handler is not None:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old_handler)
+                if old_timer and old_timer[0] > 0:
+                    signal.setitimer(signal.ITIMER_REAL, old_timer[0], old_timer[1])
 
     def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, str]:
         """One call through the gate. Returns (status, body text)."""
@@ -299,6 +428,8 @@ def _failure_message(exc: BaseException) -> str:
             return "cannot reach the gate (connection refused)"
         return ("the gate closed the connection without a complete answer; this is not a refusal, "
                 "and the request may already have reached Discord")
+    if isinstance(exc, http.client.InvalidURL):
+        return "the request could not be built (invalid URL or header value)"
     if isinstance(exc, http.client.HTTPException):
         return "malformed or truncated HTTP answer from the gate"
     if isinstance(exc, urllib.error.URLError) or isinstance(exc, OSError):
@@ -309,7 +440,12 @@ def _failure_message(exc: BaseException) -> str:
 
 
 def report_refusal(status: int, decision: str, code: str) -> int:
-    print(f"caller: the gate answered {status} {decision}/{code}; nothing was sent to Discord", file=sys.stderr)
+    """Print one fixed-shape line and return the exit code. A decision or code
+    outside the gate's vocabulary is a malformed answer: fixed text, exit 2."""
+    if decision not in DECISIONS or code not in KNOWN_CODES or not isinstance(status, int):
+        _emit("caller: malformed answer from the gate (unknown refusal code)")
+        return 2
+    _emit(f"caller: the gate answered {status} {decision}/{code}; nothing was sent to Discord")
     if decision == "expired":
         return 4
     if decision == "unavailable":
@@ -351,42 +487,52 @@ def main(argv: list[str]) -> int:
             die("usage: caller.py request <METHOD> <path> [json-body]")
         path = _validate_user_path(args[1])
         if not re.fullmatch(r"[A-Za-z]+", args[0] or ""):
-            die(f"method must be alphabetic, got {args[0]!r}")
+            die("method must be alphabetic")
         try:
             body = json.loads(args[2]) if len(args) > 2 else None
-        except ValueError as exc:
-            die(f"invalid JSON body: {exc}")
+        except ValueError:
+            die("invalid JSON body")
         status, text = caller.request(args[0].upper(), path, body)
     else:
-        die(f"unknown command: {command}")
+        die("unknown command (expected get-messages, send or request)")
 
     decision = gate_decision(text) if status >= 400 else None
     if decision is not None:
         return report_refusal(status, *decision)
     if 200 <= status < 300:
-        print(text)
+        _emit(text, err=False)
         return 0
-    shown = text if len(text) <= MAX_SHOWN_CHARS else text[:MAX_SHOWN_CHARS] + "...(truncated)"
-    print(f"caller: upstream or transport answered {status}: {shown}", file=sys.stderr)
+    # Scrub before cutting, so a key straddling the cut cannot survive as a prefix.
+    shown = scrub(text, MAX_SHOWN_CHARS)
+    _emit(f"caller: upstream or transport answered {status}: {shown}")
     return 2
 
 
 def run(argv: list[str]) -> int:
-    """main() behind a top-level guard: an unexpected exception prints fixed
-    text and exits 70, never a traceback (a traceback can carry the key)."""
+    """main() behind a top-level guard: the configured secrets are registered,
+    sys.stdout and sys.stderr are replaced by guards that scrub every write, and
+    an unexpected exception prints fixed text and exits 70, never a traceback
+    (a traceback can carry the key)."""
+    register_secrets(os.environ.get("AP_CALLER_KEY", ""))
+    saved = sys.stdout, sys.stderr
+    _raw_streams[False], _raw_streams[True] = saved
+    sys.stdout, sys.stderr = _Guard(False), _Guard(True)
     try:
         return main(argv)
     except SystemExit:
         raise
     except KeyboardInterrupt:
-        print("caller: interrupted", file=sys.stderr)
+        _emit("caller: interrupted")
         return 130
     except BaseException:  # noqa: BLE001
         try:
-            print("caller: unexpected internal error (details withheld)", file=sys.stderr)
+            _emit("caller: unexpected internal error (details withheld)")
         except BaseException:  # noqa: BLE001
             pass
         return 70
+    finally:
+        sys.stdout, sys.stderr = saved
+        _raw_streams.clear()
 
 
 if __name__ == "__main__":

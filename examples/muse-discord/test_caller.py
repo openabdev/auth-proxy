@@ -32,7 +32,24 @@ Covered:
      non-JSON bodies, forced exceptions of every transport class, an
      unexpected exception) checks the exit code and that neither the caller
      key nor "/ap/" ever reaches stdout or stderr, and no traceback is shown,
- 12. response bodies are capped on the success and the HTTP error path.
+ 12. response bodies are capped on the success and the HTTP error path, and
+     the read stops at cap + 1 bytes (a never-ending stream is cut off),
+ 13. the key never reaches stdout or stderr through ANY channel: it is
+     duplicated into each reflected input (command, channel id, limit,
+     message id, method, path, JSON body, AP_KEY_PLACEMENT, AP_ROUTE,
+     AP_KEY_HEADER, AP_BASE) and into 2xx, 4xx and 5xx response bodies, a
+     gate-shaped body's "code", and the request line and headers echoed back,
+     each in raw, upper-case, percent-encoded (lower, upper, mixed), JSON
+     \\u escaped, hex and base64 forms; no key, "apk_", "/ap/" or traceback
+     appears on either stream for any exit code,
+ 14. every write goes through caller._emit: an AST check forbids a bare
+     print or a direct stream write, and a stray print/write inside the
+     guarded run() is scrubbed,
+ 15. the 60 s total budget is a hard one: scaled slow-drip peers (headers and
+     body) end near the configured total, not at the drip's own pace,
+ 16. the mock reads its route set from the policy (a temporary policy with a
+     second route is recognised), and an unknown refusal code is a malformed
+     gate answer (exit 2, never echoed).
 
 No reusable credential material is committed: the caller key below is
 generated per run and passed to the mock through its environment.
@@ -40,6 +57,8 @@ generated per run and passed to the mock through its environment.
 Run: python3 test_caller.py   (stdlib only, binds loopback ports only)
 """
 
+import ast
+import base64
 import contextlib
 import io
 import json
@@ -50,7 +69,9 @@ import socketserver
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from http import client as http_client
@@ -133,8 +154,10 @@ def start_raw_server(behave, partial: bool = False) -> socketserver.ThreadingTCP
     return server
 
 
-def start_mock(redirect_location: str = "") -> tuple[subprocess.Popen, str]:
+def start_mock(redirect_location: str = "", policy: str = "") -> tuple[subprocess.Popen, str]:
     env = dict(os.environ, MOCK_PORT="0", MOCK_CALLER_KEY=CALLER_KEY)
+    if policy:
+        env["MOCK_POLICY"] = policy
     if redirect_location:
         env["MOCK_REDIRECT_LOCATION"] = redirect_location
     proc = subprocess.Popen(
@@ -151,8 +174,10 @@ def start_mock(redirect_location: str = "") -> tuple[subprocess.Popen, str]:
 
 
 def run_caller(base: str, args: list[str], key: str = CALLER_KEY, placement: str = "path",
-               authorization: str | None = AUTHORIZATION, route: str = "discord"):
+               authorization: str | None = AUTHORIZATION, route: str = "discord",
+               env_extra: dict | None = None):
     env = dict(os.environ, AP_BASE=base, AP_CALLER_KEY=key, AP_KEY_PLACEMENT=placement, AP_ROUTE=route)
+    env.update(env_extra or {})
     env.pop("AP_AUTHORIZATION", None)
     if authorization is not None:
         env["AP_AUTHORIZATION"] = authorization
@@ -178,10 +203,60 @@ def run_inproc(argv: list[str]) -> tuple[int, str, str]:
     return rc, out.getvalue(), err.getvalue()
 
 
+def key_forms(key: str = CALLER_KEY) -> dict[str, str]:
+    """The key as a server, proxy or error page might reflect it."""
+    pct = "".join(f"%{ord(c):02x}" for c in key)
+    mixed = "".join(f"%{ord(c):02X}" if i % 2 else c for i, c in enumerate(key))
+    return {
+        "raw": key,
+        "upper": key.upper(),
+        "case-mixed": "".join(c.upper() if i % 2 else c for i, c in enumerate(key)),
+        "pct-lower": pct,
+        "pct-upper": pct.upper(),
+        "pct-mixed": mixed,
+        "json-u": "".join(f"\\u{ord(c):04x}" for c in key),
+        "html-entity": "".join(f"&#{ord(c)};" for c in key),
+        "hex-bytes": key.encode().hex(),
+        "base64": base64.b64encode(key.encode()).decode(),
+        "base64url": base64.urlsafe_b64encode(key.encode()).decode(),
+        "ap-prefix": f"/ap/{key}/discord",
+    }
+
+
 def check_no_leak(name: str, output: str, key: str = CALLER_KEY) -> None:
+    forms = key_forms(key)
+    seen = [n for n, f in forms.items() if f in output]
     check(f"no key or /ap/ prefix in output: {name}",
           key not in output and "/ap/" not in output and "apk_" not in output
-          and "Traceback" not in output, output[:300].replace(key, "<KEY>"))
+          and "Traceback" not in output and not seen, f"{seen} {output[:300]}".replace(key, "<KEY>"))
+
+
+def signal_state_restored() -> bool:
+    import signal
+    return signal.getsignal(signal.SIGALRM) in (signal.SIG_DFL, signal.SIG_IGN, None) \
+        and signal.getitimer(signal.ITIMER_REAL)[0] == 0
+
+
+def run_inproc_forced_invalid_url() -> tuple[int, str, str]:
+    saved_open, saved_env = caller_mod._OPENER.open, dict(os.environ)
+    try:
+        os.environ.update(AP_BASE="http://127.0.0.1:9", AP_CALLER_KEY=CALLER_KEY)
+
+        def boom(*_a, **_k):
+            raise http_client.InvalidURL(f"can't contain control characters {CALLER_KEY}")
+        caller_mod._OPENER.open = boom
+        return run_inproc(["caller.py", "get-messages", CHANNEL])
+    finally:
+        caller_mod._OPENER.open = saved_open
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+
+def run_inproc_report(decision: str, code: str) -> tuple[int, str]:
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc = caller_mod.report_refusal(423, decision, code)
+    return rc, err.getvalue()
 
 
 def http(base: str, method: str, path: str, headers: list[tuple[str, str]] | None = None,
@@ -440,6 +515,285 @@ def main() -> int:
         caller_mod.main = real_main
         os.environ.clear()
         os.environ.update(saved_env)
+
+
+    # 13. The key through every channel: reflected inputs and response bodies.
+    forms = key_forms()
+    dead_base = f"http://127.0.0.1:{dead_port}"
+    for fname, form in forms.items():
+        # Reflected inputs (the messages are fixed text, so a few forms suffice): each of these used to be echoed back on exit 64.
+        reflected = [
+            (["get-messages", form], {}), (["get-messages", CHANNEL, form], {}),
+            (["send", form, "hi"], {}), (["send", CHANNEL, "hi", "--reply-to", form], {}),
+            ([form], {}), (["request", form, "/x"], {}), (["request", "GET", form], {}),
+            (["request", "GET", "/x", form], {}), (["request", "GET", "/x?" + form], {}),
+            (["request", "GET", "/" + form], {}), (["request", "GET", "/x", '{"a":"' + form + '"'], {}),
+            (["get-messages", CHANNEL], {"AP_KEY_PLACEMENT": form}),
+            (["get-messages", CHANNEL], {"AP_ROUTE": form}),
+            (["get-messages", CHANNEL], {"AP_KEY_HEADER": form}),
+            (["get-messages", CHANNEL], {"AP_BASE": "http://" + form}),
+        ]
+        for args, env_extra in (reflected if fname in ("raw", "case-mixed", "pct-lower", "ap-prefix") else []):
+            r = run_caller(dead_base, args, env_extra=env_extra)
+            out = r.stdout + r.stderr
+            check(f"reflected input [{fname}] {args[0][:12]!r} {sorted(env_extra)}: no key in any form, "
+                  f"exit {r.returncode} is documented",
+                  r.returncode in (2, 64) and not [n for n, f in forms.items() if f in out]
+                  and "Traceback" not in out and "apk_" not in out and "/ap/" not in out, out[:200])
+            check(f"reflected input [{fname}] {sorted(env_extra)}: bounded output", len(out) < 4096, str(len(out)))
+        # Response bodies that echo the request target or the key.
+        def serve(status, body_fn, ctype="text/plain"):
+            def behave(conn, req):
+                body = body_fn(req)
+                conn.sendall((f"HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n"
+                              "Connection: close\r\n\r\n").encode() + body)
+            return behave
+        bodies = {
+            "4xx echo": (404, lambda req, f=form: f"Cannot GET /ap/{f}/discord/x".encode(), 2),
+            "4xx key only": (400, lambda req, f=form: f.encode(), 2),
+            "5xx echo": (500, lambda req, f=form: f"upstream echoed /ap/{f}/discord".encode(), 2),
+            "5xx json path": (502, lambda req, f=form: json.dumps({"path": f"/ap/{f}/discord"}).encode(), 2),
+            "gate-shaped code=key": (423, lambda req, f=form: json.dumps(
+                {"ap_decision": "denied", "code": f}).encode(), 2),
+            "gate-shaped code=/ap/key": (400, lambda req, f=form: json.dumps(
+                {"ap_decision": "rejected", "code": f"/ap/{f}/x"}).encode(), 2),
+            "2xx reflects request": (200, lambda req: req, 0),
+            "4xx reflects request": (400, lambda req: req, 2),
+            "2xx key only": (200, lambda req, f=form: f.encode(), 0),
+        }
+        for bname, (status, body_fn, want_rc) in bodies.items():
+            server = start_raw_server(serve(status, body_fn))
+            try:
+                for placement in (("path", "header") if fname == "raw" else ("path",)):
+                    r = run_caller(f"http://127.0.0.1:{server.server_address[1]}", ["get-messages", CHANNEL],
+                                   placement=placement)
+                    out = r.stdout + r.stderr
+                    check(f"{bname} [{fname}] ({placement}): exit {want_rc}", r.returncode == want_rc,
+                          f"rc={r.returncode} {out[:200]}")
+                    check(f"{bname} [{fname}] ({placement}): no form of the key on any stream",
+                          not [n for n, f in forms.items() if f in out] and "apk_" not in out
+                          and "/ap/" not in out and "Traceback" not in out, out[:200])
+                    check(f"{bname} [{fname}] ({placement}): output bounded",
+                          len(r.stderr) < 8192, str(len(r.stderr)))
+                    if bname.startswith("gate-shaped"):
+                        check(f"{bname} [{fname}] ({placement}): unknown code is a fixed malformed-answer message",
+                              "malformed answer from the gate" in r.stderr and "nothing was sent" not in r.stderr, r.stderr)
+            finally:
+                server.shutdown()
+                server.server_close()
+    # Invalid inputs are never echoed: a harmless sentinel in each slot must not come back.
+    sentinel = "ZZ1SENTINEL1ZZ"
+    slots = [
+        (["get-messages", sentinel], {}), (["get-messages", CHANNEL, sentinel], {}),
+        (["send", sentinel, "hi"], {}), (["send", CHANNEL, "hi", "--reply-to", sentinel], {}),
+        ([sentinel], {}), (["request", sentinel, "/x"], {}), (["request", "GET", sentinel], {}),
+        (["request", "GET", "/x", sentinel], {}), (["request", "GET", "/x?" + sentinel], {}),
+        (["get-messages", CHANNEL], {"AP_KEY_PLACEMENT": sentinel}),
+        (["get-messages", CHANNEL], {"AP_ROUTE": sentinel}),
+        (["get-messages", CHANNEL], {"AP_KEY_HEADER": sentinel + " bad"}),
+        (["get-messages", CHANNEL], {"AP_BASE": "http://" + sentinel + "/p"}),
+    ]
+    for args, env_extra in slots:
+        r = run_caller(dead_base, args, env_extra=env_extra)
+        check(f"invalid input is never echoed: {args[0][:12]!r} {sorted(env_extra)}",
+              r.returncode == 64 and sentinel not in r.stdout + r.stderr and r.stderr.startswith("caller: "),
+              f"rc={r.returncode} {r.stderr[:200]}")
+    # A caller-key header echoed back in error text, for the header placement.
+    server = start_raw_server(lambda conn, req: conn.sendall(
+        b"HTTP/1.1 400 X\r\nContent-Length: " + str(len(req)).encode() + b"\r\nConnection: close\r\n\r\n" + req))
+    try:
+        r = run_caller(f"http://127.0.0.1:{server.server_address[1]}", ["get-messages", CHANNEL], placement="header")
+        check("header placement: echoed X-AP-Caller-Key is redacted", r.returncode == 2 and "redacted" in r.stderr, r.stderr[:200])
+    finally:
+        server.shutdown()
+        server.server_close()
+    # Control characters in a body are replaced, and the output is bounded.
+    server = start_raw_server(lambda conn, req: conn.sendall(
+        b"HTTP/1.1 500 X\r\nContent-Length: 34\r\nConnection: close\r\n\r\n\x1b[31mred\x00\x07 \xe2\x80\xae" + b"A" * 20))
+    try:
+        r = run_caller(f"http://127.0.0.1:{server.server_address[1]}", ["get-messages", CHANNEL])
+        check("non-printable characters in a body are replaced", all(
+            ch in "\n\t" or (32 <= ord(ch) < 127) or ord(ch) > 159 and ch != "\u202e" for ch in r.stderr)
+            and "\x1b" not in r.stderr and "\u202e" not in r.stderr and "?[31mred" in r.stderr, repr(r.stderr))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    # 14. One output path. Nothing in caller.py prints or writes a stream directly.
+    tree = ast.parse(open(os.path.join(HERE, "caller.py")).read())
+    allowed_funcs = {"_emit", "run"}  # _emit writes the raw stream; run installs the guards
+    offences = []
+
+    def walk(node, func):
+        for child in ast.iter_child_nodes(node):
+            name = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else func
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id in ("print", "input", "exec"):
+                offences.append(f"call {child.func.id}() line {child.lineno}")
+            if (isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name) and child.value.id == "sys"
+                    and child.attr in ("stdout", "stderr", "__stdout__", "__stderr__") and func not in allowed_funcs):
+                offences.append(f"sys.{child.attr} line {child.lineno} in {func}")
+            if (isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name)
+                    and child.value.id in ("traceback", "faulthandler", "logging", "warnings")):
+                offences.append(f"{child.value.id}.{child.attr} line {child.lineno}")
+            if (isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name) and child.value.id == "os"
+                    and child.attr in ("write", "writev", "dup2", "fdopen")):
+                offences.append(f"os.{child.attr} line {child.lineno}")
+            walk(child, name)
+    walk(tree, "<module>")
+    check("caller.py has no bare print and no direct stream write outside _emit/run", not offences, "; ".join(offences))
+    raw_writes = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and n.func.attr in ("write", "writelines", "buffer")]
+    emit_src = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_emit")
+    allowed_lines = set(range(emit_src.lineno, emit_src.end_lineno + 1))
+    check("the only .write() call in caller.py is inside _emit", all(l in allowed_lines for l in raw_writes), str(raw_writes))
+    # A stray print() or stream write inside the guarded run() is scrubbed.
+    saved_env = dict(os.environ)
+    real_main = caller_mod.main
+    try:
+        os.environ.update(AP_BASE="http://127.0.0.1:9", AP_CALLER_KEY=CALLER_KEY)
+
+        def stray(_argv):
+            print("stray print", CALLER_KEY, f"/ap/{CALLER_KEY}/x")
+            sys.stderr.write("stray write " + CALLER_KEY.upper() + "\n")
+            sys.stdout.write("x" * 10 + "".join(f"%{ord(c):02x}" for c in CALLER_KEY) + "\n")
+            return 0
+        caller_mod.main = stray
+        rc, out, err = run_inproc(["caller.py"])
+        check("a stray print or stream write inside run() is scrubbed",
+              rc == 0 and "stray print" in out and "stray write" in err
+              and CALLER_KEY not in out + err and CALLER_KEY.upper() not in out + err
+              and "apk_" not in (out + err).lower() and "%61%70%6b%5f" not in out and "%70%6b" not in out, f"{out!r} {err!r}")
+    finally:
+        caller_mod.main = real_main
+        os.environ.clear()
+        os.environ.update(saved_env)
+    # scrub() itself: truncation and the generic token rules.
+    caller_mod.register_secrets(CALLER_KEY)
+    check("scrub truncates to the documented maximum",
+          len(caller_mod.scrub("a b" * 5000, 100)) == 100 and caller_mod.scrub("a b" * 5000, 100).endswith("...(truncated)"))
+    check("scrub removes an apk_ token and a 64-hex value that are not the configured key",
+          "apk_" not in caller_mod.scrub("x apk_" + "a1" * 32 + " y", 999) and "a1" * 32 not in caller_mod.scrub("h " + "a1" * 32, 999))
+    check("scrub removes a long token-shaped value", "T" * 45 not in caller_mod.scrub("tok " + "T" * 45, 999))
+    check("scrub leaves ordinary text alone", caller_mod.scrub("hello, world 123\n", 999) == "hello, world 123\n")
+    caller_mod.register_secrets()
+
+    # An endless body is cut off at cap + 1 bytes: count what the server managed to send.
+    sent = []
+
+    def endless(conn, req):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+        total = 0
+        piece = b"y" * 65536
+        try:
+            while total < 4 * cap:
+                conn.sendall(piece)
+                total += len(piece)
+        except OSError:
+            pass
+        finally:
+            sent.append(total)
+    server = start_raw_server(endless)
+    try:
+        r = run_caller(f"http://127.0.0.1:{server.server_address[1]}", ["get-messages", CHANNEL])
+        time.sleep(0.5)
+        check("an endless body is cut off near the cap (reads stop at cap + 1)",
+              r.returncode == 2 and sent and sent[0] < 2 * cap, f"rc={r.returncode} sent={sent}")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    # KeyboardInterrupt raised inside the request itself is exit 130, not "unexpected error".
+    saved_open = caller_mod._OPENER.open
+    saved_env = dict(os.environ)
+    try:
+        os.environ.update(AP_BASE="http://127.0.0.1:9", AP_CALLER_KEY=CALLER_KEY)
+
+        def interrupt(*_a, **_k):
+            raise KeyboardInterrupt
+        caller_mod._OPENER.open = interrupt
+        rc, out, err = run_inproc(["caller.py", "get-messages", CHANNEL])
+        check("KeyboardInterrupt inside the request: exit 130", rc == 130 and err == "caller: interrupted\n", f"rc={rc} {err!r}")
+    finally:
+        caller_mod._OPENER.open = saved_open
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+    # 15. The total budget is hard: scaled slow-drip peers.
+    def drip_body(conn, req):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n")
+        for _ in range(60):
+            conn.sendall(b"z")
+            time.sleep(0.15)
+
+    def drip_headers(conn, req):
+        for ch in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"a" * 60:
+            conn.sendall(bytes([ch]))
+            time.sleep(0.15)
+
+    saved_total, saved_sock = caller_mod.TOTAL_TIMEOUT_SECS, caller_mod.SOCKET_TIMEOUT_SECS
+    saved_env = dict(os.environ)
+    try:
+        caller_mod.TOTAL_TIMEOUT_SECS, caller_mod.SOCKET_TIMEOUT_SECS = 1.0, 0.8
+        for dname, behave in (("body", drip_body), ("headers", drip_headers)):
+            server = start_raw_server(behave)
+            try:
+                os.environ.update(AP_BASE=f"http://127.0.0.1:{server.server_address[1]}", AP_CALLER_KEY=CALLER_KEY)
+                t0 = time.monotonic()
+                rc, out, err = run_inproc(["caller.py", "get-messages", CHANNEL])
+                elapsed = time.monotonic() - t0
+                check(f"slow-drip {dname}: ends near the total budget (1.0 s), not at the drip's pace",
+                      rc == 2 and "timed out" in err and elapsed < 1.0 + 0.6, f"rc={rc} elapsed={elapsed:.2f} {err!r}")
+                check_no_leak(f"slow-drip {dname}", out + err)
+            finally:
+                server.shutdown()
+                server.server_close()
+        check("the alarm and handler are restored after the exchange",
+              signal_state_restored(), "")
+    finally:
+        caller_mod.TOTAL_TIMEOUT_SECS, caller_mod.SOCKET_TIMEOUT_SECS = saved_total, saved_sock
+        os.environ.clear()
+        os.environ.update(saved_env)
+
+    # 16. The mock reads its routes from the policy: a second route is recognised.
+    with tempfile.TemporaryDirectory() as tmp:
+        policy = os.path.join(tmp, "policy.toml")
+        with open(policy, "w") as fh:
+            fh.write('[[route]]\nname = "discord"\nhost = "discord.com"\nmode = "passthrough"\n\n'
+                     '[[route]]\nname = "second-route"\nhost = "example.invalid"\nmode = "passthrough"\n\n'
+                     '[[grant]]\nidentity = "x"\nroute = "second-route"\nmethods = ["GET"]\npaths = ["/v1/"]\ndecision = "allow"\n')
+        mock2, base2 = start_mock(policy=policy)
+        try:
+            status, headers, text = http(base2, "GET", f"/ap/{CALLER_KEY}/second-route/v1/things")
+            check("mock: a second route from the policy is recognised (granted, answered by the upstream)",
+                  status == 404 and "x-ap-decision" not in headers, f"{status} {text}")
+            status, headers, text = http(base2, "GET", f"/ap/{CALLER_KEY}/second-route/other")
+            check("mock: the second route's grant applies (ungranted path is no_grant)",
+                  status == 423 and json.loads(text)["code"] == "no_grant", f"{status} {text}")
+            status, headers, text = http(base2, "GET", f"/ap/{CALLER_KEY}/discord/api/v10/users/@me")
+            check("mock: a route with no grant in this policy gets no_grant",
+                  status == 423 and json.loads(text)["code"] == "no_grant", f"{status} {text}")
+            status, headers, text = http(base2, "GET", f"/ap/{CALLER_KEY}/third-route/v1/things")
+            check("mock: a route absent from the policy is route_unknown",
+                  status == 423 and json.loads(text)["code"] == "route_unknown", f"{status} {text}")
+        finally:
+            mock2.kill()
+            mock2.wait(timeout=10)
+
+    # Validators accept no trailing newline and no non-ASCII digit.
+    check("key, route, header and id validators use fullmatch",
+          not caller_mod.KEY_RE.fullmatch(CALLER_KEY + "\n") and not caller_mod.ROUTE_RE.fullmatch("discord\n")
+          and not caller_mod.HEADER_NAME_RE.fullmatch("X-A\n") and not caller_mod.SNOWFLAKE_RE.fullmatch("12\n")
+          and not caller_mod.SNOWFLAKE_RE.fullmatch("\u0661\u0662"))
+    r = run_caller(dead_base, ["get-messages", CHANNEL], route="discord\n")
+    check("AP_ROUTE with a trailing newline is exit 64", r.returncode == 64, f"rc={r.returncode} {r.stderr}")
+    r = run_caller(dead_base, ["get-messages", "\u0661\u0662"])
+    check("a non-ASCII digit channel id is exit 64", r.returncode == 64, f"rc={r.returncode} {r.stderr}")
+    rc, out, err = run_inproc_forced_invalid_url()
+    check("InvalidURL is reported as 'could not be built', not as a malformed gate answer",
+          "could not be built" in err and "malformed" not in err, err)
+    # Unknown refusal codes never reach the output.
+    check("report_refusal: an unknown code is exit 2 with fixed text",
+          run_inproc_report("denied", "no/such code") == (2, "caller: malformed answer from the gate (unknown refusal code)\n"))
 
     # 7. Decision mapping, pure helper (the real gate sends 503 unavailable; expired is stage 2).
     body = lambda d, c: json.dumps({"ap_decision": d, "code": c})  # noqa: E731

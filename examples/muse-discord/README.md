@@ -108,20 +108,25 @@ There is no config file in this directory: the policy is the pilot example under
 | Code | Meaning |
 |---|---|
 | 0 | success (2xx) |
-| 2 | transport error (cannot connect, TLS, timeout, connection closed without a complete answer, malformed HTTP), upstream error, malformed gate answer, or response over the cap |
+| 2 | transport error (cannot connect, TLS, timeout, connection closed without a complete answer, malformed HTTP), upstream error, malformed gate answer (including an unknown refusal code), or response over the cap |
 | 3 | refused by the gate (`denied` or `rejected`) |
 | 4 | decision `expired` (stage 2, in review) |
 | 5 | gate `unavailable` (503, retry later) |
 | 64 | usage or configuration error, including a malformed `AP_BASE` |
 | 70 | unexpected internal error (fixed message, no traceback) |
+| 130 | interrupted (SIGINT) |
 
 `AP_BASE` must be `http://` or `https://` plus a host and an optional port:
 no path, query, fragment, userinfo, whitespace or control characters. It is
 validated before any URL holding the caller key is built. Response bodies are
 capped at 8 MiB (a larger declared `Content-Length` is rejected before reading;
-reads stop at cap + 1 bytes) and one exchange has a 60 s wall-clock budget.
-Every error message is fixed text: none contains a URL, the `/ap/<key>` prefix
-or the key, and none is followed by a traceback.
+reads stop at cap + 1 bytes) and one exchange has a hard 60 s wall-clock
+budget, enforced with an interval timer that interrupts a blocked read (a peer
+that sends one byte at a time cannot extend it; on a platform without
+`setitimer` it is only checked between reads). Every diagnostic is fixed text:
+none contains a URL, the `/ap/<key>` prefix or the key, none echoes an invalid
+command, channel id, method, placement or route, and none is followed by a
+traceback.
 
 ## Generating a key
 
@@ -180,7 +185,21 @@ reusable key material is committed here.
   and ambient `http_proxy`/`https_proxy` ignored, so an upstream 3xx is an
   error (exit 2) instead of resending the header to the `Location` host.
   `test_caller.py` pins this with a 302 to a counting external server.
-- The key never reaches stdout or stderr. `test_caller.py` runs every failure
-  mode (malformed bases, refusals, aborted connections, oversized bodies,
-  forced exceptions) with a sentinel key and asserts neither the key nor
-  `/ap/` appears in either stream.
+- The key never reaches stdout or stderr. Every write goes through one output
+  function, `_emit` in `caller.py`, which removes the configured key in every
+  form it can take (raw, case-mixed, percent-encoded, JSON `\u` and HTML
+  escaped), any `/ap/...` prefix, any `apk_...` token, any 64-hex run and any
+  run of 40 or more token characters (which also covers its hex and base64
+  forms), replaces control and other
+  non-printable characters with `?`, and truncates (stdout 8 MiB, one stderr
+  line 4096 characters, an upstream error body 2048). `sys.stdout` and
+  `sys.stderr` are replaced by guards that call it, so even a stray `print` is
+  scrubbed, and `test_caller.py` fails if the source holds a bare `print` or a
+  direct stream write. This also covers a server or reverse proxy that echoes
+  the request target in an error body, in a gate-shaped body's `code`, or in a
+  2xx body; `test_caller.py` runs those, and every reflected input, in each
+  encoding, in real subprocesses and asserts the key, `apk_`, `/ap/` and a
+  traceback never appear on either stream. Content that merely contains
+  `/ap/` or a long token-shaped value is redacted too. A misdirected `AP_BASE`
+  has already received the key in the request, so rotate the key if that
+  happens.

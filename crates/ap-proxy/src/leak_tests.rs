@@ -7,7 +7,7 @@
 //! * The refusal table generates every row of design section 3.5 and checks status,
 //!   `X-AP-Decision`, `code` and the two-key body.
 //!
-//! Panic output and the process journal belong to the real binary; the black-box row PT-27 in
+//! Panic output and the process journal belong to the real binary; the black-box row PT-29 in
 //! `tests/matrix/passthrough.py` covers them.
 
 use std::collections::BTreeSet;

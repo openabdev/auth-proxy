@@ -136,5 +136,5 @@ proxy and Muse retries without bound, stop and rethink the design instead of bui
 cargo build -p ap-proxy -p ap-egress --features ap-proxy/matrix-upstream,ap-proxy/stage1-probe,ap-egress/matrix-upstream
 cargo test -p ap-proxy --features matrix-upstream,stage1-probe --test matrix_passthrough
 python3 tests/matrix/passthrough.py --bin target/debug      # needs an OpenSSL 3 `openssl` on PATH
-python3 tests/matrix/matrix.py --bin target/debug           # sidecar matrix, still 41 rows
+python3 tests/matrix/matrix.py --bin target/debug           # sidecar matrix, 48 rows, the first 41 unchanged
 ```

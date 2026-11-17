@@ -149,6 +149,192 @@ class ValidatorTests(unittest.TestCase):
         copy.edit_pod(mutate)
         self.assert_fails(copy, "runtime-key-mode-0444")
 
+    def _mount_credential(self, copy, container, **extra):
+        def mutate(pod):
+            m = {"name": "kiro-secret", "mountPath": "/var/run/cred-copy", "readOnly": True}
+            m.update(extra)
+            copy.container(pod, container)["volumeMounts"].append(m)
+
+        copy.edit_pod(mutate)
+
+    def test_credential_mounted_in_the_runtime_is_refused(self):
+        copy = Copy(self)
+        self._mount_credential(copy, "runtime")
+        self.assert_fails(copy, "credential-mounted-only-by-proxy")
+
+    def test_credential_mounted_in_the_egress_is_refused(self):
+        copy = Copy(self)
+        self._mount_credential(copy, "egress")
+        self.assert_fails(copy, "credential-mounted-only-by-proxy")
+
+    def test_credential_mounted_in_the_agent_is_refused(self):
+        copy = Copy(self)
+        self._mount_credential(copy, "agent")
+        self.assert_fails(copy, "credential-mounted-only-by-proxy")
+
+    def test_credential_mounted_in_an_init_container_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["initContainers"][0]["volumeMounts"].append(
+                {"name": "kiro-secret", "mountPath": "/cred", "readOnly": True})
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-mounted-only-by-proxy")
+
+    def test_credential_on_a_pvc_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for v in pod["spec"]["volumes"]:
+                if v["name"] == "kiro-secret":
+                    del v["secret"]
+                    v["persistentVolumeClaim"] = {"claimName": "auth-proxy-kiro"}
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-volume-is-secret-type")
+
+    def test_credential_through_a_projected_volume_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for v in pod["spec"]["volumes"]:
+                if v["name"] == "kiro-secret":
+                    del v["secret"]
+                    v["projected"] = {"defaultMode": 292, "sources": [
+                        {"secret": {"name": "auth-proxy-kiro"}}]}
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-volume-is-secret-type")
+
+    def test_other_volume_under_the_credential_directory_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["volumes"].append({"name": "stray", "emptyDir": {}})
+            copy.container(pod, "proxy")["volumeMounts"].append(
+                {"name": "stray", "mountPath": "/var/run/auth-proxy/secrets/other"})
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-dir-only-holds-credential-volume")
+
+    def test_credential_with_the_wrong_mode_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for v in pod["spec"]["volumes"]:
+                if v["name"] == "kiro-secret":
+                    v["secret"]["defaultMode"] = 256  # 0400, unreadable to the proxy UID
+                    # Documented in README: a Secret volume file is not owned by the proxy UID.
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-secret-mode-0444")
+
+    def test_credential_mount_not_read_only_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for m in copy.container(pod, "proxy")["volumeMounts"]:
+                if m["name"] == "kiro-secret":
+                    m.pop("readOnly")
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-mount-read-only")
+
+    def test_credential_in_agent_env_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "agent")["env"].append({"name": "KEY", "valueFrom": {
+                "secretKeyRef": {"name": "auth-proxy-kiro", "key": "api_key"}}})
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-not-referenced-by-env")
+
+    def test_credential_in_runtime_envfrom_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            copy.container(pod, "runtime")["envFrom"] = [{"secretRef": {"name": "auth-proxy-kiro"}}]
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-not-referenced-by-env")
+
+    def _add_ephemeral(self, copy, **fields):
+        def mutate(pod):
+            c = {"name": "debugger", "image": "busybox"}
+            c.update(fields)
+            pod["spec"]["ephemeralContainers"] = [c]
+
+        copy.edit_pod(mutate)
+
+    def test_credential_mounted_in_an_ephemeral_container_is_refused(self):
+        copy = Copy(self)
+        self._add_ephemeral(copy, volumeMounts=[
+            {"name": "kiro-secret", "mountPath": "/cred", "readOnly": True}])
+        self.assert_fails(copy, "credential-mounted-only-by-proxy")
+
+    def test_credential_dir_mount_in_an_ephemeral_container_is_refused(self):
+        copy = Copy(self)
+        self._add_ephemeral(copy, volumeMounts=[
+            {"name": "home", "mountPath": "/var/run/auth-proxy/secrets/x"}])
+        self.assert_fails(copy, "credential-dir-only-holds-credential-volume")
+
+    def test_credential_secretkeyref_in_an_ephemeral_container_is_refused(self):
+        copy = Copy(self)
+        self._add_ephemeral(copy, env=[{"name": "KEY", "valueFrom": {
+            "secretKeyRef": {"name": "auth-proxy-kiro", "key": "api_key"}}}])
+        self.assert_fails(copy, "credential-not-referenced-by-env")
+
+    def test_credential_secretref_in_an_ephemeral_container_is_refused(self):
+        copy = Copy(self)
+        self._add_ephemeral(copy, envFrom=[{"secretRef": {"name": "auth-proxy-kiro"}}])
+        self.assert_fails(copy, "credential-not-referenced-by-env")
+
+    def test_credential_item_mode_override_is_refused(self):
+        for mode in (256, 511):
+            copy = Copy(self)
+
+            def mutate(pod, mode=mode):
+                for v in pod["spec"]["volumes"]:
+                    if v["name"] == "kiro-secret":
+                        v["secret"]["items"][0]["mode"] = mode
+
+            copy.edit_pod(mutate)
+            self.assert_fails(copy, "credential-secret-mode-0444")
+
+    def test_runtime_key_item_mode_override_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for v in pod["spec"]["volumes"]:
+                if v["name"] == "runtime-key":
+                    v["secret"]["items"][0]["mode"] = 256
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "runtime-key-mode-0444")
+
+    def test_hostpath_volume_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["volumes"].append(
+                {"name": "hp", "hostPath": {"path": "/var/lib/kubelet/pods"}})
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "no-hostpath-volumes")
+
+    def test_credential_subpath_mount_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            for m in copy.container(pod, "proxy")["volumeMounts"]:
+                if m["name"] == "kiro-secret":
+                    m["subPath"] = "api_key"
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "credential-mount-no-subpath")
+
     def test_netinit_without_the_runtime_rules_is_refused(self):
         copy = Copy(self)
         copy.edit_netinit(

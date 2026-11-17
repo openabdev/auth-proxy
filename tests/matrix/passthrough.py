@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Black-box matrix for the Muse gated passthrough, stage 1 (docs/design/muse-gated-passthrough.md,
-section 7). Separate from matrix.py, whose 41 rows are unchanged.
+section 7). Separate from matrix.py, whose first 41 rows are unchanged.
 
   passthrough.py --bin DIR [--noprobe-bin DIR] [--work DIR] [--json OUT]
 
@@ -8,7 +8,7 @@ DIR holds an `auth-proxy` built with `--features matrix-upstream,stage1-probe`. 
 --noprobe-bin DIR holds one built with `--features matrix-upstream` only, from a separate target
 dir, so default-feature behaviour is proven; it adds the rows that need a build without the probe
 route. Without it those rows are not run, and the expected-row count shrinks with them (it is
-never padded). Rows PT-18..PT-25 are stage 2: they drive the real approval listener over HTTP
+never padded). Rows PT-20..PT-27 (and PT-29) are stage 2: they drive the real approval listener over HTTP
 (Basic auth, CSRF token), kill -9 and SIGTERM the process, and rewrite the policy. Each row asserts the
 client-visible outcome AND what the mock upstream received. The upstream is the harness mock, so
 nothing real is involved; every sentinel is random per run.
@@ -43,10 +43,10 @@ KEY_HEADER = "x-ap-caller-key"
 
 CASES = []  # (id, row, name, instance, fn)
 EXPECTED = ["PT-01", "PT-02", "PT-03", "PT-04", "PT-05", "PT-06", "PT-07", "PT-08", "PT-09",
-            "PT-10a", "PT-12", "PT-13", "PT-14", "PT-15", "PT-16", "PT-17",
-            "PT-18", "PT-19", "PT-20", "PT-21", "PT-22", "PT-23", "PT-24", "PT-25", "PT-27"]
+            "PT-10a", "PT-12", "PT-13", "PT-14", "PT-15", "PT-16", "PT-17", "PT-18", "PT-19",
+            "PT-20", "PT-21", "PT-22", "PT-23", "PT-24", "PT-25", "PT-26", "PT-27", "PT-29"]
 # Rows that need a build without the probe route (--noprobe-bin).
-EXPECTED_NOPROBE = ["PT-26", "PT-12n", "PT-13n"]
+EXPECTED_NOPROBE = ["PT-28", "PT-12n", "PT-13n"]
 
 
 def case(cid, row, name, instance="main"):
@@ -640,7 +640,7 @@ def pt06(c):
     alive = r["status"] == 200
     out.append(f"alive-after-panic:{alive}")
     e.stop_proxy()  # flush every file
-    needles = [c.auth.split(" ", 1)[1].encode(), c.key.encode(), c.path_token.encode(), b"/ap/"]
+    needles = [c.auth.split(" ", 1)[1].encode(), c.key.encode(), c.path_token.encode(), b"/ap/apk_"]
     hits, scanned = [], []
     for root, _d, files in os.walk(e.work):
         rel = os.path.relpath(root, e.work)
@@ -783,8 +783,8 @@ def only(c, rid_list):
     return rid_list[0]["id"] if rid_list else None
 
 
-@case("PT-18", "acc 1,3,7", "hold, approve through the real listener: nothing upstream until approval, then one verbatim request and response", "hold")
-def pt18(c):
+@case("PT-20", "acc 1,3,7", "hold, approve through the real listener: nothing upstream until approval, then one verbatim request and response", "hold")
+def pt20(c):
     c.start_hold()
     raw, body = c.held_req(1)
     t = Caller(c.port, raw)
@@ -811,8 +811,8 @@ def pt18(c):
                 f"status={r and r['status']} upstream={len(up)} second_approve={again}")
 
 
-@case("PT-19", "acc 4", "hold, deny through the real listener: 423 human_denied, nothing upstream", "hold")
-def pt19(c):
+@case("PT-21", "acc 4", "hold, deny through the real listener: 423 human_denied, nothing upstream", "hold")
+def pt21(c):
     c.start_hold()
     raw, _ = c.held_req(2)
     t = Caller(c.port, raw)
@@ -826,8 +826,8 @@ def pt19(c):
     return ok, f"deny={dst}/{res} status={r and r['status']} code={r and code_of(r)} upstream={len(c.ulog())}"
 
 
-@case("PT-20", "acc 5", "hold expires after hold_secs: 410 expired, no Retry-After, nothing upstream, the id is gone", "hold")
-def pt20(c):
+@case("PT-22", "acc 5", "hold expires after hold_secs: 410 expired, no Retry-After, nothing upstream, the id is gone", "hold")
+def pt22(c):
     c.start_hold()
     raw, _ = c.held_req(3)
     t0 = time.time()
@@ -843,8 +843,8 @@ def pt20(c):
     return ok, f"status={r and r['status']} took={took:.1f}s late_approve={late} upstream={len(c.ulog())}"
 
 
-@case("PT-21", "acc 9", "kill -9 while held: connection closed with no response, nothing upstream, the restarted process holds nothing", "hold")
-def pt21(c):
+@case("PT-23", "acc 9", "kill -9 while held: connection closed with no response, nothing upstream, the restarted process holds nothing", "hold")
+def pt23(c):
     e = c.e
     c.start_hold()
     raw, _ = c.held_req(4)
@@ -861,8 +861,8 @@ def pt21(c):
     return ok, f"status={r and r['status']} closed={r and r['closed']} upstream={len(c.ulog())} old_id_after_restart={gone}"
 
 
-@case("PT-22", "acc 10", "kill -9 between approve and send: nothing upstream, no forward_started, nothing replayed after restart", "hold")
-def pt22(c):
+@case("PT-24", "acc 10", "kill -9 between approve and send: nothing upstream, no forward_started, nothing replayed after restart", "hold")
+def pt24(c):
     e = c.e
     c.start_hold(extra_env={"AP_TEST_HOLD_PAUSE_MS": "4000"})
     raw, _ = c.held_req(5)
@@ -895,8 +895,8 @@ def _try(f):
         return ("error", repr(ex))
 
 
-@case("PT-23", "acc 6", "SIGTERM while held: 503 shutdown, nothing upstream, exit 0", "hold")
-def pt23(c):
+@case("PT-25", "acc 6", "SIGTERM while held: 503 shutdown, nothing upstream, exit 0", "hold")
+def pt25(c):
     e = c.e
     c.start_hold()
     raw, _ = c.held_req(6)
@@ -915,8 +915,8 @@ def pt23(c):
     return ok, f"status={r and r['status']} code={r and code_of(r)} exit={rc} listening={listening} upstream={len(c.ulog())}"
 
 
-@case("PT-24", "acc 26", "SIGTERM during an approved forward: a started response completes, exit 0 (streaming); approved but before the send, 503 shutdown with zero upstream", "hold")
-def pt24(c):
+@case("PT-26", "acc 26", "SIGTERM during an approved forward: a started response completes, exit 0 (streaming); approved but before the send, 503 shutdown with zero upstream", "hold")
+def pt26(c):
     e = c.e
     out, ok = [], True
     # a) approved, response streaming (the mock sends 20 events over about a second)
@@ -956,8 +956,8 @@ def pt24(c):
     return ok, " | ".join(out)
 
 
-@case("PT-25", "acc 21", "policy reload: a removed identity's hold is dropped (503), others stay; a removed policy file drops every hold", "hold")
-def pt25(c):
+@case("PT-27", "acc 21", "policy reload: a removed identity's hold is dropped (503), others stay; a removed policy file drops every hold", "hold")
+def pt27(c):
     e = c.e
     out, ok = [], True
     c.start_hold()
@@ -999,8 +999,8 @@ def pt25(c):
 
 
 # ------------------------------------------------------------------ no-probe build rows
-@case("PT-26", "acc 24", "a build without stage1-probe: no probe string, probe route refused with zero upstream, [probe] enabled refused at startup", "np-startup")
-def pt26(c):
+@case("PT-28", "acc 24", "a build without stage1-probe: no probe string, probe route refused with zero upstream, [probe] enabled refused at startup", "np-startup")
+def pt28(c):
     e = c.e
     out, ok = [], True
     binpath = os.path.join(e.bindir, "auth-proxy")
@@ -1032,8 +1032,8 @@ def pt26(c):
     return ok, " ".join(out)
 
 
-@case("PT-27", "acc 12", "sentinel sweep on the real binary: approval page, list and caller answers, a panic while a hold exists, then every file and the proxy log", "hold")
-def pt27(c):
+@case("PT-29", "acc 12", "sentinel sweep on the real binary: approval page, list and caller answers, a panic while a hold exists, then every file and the proxy log", "hold")
+def pt29(c):
     e = c.e
     c.start_hold()
     raw, _ = c.held_req(7)
@@ -1093,6 +1093,113 @@ def pt27(c):
 CASES.append(("PT-12n", "acc 28", "framing conflicts on a build without the probe route", "np-main", pt12))
 CASES.append(("PT-13n", "acc 28", "allowed-body boundary on a build without the probe route", "np-limits", pt13))
 
+
+def canon_refused(c, label, raw, codes=None, statuses=range(400, 500)):
+    """Refused: a 4xx (an HTTP-layer parse error counts) and nothing at the upstream."""
+    c.e.ureset()
+    r = exchange(c.port, raw)
+    n = len(c.ulog())
+    ok = r["status"] in statuses and n == 0 and (codes is None or code_of(r) in codes)
+    return ok, f"[{label}: {r['status']}/{code_of(r)}/{n}]"
+
+
+def canon_identical(c, label, raw, want_path):
+    """Forwarded: the upstream saw exactly `want_path`, with the caller key nowhere in it."""
+    c.e.ureset()
+    r = exchange(c.port, raw)
+    up = c.ulog()
+    got = up[0]["path"].split("?")[0] if up else None
+    ok = r["status"] == 200 and len(up) == 1 and got == want_path
+    return ok, f"[{label[:30]}: {r['status']} upstream={(got or '')[:40]!r}]"
+
+
+def canon_framing(c, label, raw):
+    """Framing conflicts the HTTP layer may settle itself: refused, or forwarded with one framing
+    header only. Never both Content-Length and Transfer-Encoding upstream."""
+    c.e.ureset()
+    r = exchange(c.port, raw)
+    up = c.ulog()
+    if not up:
+        return 400 <= r["status"] < 500, f"[{label}: refused {r['status']}]"
+    names = [k for k, _ in up[0]["headers"]]
+    ok = (r["status"] == 200 and names.count("content-length") <= 1
+          and not ("content-length" in names and "transfer-encoding" in names))
+    return ok, f"[{label}: forwarded {r['status']} cl={names.count('content-length')} te={names.count('transfer-encoding')}]"
+
+
+def run_all(checks):
+    ok = True
+    out = []
+    for good, d in checks:
+        ok &= good
+        out.append(d)
+    return ok, " ".join(out)
+
+
+@case("PT-18", "issue 19", "path forms with the caller key: encodings, `;`, Unicode, empty and reserved keys, repeated key; matched path is the forwarded path")
+def pt18(c):
+    k = c.key
+    key_hdr = [("Authorization", c.auth)]
+
+    def get(path, key=k):
+        return build("GET", f"/ap/{key}{path}", key_hdr)
+
+    checks = []
+    for p in ["/discord/v1/%252f", "/discord/v1/%255c", "/discord/v1/%2500", "/discord/v1%2fx",
+              "/discord/v1/%5cx", "/discord/v1/..;/x", "/discord/v1/.;/x", "/discord/v1/{x}", '/discord/v1/a"b',
+              "/discord/v1/caf\u00e9", "/discord/v1/\uff0e\uff0e/x",
+              "/discord/v1/..%3b/x", "/discord/v1/.%3B/x", "/discord/v1/..%253b/x",
+              "/discord/v1/%25%32%46x", "/discord/v1/%25%32%45%25%32%45/x", "/discord/v1/%25%35%43x",
+              "/discord/v1/%2%45", "/discord/v1/%252525252e/x", "/discord/v1/%0a",
+              "/discord/v1/%c0%ae/x", "/discord/v1/%u002e"]:
+        checks.append(canon_refused(c, p, get(p), None if not p.isascii() else {"path_ambiguous"}))
+    for label, key in [("empty key", ""), ("key %2f", k + "%2f"), ("key ;", k + ";x"),
+                       ("key upper", k.upper()), ("key short", k[:-1]), ("key long", k + "0")]:
+        checks.append(canon_refused(c, label, build("GET", f"/ap/{key}/discord/v1/x", key_hdr),
+                                    {"caller_rejected", "path_ambiguous"}))
+    for p in ["/v1/a;b=c", "/v1/caf%C3%A9", "/v1/echo/ap/discord/x", "/v1/" + "a" * 4000]:
+        checks.append(canon_identical(c, p[:24], get("/discord" + p), p))
+    n = len(c.ulog())
+    r = exchange(c.port, build("GET", f"/ap/{k}/discord/v1/" + "a" * 300000, key_hdr))
+    checks.append((400 <= r["status"] < 500 and len(c.ulog()) == n, f"[300000-byte segment: {r['status']}]"))
+    return run_all(checks)
+
+
+@case("PT-19", "issue 19", "public Host spellings, absolute form, CRLF and folded headers, duplicate and conflicting headers")
+def pt19(c):
+    path = "/discord/v1/x"
+    good = c.good()
+    checks = []
+    for label, host in [("mixed case", AUTHORITY.upper()), ("trailing dot", AUTHORITY + "."),
+                        ("with port", AUTHORITY + ":443"), ("IPv6", "[::1]"), ("IPv4-mapped", "[::ffff:127.0.0.1]"),
+                        ("decimal IP", "2130706433"), ("octal IP", "0177.0.0.1"), ("hex IP", "0x7f.0.0.1"),
+                        ("punycode", "xn--e1afmkfd.xn--p1ai"), ("Unicode", "b\u00fccher.example"),
+                        ("userinfo", "u@" + AUTHORITY), ("empty", "")]:
+        checks.append(canon_refused(c, label, build("GET", path, good, host=host), {"host_rejected"}))
+    for label, target, host in [("absolute matching", f"http://{AUTHORITY}{path}", AUTHORITY),
+                                ("absolute https", f"https://{AUTHORITY}{path}", AUTHORITY),
+                                ("absolute foreign", f"http://evil.test{path}", AUTHORITY),
+                                ("absolute foreign Host", f"http://{AUTHORITY}{path}", "evil.test")]:
+        checks.append(canon_refused(c, label, build("GET", target, good, host=host), {"absolute_form"}))
+    base = f"GET {path} HTTP/1.1\r\nHost: {AUTHORITY}\r\n{KEY_HEADER}: {c.key}\r\nAuthorization: {c.auth}\r\n".encode()
+    for label, extra in [("bare CR", b"X-A: a\rb\r\n"), ("NUL", b"X-A: a\x00b\r\n"),
+                         ("obs-fold", b"X-A: a\r\n b\r\n"), ("obs-fold tab", b"X-A: a\r\n\tb\r\n"),
+                         ("space before colon", b"X-A : a\r\n")]:
+        checks.append(canon_refused(c, label, base + extra + b"\r\n"))
+    for label, hs in [("two caller keys", [(KEY_HEADER, c.key), (KEY_HEADER, c.key)]),
+                      ("two Authorization", [(KEY_HEADER, c.key), ("Authorization", c.auth), ("Authorization", c.auth)]),
+                      ("two different Content-Length", c.good([("Content-Length", "0"), ("Content-Length", "5")])),
+                      ("Connection nominates key", c.good([("Connection", KEY_HEADER)]))]:
+        checks.append(canon_refused(c, label, build("GET", path, hs)))
+    for label, hs in [("two equal Content-Length", [("Content-Length", "0"), ("Content-Length", "0")]),
+                      ("CL and TE", [("Content-Length", "0"), ("Transfer-Encoding", "chunked")]),
+                      ("TE twice", [("Transfer-Encoding", "chunked"), ("Transfer-Encoding", "chunked")]),
+                      ("TE list", [("Transfer-Encoding", "gzip, chunked")])]:
+        checks.append(canon_framing(c, label, build("GET", path, c.good(hs))))
+    return run_all(checks)
+
+
+
 # ------------------------------------------------------------------ driver
 def run_instance(c, instance, results):
     cases = [x for x in CASES if x[3] == instance]
@@ -1144,7 +1251,7 @@ def run_instance(c, instance, results):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True, help="directory with auth-proxy (matrix-upstream + stage1-probe build)")
-    ap.add_argument("--noprobe-bin", help="directory with an auth-proxy built without stage1-probe (adds PT-26, PT-12n, PT-13n)")
+    ap.add_argument("--noprobe-bin", help="directory with an auth-proxy built without stage1-probe (adds PT-28, PT-12n, PT-13n)")
     ap.add_argument("--work", help="work directory (default: a fresh temp dir)")
     ap.add_argument("--json", help="write the per-case results here")
     a = ap.parse_args()

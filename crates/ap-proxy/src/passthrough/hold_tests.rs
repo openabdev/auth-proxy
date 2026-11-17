@@ -1818,3 +1818,107 @@ async fn notify_absent_means_the_hold_just_waits() {
     t.app.hold.deny(&id, "alice");
     h.await.unwrap().unwrap();
 }
+
+/// Every canonicalization attack form the fuzz work refuses on the plain path is refused on a
+/// hold grant too, before the request can be held: nothing is admitted to the table, nothing is
+/// written as `held`, no notification goes out and the upstream sees nothing.
+#[tokio::test]
+async fn canonicalization_attack_forms_are_refused_before_a_hold_exists() {
+    let mock = Mock::start().await;
+    let n = MockNotifier::new(false);
+    let o = Opts {
+        notifier: Some(Arc::clone(&n)),
+        ..Opts::default()
+    };
+    let t = Ht::with("canon-hold", &mock.up, o).await;
+    // (label, request path, Host override, expected code)
+    let paths: &[(&str, &str)] = &[
+        ("layered %252f", "/discord/hold/%252f"),
+        ("layered %255c", "/discord/hold/%255c"),
+        ("layered %25252e", "/discord/hold/%252525252e/x"),
+        ("layered dot-dot", "/discord/hold/%25%32%45%25%32%45/x"),
+        ("layered %2500", "/discord/hold/%2500"),
+        ("..%3b", "/discord/hold/..%3b/x"),
+        (".%3B mixed case", "/discord/hold/.%3B/x"),
+        ("..%253b layered", "/discord/hold/..%253b/x"),
+        ("mixed-case %2E%2e", "/discord/hold/%2E%2e/x"),
+        ("mixed-case %2F", "/discord/hold%2Fx"),
+        ("mixed-case %5C", "/discord/hold/%5Cx"),
+        ("semicolon dot-dot", "/discord/hold/..;/x"),
+        ("overlong utf8", "/discord/hold/%c0%ae/x"),
+        ("%u escape", "/discord/hold/%u002e"),
+    ];
+    let mut forms: Vec<(String, String, Option<&str>)> = Vec::new();
+    for (label, p) in paths {
+        forms.push((format!("header form: {label}"), (*p).to_string(), None));
+        forms.push((
+            format!("path form: {label}"),
+            format!("/ap/{}{}", t.key, p),
+            None,
+        ));
+    }
+    for host in [
+        "0x7f.0.0.1",
+        "127.0.0.0x1",
+        "gate.example.0xff",
+        "2130706433",
+    ] {
+        forms.push((
+            format!("hex-tail IP host {host}"),
+            "/discord/hold/ok".to_string(),
+            Some(host),
+        ));
+    }
+    for (label, path, host) in &forms {
+        let mut b = t
+            .builder(&t.key, "POST", path)
+            .header("content-type", "application/json")
+            .header("content-length", 2);
+        if let Some(h) = host {
+            b = b.header("host", *h);
+        }
+        let mut req = b.body(Body::from("{}")).unwrap();
+        if let Some(h) = host {
+            // `builder` already set the public host; the attack Host must be the only one.
+            let hv = req.headers_mut();
+            hv.remove("host");
+            hv.insert("host", http::HeaderValue::from_str(h).unwrap());
+        }
+        let res = tokio::time::timeout(Duration::from_secs(3), t.send(req)).await;
+        let (parts, _body) = match res {
+            Ok(Ok(r)) => r,
+            // A refusal that closes the connection without a response is also not a hold.
+            Ok(Err(())) => continue,
+            Err(_) => panic!("{label}: the request waited, it was held or hung"),
+        };
+        assert!(
+            (400..500).contains(&parts.status.as_u16()),
+            "{label}: status {}",
+            parts.status
+        );
+        assert_ne!(decision(&parts), "held", "{label}");
+        assert_eq!(t.app.hold.pending_len(), 0, "{label}: hold table not empty");
+    }
+    assert_eq!(t.app.hold.pending_len(), 0);
+    assert_eq!(t.count("held"), 0, "a hold was recorded: {}", t.text());
+    assert_eq!(t.count("forward_started"), 0);
+    assert!(n.calls().is_empty(), "a notification was sent");
+    assert_eq!(mock.recorded().len(), 0, "the upstream saw a request");
+    // The same route still holds a clean request, so the refusals above came from the
+    // canonical-form check and not from a broken fixture.
+    let ok = t.spawn(t.post("/discord/hold/ok", "{}"));
+    let id = t.held(1).await;
+    calls_reach(&n, 1).await;
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Success
+    );
+    let (parts, _) = ok.await.unwrap().unwrap();
+    assert_eq!(parts.status, 200);
+    let up = mock.recorded();
+    assert_eq!(up.len(), 1);
+    assert_eq!(
+        up[0].uri, "/hold/ok",
+        "forwarded path equals the matched path"
+    );
+}

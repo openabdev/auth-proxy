@@ -26,7 +26,10 @@ fn main() {
         }
     }
     if once {
-        let result = ap_netprobe::run_probes();
+        let (result, lines) = ap_netprobe::run_probes_detailed();
+        for l in lines {
+            eprintln!("ap-netprobe: {l}");
+        }
         print!("{}", ap_netprobe::status_line("once", result));
         exit(i32::from(result.is_err()));
     }
@@ -41,14 +44,14 @@ fn main() {
         .unwrap_or(0);
     let mut n: u64 = 0;
     loop {
-        let result = ap_netprobe::run_probes();
+        let (result, lines) = ap_netprobe::run_probes_detailed();
         n += 1;
         let line = ap_netprobe::status_line(&format!("{start}-{n}"), result);
         if let Err(e) = ap_netprobe::write_status(&status, &line) {
             eprintln!("ap-netprobe: cannot write the status file: {e}");
         }
         if let Err(reason) = result {
-            eprintln!("ap-netprobe: fail: {reason}");
+            eprintln!("ap-netprobe: fail: {reason}: {}", lines.join("; "));
         }
         std::thread::sleep(Duration::from_secs(interval));
     }

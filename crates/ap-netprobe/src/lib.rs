@@ -7,7 +7,8 @@
 //! 1. a TCP connect to a loopback listener on another port must be refused (rule: any other
 //!    loopback packet from the agent UID is rejected),
 //! 2. a TCP connect to a routable non-loopback address must be refused (direct egress),
-//! 3. a UDP query to the resolver must be refused (DNS is closed).
+//! 3. a UDP query to the resolver must be refused (DNS is closed): the send fails with `EPERM`
+//!    (local `REJECT`) or the reply side gets `ECONNREFUSED`.
 //!
 //! The only passing outcome is "refused". A connect that succeeds, a reply, a timeout and any
 //! other error all fail the probe, so a missing rule, a changed UID mapping and an unexpected
@@ -48,6 +49,20 @@ const DNS_QUERY: [u8; 17] = [
     0x01,
 ];
 
+/// An outcome and what was seen, for the log line. The detail holds an error kind, never data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub outcome: Outcome,
+    pub detail: String,
+}
+
+fn kind<T>(r: &io::Result<T>) -> String {
+    match r {
+        Ok(_) => "ok".to_string(),
+        Err(e) => format!("{:?}", e.kind()),
+    }
+}
+
 /// Classify a TCP connect result.
 pub fn connect_outcome(r: io::Result<TcpStream>) -> Outcome {
     match r {
@@ -58,11 +73,15 @@ pub fn connect_outcome(r: io::Result<TcpStream>) -> Outcome {
 }
 
 /// Classify the result of a UDP exchange: the send, then the receive of a reply.
+///
+/// A local `REJECT` shows up as `EPERM` on the send (measured on k3s: the netfilter verdict is
+/// returned to the sender, and no ICMP error comes back to a UDP socket), or as `ECONNREFUSED` when
+/// an ICMP port-unreachable reaches the socket. Both mean the packet was stopped on this host.
 pub fn udp_outcome(sent: io::Result<usize>, received: io::Result<usize>) -> Outcome {
+    use io::ErrorKind::{ConnectionRefused, PermissionDenied};
     match (sent, received) {
-        (Err(e), _) | (Ok(_), Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => {
-            Outcome::Refused
-        }
+        (Err(e), _) if matches!(e.kind(), ConnectionRefused | PermissionDenied) => Outcome::Refused,
+        (Ok(_), Err(e)) if e.kind() == ConnectionRefused => Outcome::Refused,
         (Ok(_), Ok(_)) => Outcome::Open,
         _ => Outcome::Inconclusive,
     }
@@ -84,34 +103,54 @@ pub fn resolver_from(text: &str) -> IpAddr {
 /// Loopback probe: a listener of our own on an ephemeral loopback port, then a connect to it.
 /// Without the rules the connect succeeds. With them it is refused, because the port is neither
 /// the proxy nor the egress port.
-pub fn probe_loopback() -> Outcome {
+pub fn probe_loopback() -> Probe {
+    let inconclusive = |detail: &str| Probe {
+        outcome: Outcome::Inconclusive,
+        detail: detail.to_string(),
+    };
     let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
-        return Outcome::Inconclusive;
+        return inconclusive("bind failed");
     };
     let Ok(addr) = listener.local_addr() else {
-        return Outcome::Inconclusive;
+        return inconclusive("no local address");
     };
-    connect_outcome(TcpStream::connect_timeout(&addr, PROBE_TIMEOUT))
+    let r = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT);
+    let detail = format!("connect: {}", kind(&r));
+    Probe {
+        outcome: connect_outcome(r),
+        detail,
+    }
 }
 
 /// Direct egress probe: a TCP connect to a non-loopback address.
-pub fn probe_egress() -> Outcome {
-    connect_outcome(TcpStream::connect_timeout(&EGRESS_TARGET, PROBE_TIMEOUT))
+pub fn probe_egress() -> Probe {
+    let r = TcpStream::connect_timeout(&EGRESS_TARGET, PROBE_TIMEOUT);
+    let detail = format!("connect: {}", kind(&r));
+    Probe {
+        outcome: connect_outcome(r),
+        detail,
+    }
 }
 
 /// DNS probe: a UDP query to the resolver on port 53.
-pub fn probe_dns(resolver: IpAddr) -> Outcome {
+pub fn probe_dns(resolver: IpAddr) -> Probe {
+    let inconclusive = |detail: &str| Probe {
+        outcome: Outcome::Inconclusive,
+        detail: detail.to_string(),
+    };
     let bind: SocketAddr = match resolver {
         IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
         IpAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
     };
     let Ok(sock) = UdpSocket::bind(bind) else {
-        return Outcome::Inconclusive;
+        return inconclusive("bind failed");
     };
-    if sock.set_read_timeout(Some(PROBE_TIMEOUT)).is_err()
-        || sock.connect(SocketAddr::new(resolver, 53)).is_err()
-    {
-        return Outcome::Inconclusive;
+    if sock.set_read_timeout(Some(PROBE_TIMEOUT)).is_err() {
+        return inconclusive("set timeout failed");
+    }
+    let connected = sock.connect(SocketAddr::new(resolver, 53));
+    if connected.is_err() {
+        return inconclusive(&format!("connect: {}", kind(&connected)));
     }
     let sent = sock.send(&DNS_QUERY);
     let mut buf = [0u8; 512];
@@ -119,7 +158,11 @@ pub fn probe_dns(resolver: IpAddr) -> Outcome {
         Ok(_) => sock.recv(&mut buf),
         Err(_) => Ok(0),
     };
-    udp_outcome(sent, received)
+    let detail = format!("send: {}, recv: {}", kind(&sent), kind(&received));
+    Probe {
+        outcome: udp_outcome(sent, received),
+        detail,
+    }
 }
 
 /// The verdict of a full probe run: `Ok(())`, or the failing reason code.
@@ -137,8 +180,19 @@ pub fn verdict(loopback: Outcome, egress: Outcome, dns: Outcome) -> Result<(), &
 /// Run the three probes. All of them run, so a log shows every result, and the first failure
 /// names the reason.
 pub fn run_probes() -> Result<(), &'static str> {
+    run_probes_detailed().0
+}
+
+/// Like [`run_probes`], with one `name: detail` string per probe for the log.
+pub fn run_probes_detailed() -> (Result<(), &'static str>, Vec<String>) {
     let resolver = resolver_from(&fs::read_to_string("/etc/resolv.conf").unwrap_or_default());
-    verdict(probe_loopback(), probe_egress(), probe_dns(resolver))
+    let (l, e, d) = (probe_loopback(), probe_egress(), probe_dns(resolver));
+    let lines = vec![
+        format!("loopback {:?} ({})", l.outcome, l.detail),
+        format!("egress {:?} ({})", e.outcome, e.detail),
+        format!("dns {:?} ({})", d.outcome, d.detail),
+    ];
+    (verdict(l.outcome, e.outcome, d.outcome), lines)
 }
 
 /// The status line for a result. The reason is a fixed code, never free text.
@@ -197,8 +251,18 @@ mod tests {
             udp_outcome(Ok(17), Err(err(io::ErrorKind::WouldBlock))),
             Outcome::Inconclusive
         );
+        // A local REJECT on the send path surfaces as EPERM.
         assert_eq!(
             udp_outcome(Err(err(io::ErrorKind::PermissionDenied)), Ok(0)),
+            Outcome::Refused
+        );
+        assert_eq!(
+            udp_outcome(Err(err(io::ErrorKind::TimedOut)), Ok(0)),
+            Outcome::Inconclusive
+        );
+        // A denied receive is not a refusal.
+        assert_eq!(
+            udp_outcome(Ok(17), Err(err(io::ErrorKind::PermissionDenied))),
             Outcome::Inconclusive
         );
     }
@@ -237,7 +301,7 @@ mod tests {
     #[test]
     fn loopback_probe_detects_a_host_without_the_rules() {
         // This test process has no per-UID rule, so the loopback connect gets through.
-        assert_eq!(probe_loopback(), Outcome::Open);
+        assert_eq!(probe_loopback().outcome, Outcome::Open);
     }
 
     #[test]

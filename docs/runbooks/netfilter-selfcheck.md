@@ -17,7 +17,7 @@ get one.
 | Check | Container | Privilege | What it does |
 |---|---|---|---|
 | Rule presence | `netcheck` | root, `NET_ADMIN` only | Compares `iptables -S OUTPUT` and `ip6tables -S OUTPUT` with the snapshot `netinit` wrote when it installed the rules. Any difference (a missing, extra, reordered or changed rule, or a changed default policy) fails. |
-| Functional probe | `netprobe` | agent UID, no capability | Runs as UID 1000, so the rules apply to it exactly as to the agent. Tries a TCP connect to a loopback port that is not the proxy or egress port, a TCP connect to a routable non-loopback address (`192.0.2.1:443`, TEST-NET-1, never answered), and a UDP DNS query to the first resolver in `/etc/resolv.conf`. Each must be refused locally. A connection, a reply, a timeout or any other error fails. |
+| Functional probe | `netprobe` | agent UID, no capability | Runs as UID 1000, so the rules apply to it exactly as to the agent. Tries a TCP connect to a loopback port that is not the proxy or egress port, a TCP connect to a routable non-loopback address (`192.0.2.1:443`, TEST-NET-1, never answered), and a UDP DNS query to the first resolver in `/etc/resolv.conf`. Each must be stopped on the host: a refused connect, or for UDP a send that fails with a permission error (what a local `REJECT` returns for UDP, measured on k3s). A connection, a reply, a timeout or any other error fails. |
 
 Each container writes one line to its own status file every interval (default 30 s):
 

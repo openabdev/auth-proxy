@@ -271,8 +271,6 @@ pub struct Grant {
 pub struct Egress {
     /// `host:port` entries read by ap-egress only.
     pub allow: Vec<String>,
-    /// Permit egress hosts that are also credential route hosts. Off by default.
-    pub allow_route_hosts: bool,
     /// Maximum CONNECT connections ap-egress serves at once, at least 1. Default 256. A
     /// connection accepted over the cap is closed at once.
     pub max_connections: usize,
@@ -282,7 +280,6 @@ impl Default for Egress {
     fn default() -> Self {
         Egress {
             allow: Vec::new(),
-            allow_route_hosts: false,
             max_connections: 256,
         }
     }
@@ -762,9 +759,9 @@ impl Config {
                     )))
                 }
             }
-            if !self.egress.allow_route_hosts && credential_hosts.contains(host) {
+            if credential_hosts.contains(host) {
                 return Err(invalid(format!(
-                    "egress host {host:?} is a credential route host (set egress.allow_route_hosts = true to permit)"
+                    "egress host {host:?} is a credential route host"
                 )));
             }
         }
@@ -841,7 +838,6 @@ allow = ["github.com:443"]
         assert_eq!(cfg.sessions.authority_lease_secs, 90);
         assert_eq!(cfg.sessions.max_sessions, 64);
         assert_eq!(cfg.limits.max_body_bytes, 33_554_432);
-        assert!(!cfg.egress.allow_route_hosts);
     }
 
     #[test]
@@ -1214,11 +1210,8 @@ allow = ["github.com:443"]
     }
 
     #[test]
-    fn allows_credential_route_host_in_egress_with_opt_in() {
-        let text = base()
-            .replace("github.com:443", "runtime.us-east-1.kiro.dev:443")
-            .replace("[egress]\n", "[egress]\nallow_route_hosts = true\n");
-        assert!(load(&text).is_ok());
+    fn rejects_removed_allow_route_hosts_key() {
+        expect_parse_error(&base().replace("[egress]\n", "[egress]\nallow_route_hosts = true\n"));
     }
 
     #[test]

@@ -48,6 +48,7 @@ required-features = ["matrix-upstream"]
 
 [dev-dependencies]
 base64 = "0.22"
+h2 = "0.4"
 getrandom = "0.2"
 http-body-util = "0.1"
 rcgen = "0.13"

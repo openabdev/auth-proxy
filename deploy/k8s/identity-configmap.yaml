@@ -26,10 +26,19 @@ data:
     error_shape = "aws"
     pass_headers = ["tokentype"]
 
+    [[route]]
+    name = "kiro-cps"
+    # Host observed by DNS/SNI only (kiro-cli 3.3.0, no real request): docs/recipes/kiro-cli.md.
+    # pass_headers = ["tokentype"] follows kiro-krs. Whether the cps service needs or sends
+    # tokentype, and its error shape, are NOT measured.
+    host = "management.us-east-1.kiro.dev"
+    error_shape = "aws"
+    pass_headers = ["tokentype"]
+
     [[credential]]
     id = "kiro"
     source = "k8s:auth-proxy-kiro:api_key"
-    routes = ["kiro-krs"]
+    routes = ["kiro-cps", "kiro-krs"]
 
     [[grant]]
     identity = "pty-team-a"
@@ -38,6 +47,15 @@ data:
     methods = ["POST"]
     paths = ["/"]
     aws_targets = ["AmazonCodeWhispererStreamingService.GenerateAssistantResponse"]
+
+    # No aws_targets here: the cps targets seen on the wire (GetProfile, ListAvailableModels) came
+    # from a capture against a local listener, not from the real host.
+    [[grant]]
+    identity = "pty-team-a"
+    credential = "kiro"
+    route = "kiro-cps"
+    methods = ["POST"]
+    paths = ["/"]
 
     [egress]
     allow = ["github.com:443", "registry.npmjs.org:443"]

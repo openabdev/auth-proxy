@@ -26,6 +26,10 @@ pub struct AuditRec {
     pub code: Option<String>,
     pub status: u16,
     pub duration_ms: u64,
+    /// Response body bytes already forwarded to the agent when the upstream reset mid-stream.
+    /// Present only on the `upstream_reset` line, omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_sent: Option<u64>,
 }
 
 /// Drop the query string and fragment from a route-relative path.
@@ -62,6 +66,7 @@ mod tests {
             code: None,
             status: 200,
             duration_ms: 12,
+            bytes_sent: None,
         }
     }
 
@@ -87,6 +92,17 @@ mod tests {
                 "status",
             ]
         );
+    }
+
+    #[test]
+    fn bytes_sent_is_omitted_unless_set() {
+        let v: serde_json::Value =
+            serde_json::from_str(sample().to_json_line().trim_end()).unwrap();
+        assert!(v.get("bytes_sent").is_none());
+        let mut r = sample();
+        r.bytes_sent = Some(8);
+        let v: serde_json::Value = serde_json::from_str(r.to_json_line().trim_end()).unwrap();
+        assert_eq!(v["bytes_sent"], 8);
     }
 
     #[test]

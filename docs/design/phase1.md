@@ -433,7 +433,9 @@ Follow-ups attached to the decision:
 - `ap-egress` connects to the exact address it validated and never resolves the name a second
   time (DNS rebinding).
 - The platform sets `NO_PROXY=127.0.0.1,localhost` next to `HTTPS_PROXY`.
-- A test confirms that kiro-cli sends `X-Amz-Target` before any grant relies on `aws_targets`.
+- [x] A test confirms that kiro-cli sends `X-Amz-Target` before any grant relies on `aws_targets`.
+  Done for kiro-cli 3.3.0, one call each, no real request [M, `docs/evidence/xamz-target.md`].
+  Re-check after a kiro-cli upgrade.
 - The combined Option A rule set is measured in one pod before release.
 
 Remaining risk, accepted: the agent can still send data to allowlisted hosts such as github.com,
@@ -522,8 +524,9 @@ the spike's canonical-host check [M exp2 R5]; every credential route exists; eve
 credential and one of its routes; methods are upper-case tokens; paths start with `/` and contain
 no dot segment, `%` or `//`; at most 256 grants; egress entries are `host:port`, with a canonical
 host and a port from 1 to 65535, and no host that is also a credential route host (otherwise a
-CONNECT tunnel could carry another credential the agent found straight to a credential host; an
-explicit `allow_route_hosts = true` turns the check off).
+CONNECT tunnel could carry another credential the agent found straight to a credential host). The
+rule has no opt-out: a policy that sets the former `egress.allow_route_hosts` key is rejected as an
+unknown field.
 
 ### Getting git, npm, pip and cargo out under the Option A deny
 
@@ -641,8 +644,9 @@ registry and store reader. Every refusal sends nothing upstream.
    roots [M exp2 R6, R7]; never follow redirects [M exp2 R4]; stream the response chunk by chunk
    with `TCP_NODELAY` on both sides [M exp2: without it p99 rose by 44 ms].
 9. Audit one JSON line to stdout: identity, session id, generation, route, method, route-relative
-   path, AWS target, decision, code, status, duration. Never the caller key, surrogate, credential
-   or query string.
+   path, AWS target, decision, code, status, duration, and optionally `bytes_sent`. `bytes_sent`
+   is omitted from every record except `upstream_reset`. Never the caller key, surrogate,
+   credential or query string.
 
 | Code | Status | Body dialect | Logged at | Notes |
 |---|---|---|---|---|

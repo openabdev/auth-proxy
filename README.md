@@ -287,15 +287,18 @@ verified against a cluster.
     v1.35.3+k3s1 or later; single server shown, HA differs, see the page) ([k3s secrets-encrypt][k3s-enc]):
     1. `k3s secrets-encrypt status` shows `Encryption Status: Disabled`.
     2. `k3s secrets-encrypt enable`.
-    3. Add `--secrets-encryption` (and `--secrets-encryption-provider=secretbox`) to the server
-       args or config and restart the server.
+    3. Add `--secrets-encryption` to the server args or config and restart the server.
     4. `status` shows `Disabled` at rotation stage `start`.
     5. `k3s secrets-encrypt rotate-keys`, then restart the server with the same arguments.
-    6. `status` shows `Encryption Status: Enabled`, stage `reencrypt_finished`, and the active
-       key (`*`) with the intended type (`XSalsa20`-based `secretbox`, not `AES-CBC`).
-    **[doc]** (the order of the steps and the status output are from the page; the key-type
-    label for `secretbox` is not shown there, read it from your own output). On a version
-    below those gates the page gives no procedure for an existing cluster. **[untested]**
+    6. `status` shows `Encryption Status: Enabled` and stage `reencrypt_finished`.
+    **[doc]** (the steps and the status output are from the page; its example shows only the
+    default provider, so it does not cover choosing `secretbox` here). To get `secretbox`, also
+    pass `--secrets-encryption-provider=secretbox` in step 3: that flag is documented on the
+    [k3s Secrets Encryption][k3s-sec] page, not on the secrets-encrypt page, and combining it
+    with this procedure is **[untested]**. Check the active key in `status` (the page's
+    example shows type `AES-CBC` for `aescbc`; the label for `secretbox` is not shown, read it
+    from your own output). On a version below those gates the page gives no procedure for an
+    existing cluster. **[untested]**
   - Rewrite after enabling: encryption applies on write, so existing Secrets stay unencrypted
     until rewritten. The Kubernetes page's command is
     `kubectl get secrets --all-namespaces -o json | kubectl replace -f -`, run as an

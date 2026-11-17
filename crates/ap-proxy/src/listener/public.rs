@@ -13,7 +13,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 
 use crate::passthrough::{self, PtApp};
 
@@ -27,8 +27,33 @@ pub struct PublicLimits {
 /// Serve until the listener fails. Connections over the cap are accepted and closed at once.
 pub async fn serve_public(listener: TcpListener, app: Arc<PtApp>, limits: PublicLimits) {
     let permits = Arc::new(Semaphore::new(limits.max_connections));
+    let (_keep_open, shutdown) = watch::channel(false);
+    serve_public_until(listener, app, limits, permits, shutdown).await;
+}
+
+/// Resolves once `rx` holds true (or its sender is gone). Returns nothing, so no `watch::Ref`
+/// (a lock guard that is not `Send`) is held by the caller's `select!`.
+async fn closed(rx: &mut watch::Receiver<bool>) {
+    let _ = rx.wait_for(|down| *down).await;
+}
+
+/// Serve until `shutdown` turns true, then stop accepting and return. Each open connection is
+/// told to finish its current request and close (an idle one closes at once); a request being
+/// answered runs to its end. `permits` holds one permit per open connection, so the caller can
+/// wait for the connections to end by taking all of them.
+pub async fn serve_public_until(
+    listener: TcpListener,
+    app: Arc<PtApp>,
+    limits: PublicLimits,
+    permits: Arc<Semaphore>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     loop {
-        let (stream, _) = match listener.accept().await {
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            () = closed(&mut shutdown) => return,
+        };
+        let (stream, _) = match accepted {
             Ok(c) => c,
             Err(_) => {
                 // A transient accept error (descriptor exhaustion) must not spin.
@@ -42,16 +67,24 @@ pub async fn serve_public(listener: TcpListener, app: Arc<PtApp>, limits: Public
         };
         let _ = stream.set_nodelay(true);
         let app = Arc::clone(&app);
+        let mut down = shutdown.clone();
         tokio::spawn(async move {
             let svc = service_fn(move |req: hyper::Request<Incoming>| {
                 let app = Arc::clone(&app);
                 async move { passthrough::handle(app, req.map(Body::new)).await }
             });
-            let _ = http1::Builder::new()
+            let conn = http1::Builder::new()
                 .timer(TokioTimer::new())
                 .header_read_timeout(limits.header_read)
-                .serve_connection(TokioIo::new(stream), svc)
-                .await;
+                .serve_connection(TokioIo::new(stream), svc);
+            tokio::pin!(conn);
+            tokio::select! {
+                _ = conn.as_mut() => {}
+                () = closed(&mut down) => {
+                    conn.as_mut().graceful_shutdown();
+                    let _ = conn.as_mut().await;
+                }
+            }
             drop(permit);
         });
     }

@@ -906,6 +906,29 @@ async fn a_full_table_refuses_and_a_reload_drop_answers_503() {
 }
 
 #[tokio::test]
+async fn the_reload_tick_drops_every_hold_when_the_policy_file_is_gone() {
+    let mock = Mock::start().await;
+    let t = Ht::new("tick", &mock.up).await;
+    let a = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let b = t.spawn(t.post_other("/discord/hold/ok", r#"{"n":2}"#));
+    t.held(2).await;
+    // A valid policy that still lists both identities drops nothing.
+    assert_eq!(t.app.reload_tick(), 0);
+    assert_eq!(t.app.hold.pending_len(), 2);
+    std::fs::remove_file(&t.policy).unwrap();
+    assert_eq!(t.app.reload_tick(), 2);
+    for h in [a, b] {
+        let (p, body) = h.await.unwrap().unwrap();
+        assert_eq!(
+            (p.status.as_u16(), decision(&p), code(&body)),
+            (503, "unavailable".into(), "dropped_on_reload".into())
+        );
+    }
+    assert_eq!(t.count("dropped_on_reload"), 2);
+    assert_eq!(mock.hits(), 0);
+}
+
+#[tokio::test]
 async fn an_identical_retry_supersedes_and_one_approval_makes_one_request() {
     let mock = Mock::start().await;
     let t = Ht::new("supersede", &mock.up).await;

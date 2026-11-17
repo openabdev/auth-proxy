@@ -14,12 +14,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Directory holding the built binaries: the parent of the test's `deps` directory.
+/// Directory holding the built binaries. `CARGO_BIN_EXE_auth-proxy` is set by cargo for this
+/// package's binaries, so it holds up when cargo keeps test executables in a separate build
+/// directory (the old "parent of `deps`" rule then points at the wrong place).
 fn bin_dir() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    exe.parent()
-        .and_then(Path::parent)
-        .expect("target profile directory")
+    Path::new(env!("CARGO_BIN_EXE_auth-proxy"))
+        .parent()
+        .expect("binary directory")
         .to_path_buf()
 }
 

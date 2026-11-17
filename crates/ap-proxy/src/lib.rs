@@ -31,6 +31,7 @@ use axum::extract::Request;
 use axum::response::Response;
 use axum::serve::ListenerExt;
 use axum::Router;
+use tokio::signal::unix::{signal, SignalKind};
 
 use audit_sink::AuditSink;
 use pipeline::App;
@@ -96,7 +97,8 @@ where
 }
 
 /// Start the proxy and serve until a listener stops. Returns the process exit code: 2 for an
-/// invalid config or a socket that cannot be bound, 1 for a listener that stops while serving.
+/// invalid config or a socket that cannot be bound, 1 for a listener that stops while serving. A
+/// passthrough process that stops on SIGTERM or SIGINT after draining returns 0.
 pub async fn run(opts: Options) -> i32 {
     #[cfg(feature = "matrix-upstream")]
     eprintln!("{}", matrix_hooks::WARNING);
@@ -307,6 +309,16 @@ async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
         max_connections: pt.max_connections,
         header_read: std::time::Duration::from_secs(pt.header_read_secs),
     };
+    let (mut sigterm, mut sigint) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            eprintln!("auth-proxy: cannot install the signal handlers");
+            return 1;
+        }
+    };
     let approval = async {
         match (approval_listener, approval_cfg) {
             (Some(l), Some(cfg)) => {
@@ -316,14 +328,54 @@ async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
             _ => std::future::pending::<()>().await,
         }
     };
+    tokio::pin!(approval);
+    let permits = Arc::new(tokio::sync::Semaphore::new(pt.max_connections));
+    let (shutdown, down) = tokio::sync::watch::channel(false);
+    let public = listener::public::serve_public_until(
+        listener,
+        Arc::clone(&app),
+        limits,
+        Arc::clone(&permits),
+        down,
+    );
+    tokio::pin!(public);
+    // Held requests notice a reload within a second (design 3.9).
+    let mut reload = tokio::time::interval(std::time::Duration::from_secs(1));
+    reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     eprintln!("auth-proxy: listening");
-    tokio::select! {
-        () = listener::public::serve_public(listener, Arc::clone(&app), limits) => {
-            eprintln!("auth-proxy: public listener stopped");
-        }
-        () = approval => {
-            eprintln!("auth-proxy: approval listener stopped");
+    loop {
+        tokio::select! {
+            () = &mut public => {
+                eprintln!("auth-proxy: public listener stopped");
+                return 1;
+            }
+            () = &mut approval => {
+                eprintln!("auth-proxy: approval listener stopped");
+                return 1;
+            }
+            _ = reload.tick() => {
+                app.reload_tick();
+            }
+            _ = sigterm.recv() => break,
+            _ = sigint.recv() => break,
         }
     }
-    1
+    // Shutdown (design 3.7): stop accepting, answer every pending hold 503 `shutdown`, and let
+    // requests already approved run to their end or to `request_deadline_secs`. A second signal
+    // ends the wait.
+    eprintln!("auth-proxy: shutting down");
+    let _ = shutdown.send(true);
+    app.hold.drain_pending();
+    let wait = std::time::Duration::from_secs(pt.request_deadline_secs)
+        .saturating_add(std::time::Duration::from_secs(2));
+    let ended = permits.acquire_many(pt.max_connections as u32);
+    tokio::select! {
+        _ = ended => {}
+        () = tokio::time::sleep(wait) => {
+            eprintln!("auth-proxy: shutdown wait reached the request deadline");
+        }
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+    }
+    0
 }

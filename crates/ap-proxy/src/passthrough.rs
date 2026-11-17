@@ -110,6 +110,21 @@ impl PtApp {
         inner.approval_base = Some(base.trim_end_matches('/').to_string());
     }
 
+    /// One step of the policy-reload watch (design 3.9), run about once a second. The policy is
+    /// re-read if its file changed. A file that is gone or no longer valid drops every pending
+    /// hold; a valid file drops the holds of identities it no longer lists. Returns the number
+    /// dropped. Entries already approved are past the table and are not touched.
+    pub fn reload_tick(&self) -> usize {
+        match self.policy.current() {
+            None => self.hold.drop_all(),
+            Some(l) => {
+                let present: std::collections::HashSet<String> =
+                    l.cfg.identities.iter().map(|i| i.name.clone()).collect();
+                self.hold.drop_identities_missing(&present)
+            }
+        }
+    }
+
     pub(crate) fn build(
         policy_path: std::path::PathBuf,
         cfg: Config,

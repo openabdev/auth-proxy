@@ -4,14 +4,21 @@
 //!   cargo build -p ap-proxy --features matrix-upstream,stage1-probe
 //!   cargo test -p ap-proxy --features matrix-upstream,stage1-probe --test matrix_passthrough
 //!
+//! With `AP_MATRIX_NOPROBE_BIN=<dir>` the driver also runs the rows that need a build without the
+//! probe route, and the expected count grows by `ROWS_NOPROBE`.
+//!
 //! Passes only when the driver exits 0, prints no FAIL row and reports every registered row as
 //! PASS. The sidecar matrix (`tests/matrix.rs`) is separate and unchanged.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Rows registered in `tests/matrix/passthrough.py`.
-const ROWS: usize = 16;
+/// Rows registered in `tests/matrix/passthrough.py` that run on the build under test.
+const ROWS: usize = 24;
+
+/// Extra rows that run when `AP_MATRIX_NOPROBE_BIN` names a directory holding an `auth-proxy` built
+/// without `stage1-probe` (CI builds one into `target/noprobe`).
+const ROWS_NOPROBE: usize = 3;
 
 /// Directory holding the built binary. `CARGO_BIN_EXE_auth-proxy` is set by cargo for this package's
 /// binaries, so it holds up when cargo keeps test executables in a separate build directory.
@@ -43,13 +50,17 @@ fn matrix_passthrough() {
         bins.display()
     );
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let out = Command::new("python3")
-        .current_dir(&root)
+    let noprobe = std::env::var_os("AP_MATRIX_NOPROBE_BIN");
+    let mut cmd = Command::new("python3");
+    cmd.current_dir(&root)
         .arg("tests/matrix/passthrough.py")
         .arg("--bin")
-        .arg(&bins)
-        .output()
-        .expect("run passthrough matrix driver");
+        .arg(&bins);
+    if let Some(dir) = &noprobe {
+        cmd.arg("--noprobe-bin").arg(dir);
+    }
+    let rows = ROWS + if noprobe.is_some() { ROWS_NOPROBE } else { 0 };
+    let out = cmd.output().expect("run passthrough matrix driver");
     let stdout = String::from_utf8_lossy(&out.stdout);
     print!("{stdout}");
     eprint!("{}", String::from_utf8_lossy(&out.stderr));
@@ -59,7 +70,7 @@ fn matrix_passthrough() {
         "a row failed"
     );
     assert!(
-        stdout.contains(&format!("summary: {ROWS} PASS of {ROWS} rows")),
+        stdout.contains(&format!("summary: {rows} PASS of {rows} rows")),
         "not every row passed:\n{stdout}"
     );
 }

@@ -1,9 +1,12 @@
 # Option A pod, split for the runtime container: one volume-prep and netinit init container, then
-# expiry-store-bootstrap, and four app containers, each with its own UID and GID.
+# expiry-store-bootstrap, four app containers, each with its own UID and GID, and two checker
+# containers for the netfilter self-check.
 #   agent 1000:1000    no proof, no session socket. Reaches the runtime only via runtime.sock.
 #   proxy 1001:1001    holds the credential and serves session.sock.
 #   runtime 1002:1002  holds the hello proof (runtime-key) and is the only client of session.sock.
 #   egress 1003:1003   allow-listed tunnel only.
+#   netcheck root      NET_ADMIN only. Compares the live per-UID rules with the netinit snapshot.
+#   netprobe 1000:1000 no capability. Runs as the agent UID and checks the rules refuse it.
 # Images are placeholders. Replace every REPLACE_* value before use.
 #
 # Session expiry store (M-3): the store file lives on its own durable volume, claim
@@ -14,7 +17,14 @@
 # Do not add a KIRO_API_KEY env var or a credential Secret mount to the agent container.
 # Do not mount the runtime-key Secret into any container except runtime.
 # Do not set shareProcessNamespace to true (finding F3).
-# The namespace needs PSA "privileged" because netinit requires NET_ADMIN.
+# The namespace needs PSA "privileged" because netinit and netcheck require NET_ADMIN.
+#
+# Netfilter self-check: the proxy container has no capability, so it cannot read the per-UID rules
+# or test them. netcheck (rule presence) and netprobe (functional probe, as the agent UID) each write
+# a one-line status file on their own emptyDir. The proxy mounts both read-only, serves only while
+# both say ok and keep ticking, and fails readiness otherwise. The agent, runtime and egress
+# containers mount neither volume. Keep the interval the same in all three places (INTERVAL,
+# --interval-secs, --netfilter-interval-secs); the validator checks it.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -82,6 +92,7 @@ spec:
         - name: agent-runtime
           mountPath: /run/auth-proxy-agent
     # Installs the per-UID rule set in the pod netns, then exits. Runs as root with NET_ADMIN only.
+    # It also writes a snapshot of the installed chains into netinit-run for netcheck.
     - name: netinit
       image: REPLACE_NETINIT_IMAGE
       command: ["/bin/sh", "/usr/local/bin/netinit.sh"]
@@ -181,6 +192,25 @@ spec:
         - /var/lib/auth-proxy/tokens
         - --expiry-store
         - /var/lib/auth-proxy/store/session-expiry.v1
+        - --netfilter-rules-status
+        - /run/auth-proxy-netcheck/rules/status
+        - --netfilter-probe-status
+        - /run/auth-proxy-netcheck/probe/status
+        - --netfilter-interval-secs
+        - "30"
+      # Not ready until the self-check passes, and not ready while it fails. The image has no shell
+      # or curl, so the probe is the binary itself, asking its admin socket. A failed self-check
+      # does not restart the container: restarting the proxy cannot bring the rules back.
+      readinessProbe:
+        exec:
+          command:
+            - auth-proxy
+            - --check-ready
+            - --admin-socket
+            - /run/auth-proxy-admin/admin.sock
+        periodSeconds: 5
+        timeoutSeconds: 3
+        failureThreshold: 1
       securityContext:
         runAsUser: 1001
         runAsGroup: 1001
@@ -210,6 +240,13 @@ spec:
         # Only the proxy and expiry-store-bootstrap mount it.
         - name: expiry-store
           mountPath: /var/lib/auth-proxy/store
+        # The two self-check status files, read-only. Written by netcheck and netprobe only.
+        - name: netcheck-rules
+          mountPath: /run/auth-proxy-netcheck/rules
+          readOnly: true
+        - name: netcheck-probe
+          mountPath: /run/auth-proxy-netcheck/probe
+          readOnly: true
     # The runtime: the hello proof and the only client of session.sock. It serves runtime.sock to the
     # agent. It runs only ap-runtime-shim and has no network (netinit gives UID 1002 no route out).
     - name: runtime
@@ -262,8 +299,62 @@ spec:
         - name: identity-config
           mountPath: /etc/auth-proxy
           readOnly: true
+    # Rule-presence checker. Root with NET_ADMIN only, because reading netfilter rules needs it. It
+    # runs a shell script, opens no socket, mounts no Secret, and writes only its status file. It
+    # reads the netinit snapshot read-only. The proxy never holds this capability.
+    - name: netcheck
+      image: REPLACE_NETINIT_IMAGE
+      command: ["/bin/sh", "/usr/local/bin/netcheck.sh"]
+      env:
+        - name: EXPECT_DIR
+          value: /run/netinit
+        - name: STATUS
+          value: /run/netcheck/status
+        - name: INTERVAL
+          value: "30"
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_ADMIN"]
+      volumeMounts:
+        - name: netinit-run
+          mountPath: /run/netinit
+          readOnly: true
+        - name: netcheck-rules
+          mountPath: /run/netcheck
+    # Functional probe. It runs as the agent UID with no capability, so the per-UID rules apply to
+    # it exactly as they apply to the agent. A loopback connect, a direct connect and a DNS query
+    # must all be refused. It mounts only its own status volume.
+    - name: netprobe
+      image: REPLACE_NETPROBE_IMAGE
+      command:
+        - ap-netprobe
+        - --status
+        - /run/netcheck/status
+        - --interval-secs
+        - "30"
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: netcheck-probe
+          mountPath: /run/netcheck
   volumes:
     - name: netinit-run
+      emptyDir: {}
+    # Status files of the netfilter self-check, one volume per writer so that neither checker can
+    # replace the other's file. The proxy mounts both read-only. No other container mounts either.
+    - name: netcheck-rules
+      emptyDir: {}
+    - name: netcheck-probe
       emptyDir: {}
     # The proxy's session socket directory. The proxy and the runtime mount it. The agent does not.
     - name: session-plane

@@ -63,7 +63,7 @@ fn matrix() {
         "matrix reported a FAIL row"
     );
     assert!(
-        stdout.contains("summary: 48 PASS of 48 rows"),
+        stdout.contains("summary: 58 PASS of 58 rows"),
         "not every registered row passed:\n{stdout}"
     );
 }

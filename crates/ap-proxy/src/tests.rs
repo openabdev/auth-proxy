@@ -49,6 +49,7 @@ async fn invalid_config_exits_with_status_2_and_binds_nothing() {
         secret_root: scratch.path().join("secrets"),
         token_dir: scratch.path().join("tokens"),
         expiry_store: None,
+        netfilter: None,
     })
     .await;
     assert_eq!(code, 2);
@@ -65,6 +66,7 @@ async fn missing_config_exits_with_status_2() {
         secret_root: scratch.path().join("secrets"),
         token_dir: scratch.path().join("tokens"),
         expiry_store: None,
+        netfilter: None,
     })
     .await;
     assert_eq!(code, 2);
@@ -86,6 +88,7 @@ async fn missing_expiry_store_exits_with_status_2_and_binds_nothing() {
         secret_root: scratch.path().join("secrets"),
         token_dir: tokens.clone(),
         expiry_store: None,
+        netfilter: None,
     })
     .await;
     assert_eq!(code, 2, "a missing store must stop the start");
@@ -96,5 +99,116 @@ async fn missing_expiry_store_exits_with_status_2_and_binds_nothing() {
     assert!(
         !tokens.join(ap_broker::expiry::FILE_NAME).exists(),
         "a refused start must not create the store"
+    );
+}
+
+#[test]
+fn netfilter_flags_are_all_or_nothing() {
+    let base = ["--config", "p.toml"];
+    let with = |extra: &[&str]| {
+        let mut v: Vec<&str> = base.to_vec();
+        v.extend_from_slice(extra);
+        parse_args(args(&v))
+    };
+    assert_eq!(with(&[]).expect("none").netfilter, None);
+    let nf = with(&[
+        "--netfilter-rules-status",
+        "/r/status",
+        "--netfilter-probe-status",
+        "/p/status",
+    ])
+    .expect("both")
+    .netfilter
+    .expect("enabled");
+    assert_eq!(nf.rules_status, PathBuf::from("/r/status"));
+    assert_eq!(nf.probe_status, PathBuf::from("/p/status"));
+    assert_eq!(
+        nf.interval,
+        std::time::Duration::from_secs(netguard::DEFAULT_INTERVAL_SECS)
+    );
+    let nf = with(&[
+        "--netfilter-rules-status",
+        "/r",
+        "--netfilter-probe-status",
+        "/p",
+        "--netfilter-interval-secs",
+        "7",
+    ])
+    .expect("interval")
+    .netfilter
+    .expect("enabled");
+    assert_eq!(nf.interval, std::time::Duration::from_secs(7));
+    assert_eq!(nf.max_age(), std::time::Duration::from_secs(19));
+    // One file alone, or an interval alone, would leave the check half set up.
+    assert!(with(&["--netfilter-rules-status", "/r"]).is_err());
+    assert!(with(&["--netfilter-probe-status", "/p"]).is_err());
+    assert!(with(&["--netfilter-interval-secs", "5"]).is_err());
+    for bad in ["0", "3601", "x", "-1"] {
+        assert!(
+            with(&[
+                "--netfilter-rules-status",
+                "/r",
+                "--netfilter-probe-status",
+                "/p",
+                "--netfilter-interval-secs",
+                bad,
+            ])
+            .is_err(),
+            "{bad}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn passthrough_config_with_the_netfilter_check_exits_with_status_2() {
+    let scratch = Scratch::new("ptnf");
+    let config = scratch.path().join("policy.toml");
+    let key = "a".repeat(64);
+    std::fs::write(
+        &config,
+        format!(
+            r#"version = 1
+
+[listen]
+proxy = "127.0.0.1:18299"
+
+[passthrough]
+public_authority = "gate.example.test"
+
+[[identity]]
+name = "muse-pilot"
+caller_key_sha256 = "{key}"
+
+[[route]]
+name = "discord"
+host = "api.up.test"
+mode = "passthrough"
+
+[[grant]]
+identity = "muse-pilot"
+route = "discord"
+methods = ["GET"]
+paths = ["/v1/"]
+"#
+        ),
+    )
+    .expect("write");
+    let code = run(Options {
+        config,
+        session_socket: scratch.path().join("s.sock"),
+        admin_socket: scratch.path().join("a.sock"),
+        secret_root: scratch.path().join("secrets"),
+        token_dir: scratch.path().join("tokens"),
+        expiry_store: None,
+        netfilter: Some(NetfilterOpts {
+            rules_status: scratch.path().join("r"),
+            probe_status: scratch.path().join("p"),
+            interval: std::time::Duration::from_secs(30),
+        }),
+    })
+    .await;
+    assert_eq!(
+        code, 2,
+        "a passthrough config has no per-UID rules to check"
     );
 }

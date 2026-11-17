@@ -149,8 +149,8 @@ Implemented and tested in Phase 1:
 
 ## Kubernetes deployment (Option A)
 
-One pod runs four app containers (agent, runtime, proxy, egress) and three init containers
-(volume-prep, netinit, expiry-store-bootstrap). The agent reaches the proxy and egress over
+One pod runs four app containers (agent, runtime, proxy, egress), two checker containers
+(netcheck, netprobe) and three init containers (volume-prep, netinit, expiry-store-bootstrap). The agent reaches the proxy and egress over
 loopback, and the runtime over its own Unix socket. It has no path to the session socket, and it
 cannot read the proxy's credential Secret or the runtime's proof seed.
 
@@ -180,6 +180,8 @@ flowchart TB
         runtime["runtime<br/>UID 1002, ap-runtime-shim, no network"]
         proxy["proxy<br/>UID 1001, loopback port 18080"]
         egress["egress<br/>UID 1003, loopback port 18081"]
+        netcheck["netcheck<br/>root, NET_ADMIN only<br/>rule presence"]
+        netprobe["netprobe<br/>UID 1000, no capability<br/>functional probe"]
         agentrt[("agent-runtime emptyDir<br/>runtime.sock, agent and runtime")]
         session[("session-plane emptyDir<br/>session.sock, proxy and runtime")]
         proof[("Secret auth-proxy-runtime-key<br/>runtime only, read-only")]
@@ -195,6 +197,8 @@ flowchart TB
     volprep -. "owners and modes" .-> agentrt
     volprep -. "owners and modes" .-> session
     netinit -. "rules for UID 1000 and 1002" .-> agent
+    netcheck -- "status file, read-only in proxy" --> proxy
+    netprobe -- "status file, read-only in proxy" --> proxy
     bootstrap -- "creates store file once" --> store
     agent -- "loopback 18080" --> proxy
     agent -- "loopback 18081" --> egress
@@ -218,6 +222,12 @@ flowchart TB
   allowed. The rules repeat for IPv6. Without them, the agent could reach the sidecar's internal
   ports and read the real credential, which the k3s run measured. UID 1002 (the runtime) gets
   replies on established connections and nothing else, since its sockets are all Unix sockets.
+- **Netfilter self-check:** the proxy serves only while the per-UID rules are in force. `netcheck`
+  (root, `NET_ADMIN` only) compares the live rules with the snapshot `netinit` took, and `netprobe`
+  (the agent UID, no capability) checks that direct egress, DNS and other loopback ports are
+  refused. If either check fails or stops reporting, the proxy fails readiness and answers every
+  request with a 503 until the rules are back. The proxy container gets no capability. See
+  [docs/runbooks/netfilter-selfcheck.md](docs/runbooks/netfilter-selfcheck.md).
 - **Runtime split:** the agent holds no hello proof and no route to `session.sock`. Its one
   session-plane path is `runtime.sock`, which serves register, revoke and status. The socket
   directories are owned by the proxy and runtime UIDs and setgid, so the agent is in neither group

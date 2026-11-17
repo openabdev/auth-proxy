@@ -821,7 +821,10 @@ def _(e):
     s = e.mint("agent-1", ("c-up",))
     au = [("Host", e.authority()), ("Authorization", f"Bearer {s}")]
     paths = ["/v1/%252f", "/v1/%252F", "/v1/%252e%252e/x", "/v1/%255c", "/v1/%2500", "/v1/%25%32%66",
-             "/v1%2fecho", "/v1/%2Fecho", "/v1/a%5cb", "/v1/a%5Cb", "/v1/a%00b", "/v1/a\\b"]
+             "/v1%2fecho", "/v1/%2Fecho", "/v1/a%5cb", "/v1/a%5Cb", "/v1/a%00b", "/v1/a\\b",
+             "/v1/%25%32%46admin", "/v1/%25%32%45%25%32%45/admin", "/v1/%25%35%43admin", "/v1/%2%45",
+             "/v1/%252525252e%252525252e/admin", "/v1/%0a", "/v1/%25%30%30", "/v1/%c0%ae%c0%ae/x",
+             "/v1/%e0%80%af", "/v1/%u002e", "/v1/%ff"]
     return canon_run([canon_refused(e, p, f"GET {e.ap('up', p)} HTTP/1.1", au, {"path_ambiguous"})
                       for p in paths])
 
@@ -831,8 +834,10 @@ def _(e):
     s = e.mint("agent-1", ("c-up",))
     au = [("Host", e.authority()), ("Authorization", f"Bearer {s}")]
     checks = [canon_refused(e, p, f"GET {e.ap('up', p)} HTTP/1.1", au, {"path_ambiguous"})
-              for p in ["/v1/..;/admin", "/v1/..;x/admin", "/v1/.;/x", "/v1/..;a=b/x"]]
-    for p in ["/v1/a;b=c", "/v1/a;b/echo", "/v1/;x/echo"]:
+              for p in ["/v1/..;/admin", "/v1/..;x/admin", "/v1/.;/x", "/v1/..;a=b/x",
+                        "/v1/..%3b/admin", "/v1/..%3B/admin", "/v1/.%3b/x", "/v1/.%3b./x",
+                        "/v1/..%3b%2f", "/v1/%2e%2e%3b/x", "/v1/..%253b/admin"]]
+    for p in ["/v1/a;b=c", "/v1/a;b/echo", "/v1/;x/echo", "/v1/a%3bb/echo"]:
         checks.append(canon_forwarded_identical(e, p, f"GET {e.ap('up', p)} HTTP/1.1", au, p))
     return canon_run(checks)
 

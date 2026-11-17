@@ -95,74 +95,96 @@ pub fn check_origin_form(
     }
 }
 
+/// Most percent-decode layers examined. A path that is still decodable after this many is
+/// refused, because a decoder stack deeper than the limit could still expose a separator.
+const MAX_DECODE_LAYERS: usize = 4;
+
 /// True when the raw, still-encoded path could be read two ways.
 ///
-/// Flags `..` and `.` segments (also with a `;` parameter, as in `..;x`, which a servlet
-/// container reads as `..`), empty interior segments (`//`), `%2e` and `%2f` in any case, `%5c`,
-/// `%00`, backslash, double encoding of any of those (`%252f`, `%255c`, `%2500`, `%25%32%66`, up
-/// to three layers), and bytes the forwarder would percent-encode (non-ASCII, controls, space,
-/// DEL, `"`, `<`, `>`, backtick, `{`, `}`), because for those the path that was matched would
-/// not be the path that is sent.
+/// The rule is one decode-to-fixed-point walk. The path is percent-decoded layer by layer (hex
+/// digits in either case, so `%2E` and `%2e`, and a layer-1 byte that spells a new escape such as
+/// `%2%45`, are all handled by value, never by text match). Any byte that a decode produces is
+/// refused when it is `.`, `/`, `\`, NUL or a control character (a single decode of those is
+/// already ambiguous), or `;` from the second layer on. `%u` escapes, a decoded layer that is not
+/// valid UTF-8 (overlong forms such as `%c0%ae` included) and a path still decodable after
+/// [`MAX_DECODE_LAYERS`] layers are refused. A `.` or `..` segment is refused in every layer,
+/// also with a path parameter (`..;x`, and `..%3b`, which a decode-then-strip stack reads as
+/// `..;`). Raw empty interior segments (`//`), backslash and bytes the forwarder would
+/// percent-encode (non-ASCII, controls, space, DEL, `"`, `<`, `>`, backtick, `{`, `}`) are
+/// refused too, because for those the matched path would not be the path that is sent.
 pub fn path_ambiguous(p: &str) -> bool {
-    let lower = p.to_ascii_lowercase();
-    if ["%2e", "%2f", "%5c", "%00"]
-        .iter()
-        .any(|s| lower.contains(s))
-        || p.contains('\\')
-    {
-        return true;
-    }
-    if p.bytes()
-        .any(|b| b <= 0x20 || b >= 0x7f || b"\"<>`{}".contains(&b))
-    {
-        return true;
-    }
-    if lower.match_indices("%25").any(|(i, _)| {
-        let rest = &lower[i + 3..];
-        rest.starts_with("2e") || rest.starts_with("2f")
-    }) || encodes_separator_in_layers(lower.as_bytes())
+    if p.contains('\\')
+        || p.bytes()
+            .any(|b| b <= 0x20 || b >= 0x7f || b"\"<>`{}".contains(&b))
     {
         return true;
     }
     let segs: Vec<&str> = p.split('/').skip(1).collect();
-    segs.iter().enumerate().any(|(i, s)| {
-        let name = s.split(';').next().unwrap_or_default();
-        name == "." || name == ".." || (s.is_empty() && i + 1 != segs.len())
-    })
-}
-
-/// True when percent-decoding `lower` (already ASCII-lowercased) one to three times exposes
-/// `%2e`, `%2f`, `%5c` or `%00`: a second or third decoder would then read a dot, slash,
-/// backslash or NUL that the first layer hid.
-fn encodes_separator_in_layers(lower: &[u8]) -> bool {
-    let mut cur = lower.to_vec();
-    for _ in 0..3 {
+    if segs
+        .iter()
+        .enumerate()
+        .any(|(i, s)| s.is_empty() && i + 1 != segs.len())
+    {
+        return true;
+    }
+    let mut cur = p.as_bytes().to_vec();
+    if dot_segment(&cur) {
+        return true;
+    }
+    for depth in 1..=MAX_DECODE_LAYERS {
         let mut out = Vec::with_capacity(cur.len());
+        let mut decoded = false;
         let mut i = 0;
         while i < cur.len() {
-            let hex = |b: u8| (b as char).to_digit(16);
-            if cur[i] == b'%' && i + 2 < cur.len() {
-                if let (Some(h), Some(l)) = (hex(cur[i + 1]), hex(cur[i + 2])) {
-                    out.push(u8::try_from(h * 16 + l).unwrap_or(b'%'));
+            if cur[i] == b'%' {
+                if cur
+                    .get(i + 1)
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&b'u'))
+                    && cur.len() >= i + 6
+                    && cur[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit)
+                {
+                    return true;
+                }
+                if let Some(b) = hex_pair(&cur, i) {
+                    if b < 0x20
+                        || b == 0x7f
+                        || matches!(b, b'.' | b'/' | b'\\')
+                        || (depth >= 2 && b == b';')
+                    {
+                        return true;
+                    }
+                    out.push(b);
+                    decoded = true;
                     i += 3;
                     continue;
                 }
             }
-            out.push(cur[i].to_ascii_lowercase());
+            out.push(cur[i]);
             i += 1;
         }
-        if [&b"%2e"[..], b"%2f", b"%5c", b"%00"]
-            .iter()
-            .any(|s| out.windows(s.len()).any(|w| w == *s))
-        {
-            return true;
-        }
-        if !out.contains(&b'%') {
+        if !decoded {
             return false;
+        }
+        if std::str::from_utf8(&out).is_err() || dot_segment(&out) {
+            return true;
         }
         cur = out;
     }
-    false
+    (0..cur.len()).any(|i| cur[i] == b'%' && hex_pair(&cur, i).is_some())
+}
+
+fn hex_pair(b: &[u8], i: usize) -> Option<u8> {
+    let d = |j: usize| b.get(j).and_then(|c| (*c as char).to_digit(16));
+    u8::try_from(d(i + 1)? * 16 + d(i + 2)?).ok()
+}
+
+/// A `.` or `..` segment, ignoring any `;` path parameter (a servlet container reads `..;x`
+/// as `..`).
+fn dot_segment(p: &[u8]) -> bool {
+    p.split(|&c| c == b'/').skip(1).any(|s| {
+        let name = s.split(|&c| c == b';').next().unwrap_or_default();
+        name == b"." || name == b".."
+    })
 }
 
 /// The parts of a `/ap/<caller-key>/<route>/<rest>` path.

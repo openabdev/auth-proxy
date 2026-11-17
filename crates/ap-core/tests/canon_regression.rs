@@ -88,6 +88,106 @@ fn path_encoding_classes_are_refused() {
 }
 
 #[test]
+fn layered_and_mixed_case_encodings_are_refused() {
+    ambiguous_all(
+        "layered encodings, any hex case",
+        &[
+            "/v1/%25%32%46admin",
+            "/v1/%25%32%66admin",
+            "/v1/%25%32%45%25%32%45/admin",
+            "/v1/%25%32%65%25%32%65/admin",
+            "/v1/%25%35%43admin",
+            "/v1/%25%35%63admin",
+            "/v1/%2%45",
+            "/v1/%2%65/x",
+            "/v1/%2%46x",
+            "/v1/%252E%252e/x",
+            "/v1/%25252e",
+            "/v1/%25%32%35%32%66",
+            "/v1/%252525252e%252525252e/admin",
+            "/v1/%2525252525x",
+            "/v1/%25%33%62",
+            "/v1/%2525%33%62",
+        ],
+    );
+    ambiguous_all(
+        "encoded NUL and control characters, any layer",
+        &[
+            "/v1/%00",
+            "/v1/%0a",
+            "/v1/%0D",
+            "/v1/%1f",
+            "/v1/%7f",
+            "/v1/%7F",
+            "/v1/%2500",
+            "/v1/%250a",
+            "/v1/%25%30%30",
+            "/v1/%25%30%61",
+            "/v1/%25%37%46",
+        ],
+    );
+    ambiguous_all(
+        "overlong, invalid and IIS-style UTF-8",
+        &[
+            "/v1/%c0%ae",
+            "/v1/%C0%AE%C0%AE/x",
+            "/v1/%c0%af",
+            "/v1/%c1%9c",
+            "/v1/%e0%80%ae",
+            "/v1/%e0%80%af",
+            "/v1/%f0%80%80%ae",
+            "/v1/%ff",
+            "/v1/%80",
+            "/v1/%c3",
+            "/v1/%ed%a0%80",
+            "/v1/%u002e",
+            "/v1/%U002E",
+            "/v1/%u002f",
+            "/v1/%u005c",
+        ],
+    );
+}
+
+#[test]
+fn encoded_semicolon_on_dot_segments_is_refused() {
+    ambiguous_all(
+        "encoded `;` makes a dot segment carry a parameter",
+        &[
+            "/v1/..%3b/admin",
+            "/v1/..%3B/admin",
+            "/v1/.%3b/x",
+            "/v1/.%3B",
+            "/v1/..%3bx/admin",
+            "/v1/..%3Bx",
+            "/v1/.%3b.",
+            "/v1/.%3b./x",
+            "/v1/..%3b%2f",
+            "/v1/..%3b%2fadmin",
+            "/v1/%2e%2e%3b/admin",
+            "/v1/%2e%2e%3B",
+            "/v1/..%253b/admin",
+            "/v1/..%253B/admin",
+            "/v1/.%253b/x",
+            "/v1/..%25%33%62/x",
+            "/..%3b/x",
+            "/v1/a/..%3b/b",
+            "/v1/..%3b%3b/x",
+        ],
+    );
+    // `;` in every segment of a path that has no dot segment is data and passes.
+    for p in [
+        "/a;b/c;d/e;f",
+        "/;/;/;",
+        "/v1/%3bx",
+        "/v1/a%3bb",
+        "/v1/a%3b",
+        "/v1/%3b..",
+    ] {
+        assert!(!path_ambiguous(p), "{p:?} must pass");
+    }
+}
+
+#[test]
 fn ordinary_paths_pass_unchanged() {
     for p in [
         "/",
@@ -103,6 +203,12 @@ fn ordinary_paths_pass_unchanged() {
         "/v1/%e2%82%ac",
         "/v1/%zz",
         "/v1/%",
+        "/v1/%2",
+        "/v1/%c3%a9",
+        "/v1/%C3%A9",
+        "/v1/%f0%9f%98%80",
+        "/v1/%2541",
+        "/v1/100%25%25",
     ] {
         assert!(!path_ambiguous(p), "{p:?} must pass");
     }
@@ -395,8 +501,8 @@ fn unicode_and_idn_never_reach_the_matcher() {
         }
     }
     assert!(Uri::from_str("http://exämple.com/x").is_err());
-    // Overlong UTF-8 for `.` and `/` is plain ASCII on the wire: opaque bytes, not a dot.
-    assert!(!path_ambiguous("/v1/%C0%AE%C0%AE/x"));
+    // Overlong UTF-8 for `.` and `/` is read as a dot by lenient decoders: refused.
+    assert!(path_ambiguous("/v1/%C0%AE%C0%AE/x"));
     // Header values with obs-text are not valid UTF-8 text for our readers.
     let h = {
         let mut h = HeaderMap::new();

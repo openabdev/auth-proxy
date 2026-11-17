@@ -33,10 +33,77 @@ impl Rng {
 }
 
 const ATOMS: &[&str] = &[
-    "a", "v1", "msg", "..", ".", "...", "%2e", "%2E", "%2f", "%5c", "%00", "%25", "%252f", "%255c",
-    "%2500", "%", "%zz", ";", "a;b", "..;", ".;x", "\\", "{", "}", "|", "^", "\"", "<", ">", "`",
-    "[", "]", "@", ":", "*", "~", "é", "\u{ff0e}", "%C3%A9", "%41", "+", "=", "&", "!", "$", "'",
-    "(", ")", ",", "-", "_", "ap", "up", "%20", " ",
+    "a",
+    "v1",
+    "msg",
+    "..",
+    ".",
+    "...",
+    "%2e",
+    "%2E",
+    "%2f",
+    "%5c",
+    "%00",
+    "%25",
+    "%252f",
+    "%255c",
+    "%2500",
+    "%",
+    "%zz",
+    ";",
+    "a;b",
+    "..;",
+    ".;x",
+    "\\",
+    "{",
+    "}",
+    "|",
+    "^",
+    "\"",
+    "<",
+    ">",
+    "`",
+    "[",
+    "]",
+    "@",
+    ":",
+    "*",
+    "~",
+    "é",
+    "\u{ff0e}",
+    "%C3%A9",
+    "%41",
+    "+",
+    "=",
+    "&",
+    "!",
+    "$",
+    "'",
+    "(",
+    ")",
+    ",",
+    "-",
+    "_",
+    "ap",
+    "up",
+    "%20",
+    " ",
+    "%3b",
+    "%3B",
+    "%253b",
+    "..%3b",
+    ".%3b",
+    ".%3b.",
+    "%25%32%46",
+    "%25%32%45",
+    "%25%35%43",
+    "%2%45",
+    "%c0%ae",
+    "%e0%80%af",
+    "%ff",
+    "%u002e",
+    "%0a",
+    "%2525252e",
 ];
 const SEPS: &[&str] = &["/", "/", "/", "", "//"];
 
@@ -83,13 +150,11 @@ async fn matched_path_is_the_forwarded_path() {
         let body = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
         if status != 200 {
             refused += 1;
-            if status != 502 {
-                assert_eq!(
-                    up.hits.load(Ordering::SeqCst),
-                    hits_before,
-                    "#{i} {target:?}: refused with {status} but upstream was contacted"
-                );
-            }
+            assert_eq!(
+                up.hits.load(Ordering::SeqCst),
+                hits_before,
+                "#{i} {target:?}: refused with {status} but upstream was contacted"
+            );
             continue;
         }
         forwarded += 1;

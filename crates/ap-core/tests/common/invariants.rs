@@ -84,6 +84,7 @@ pub fn check_path_against_parsers(p: &str) {
 /// Everything about a request path that must hold for any string.
 pub fn check_path(p: &str) {
     check_ap_path(p);
+    check_decode_oracle(p);
     check_path_against_parsers(p);
 }
 
@@ -212,4 +213,77 @@ pub fn check_origin(target: &str, hosts: &[Vec<u8>], http2: bool, expected: &str
         }
     }
     assert!(!expected.contains('@'));
+}
+
+/// Independent oracle for the layered-decode rule. It decodes to a fixed point with a different
+/// implementation (char-level, each byte carrying the depth that produced it) and states what
+/// must be refused: a dot, slash, backslash, NUL or control byte produced by any decode, a
+/// semicolon produced from the second layer on, a `.`/`..` segment (before any `;`) in any
+/// layer, and an escape still decodable after four layers. If the oracle demands refusal,
+/// `path_ambiguous` must refuse; the reverse is not asserted because the production rule also
+/// refuses bytes the forwarder would re-encode, `%u` escapes and invalid UTF-8.
+pub fn check_decode_oracle(p: &str) {
+    if oracle_must_refuse(p) {
+        assert!(
+            path_ambiguous(p),
+            "decode oracle demands refusal but path_ambiguous accepted {p:?}"
+        );
+    }
+}
+
+fn oracle_must_refuse(p: &str) -> bool {
+    // (byte, depth that produced it; 0 = literal)
+    let mut layer: Vec<(u8, usize)> = p.bytes().map(|b| (b, 0)).collect();
+    for depth in 1..=4 {
+        if has_dot_segment(&layer) {
+            return true;
+        }
+        let mut next = Vec::new();
+        let mut changed = false;
+        let mut i = 0;
+        while i < layer.len() {
+            let esc = (layer[i].0 == b'%' && i + 2 < layer.len())
+                .then(|| {
+                    let hex: String = layer[i + 1..i + 3].iter().map(|x| x.0 as char).collect();
+                    (hex.len() == 2 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+                        .then(|| u8::from_str_radix(&hex, 16).unwrap())
+                })
+                .flatten();
+            match esc {
+                Some(b) => {
+                    if matches!(b, 0 | b'.' | b'/' | b'\\') || b < 0x20 || b == 0x7f {
+                        return true;
+                    }
+                    if b == b';' && depth >= 2 {
+                        return true;
+                    }
+                    next.push((b, depth));
+                    changed = true;
+                    i += 3;
+                }
+                None => {
+                    next.push(layer[i]);
+                    i += 1;
+                }
+            }
+        }
+        if !changed {
+            return false;
+        }
+        layer = next;
+    }
+    has_dot_segment(&layer)
+        || (0..layer.len()).any(|i| {
+            layer[i].0 == b'%'
+                && layer.len() > i + 2
+                && layer[i + 1].0.is_ascii_hexdigit()
+                && layer[i + 2].0.is_ascii_hexdigit()
+        })
+}
+
+fn has_dot_segment(layer: &[(u8, usize)]) -> bool {
+    let text: String = layer.iter().map(|x| x.0 as char).collect();
+    text.split('/')
+        .skip(1)
+        .any(|seg| matches!(seg.split(';').next(), Some(".") | Some("..")))
 }

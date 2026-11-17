@@ -664,7 +664,11 @@ def pt18(c):
     checks = []
     for p in ["/discord/v1/%252f", "/discord/v1/%255c", "/discord/v1/%2500", "/discord/v1%2fx",
               "/discord/v1/%5cx", "/discord/v1/..;/x", "/discord/v1/.;/x", "/discord/v1/{x}", '/discord/v1/a"b',
-              "/discord/v1/caf\u00e9", "/discord/v1/\uff0e\uff0e/x"]:
+              "/discord/v1/caf\u00e9", "/discord/v1/\uff0e\uff0e/x",
+              "/discord/v1/..%3b/x", "/discord/v1/.%3B/x", "/discord/v1/..%253b/x",
+              "/discord/v1/%25%32%46x", "/discord/v1/%25%32%45%25%32%45/x", "/discord/v1/%25%35%43x",
+              "/discord/v1/%2%45", "/discord/v1/%252525252e/x", "/discord/v1/%0a",
+              "/discord/v1/%c0%ae/x", "/discord/v1/%u002e"]:
         checks.append(canon_refused(c, p, get(p), None if not p.isascii() else {"path_ambiguous"}))
     for label, key in [("empty key", ""), ("key %2f", k + "%2f"), ("key ;", k + ";x"),
                        ("key upper", k.upper()), ("key short", k[:-1]), ("key long", k + "0")]:

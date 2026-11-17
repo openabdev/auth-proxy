@@ -187,8 +187,10 @@ def main():
         cv = volumes[cred_vols[0]]["secret"]
         check(
             "credential-secret-mode-0444",
-            cv.get("defaultMode") == SECRET_FILE_MODE,
-            "defaultMode is %s" % cv.get("defaultMode"),
+            cv.get("defaultMode") == SECRET_FILE_MODE
+            and all(i.get("mode") in (None, SECRET_FILE_MODE) for i in cv.get("items", [])),
+            "defaultMode is %s, item modes %s"
+            % (cv.get("defaultMode"), [i.get("mode") for i in cv.get("items", [])]),
         )
 
     def mount_names(container_name):
@@ -217,6 +219,87 @@ def main():
         ),
     )
 
+    # Credential Secret at-rest rules (docs: README "Credential Secret at-rest requirements").
+    # Any volume that names the credential Secret anywhere must be a plain `secret` volume, so a
+    # PVC, projected, hostPath or CSI volume cannot carry the credential.
+    cred_named = sorted(
+        n for n, v in volumes.items()
+        if any(isinstance(x, str) and x == CREDENTIAL_SECRET for _, x in walk(v))
+    )
+    not_secret_type = [n for n in cred_named if "secret" not in volumes[n]]
+    check(
+        "credential-volume-is-secret-type",
+        not not_secret_type,
+        "volumes %s name %s but are not secret volumes" % (not_secret_type, CREDENTIAL_SECRET),
+    )
+    # No other volume may be mounted under the credential directory the proxy reads from.
+    cred_dir = "/var/run/auth-proxy/secrets"
+    # Every container list in the Pod spec, ephemeral containers included. The API server rejects
+    # ephemeralContainers on Pod create; they are added later through pods/ephemeralcontainers
+    # (a runtime gap, see README), but a manifest that carries them must not slip past.
+    all_ctrs = (
+        inits + spec.get("containers", []) + spec.get("ephemeralContainers", [])
+    )
+    stray = sorted(
+        "%s:%s" % (c.get("name"), m.get("mountPath"))
+        for c in all_ctrs
+        for m in c.get("volumeMounts", [])
+        if (m.get("mountPath") or "").startswith(cred_dir)
+        and m.get("name") not in cred_vols
+    )
+    check(
+        "credential-dir-only-holds-credential-volume",
+        not stray,
+        "non-credential mounts under %s: %s" % (cred_dir, stray),
+    )
+    cred_holders = sorted(
+        c.get("name") for c in all_ctrs
+        if mount_names_of(c) & set(cred_vols + cred_named)
+    )
+    check(
+        "credential-mounted-only-by-proxy",
+        cred_holders == ["proxy"],
+        "credential volume is mounted by %s" % cred_holders,
+    )
+    cred_mounts = [
+        m for m in containers.get("proxy", {}).get("volumeMounts", [])
+        if m.get("name") in set(cred_vols + cred_named)
+    ]
+    check(
+        "credential-mount-read-only",
+        len(cred_mounts) == 1 and cred_mounts[0].get("readOnly") is True,
+        "proxy credential mounts: %s" % cred_mounts,
+    )
+    # A subPath mount does not receive Secret updates, which would silently stop the kubelet's
+    # atomic swap that credential rotation relies on (docs/design/phase1.md, S1). Forbidden.
+    check(
+        "credential-mount-no-subpath",
+        all("subPath" not in m and "subPathExpr" not in m for m in cred_mounts),
+        "proxy credential mounts: %s" % cred_mounts,
+    )
+    # No hostPath volume anywhere in the Pod: it would reach the node filesystem, where the
+    # kubelet keeps the Secret copy, without naming the Secret.
+    host_vols = sorted(n for n, v in volumes.items() if "hostPath" in v)
+    check(
+        "no-hostpath-volumes",
+        not host_vols,
+        "hostPath volumes: %s" % host_vols,
+    )
+    env_refs = []
+    for c in all_ctrs:
+        for e in c.get("env", []):
+            ref = e.get("valueFrom", {}).get("secretKeyRef", {})
+            if ref.get("name") == CREDENTIAL_SECRET:
+                env_refs.append("%s env %s" % (c.get("name"), e.get("name")))
+        for ef in c.get("envFrom", []):
+            if ef.get("secretRef", {}).get("name") == CREDENTIAL_SECRET:
+                env_refs.append("%s envFrom" % c.get("name"))
+    check(
+        "credential-not-referenced-by-env",
+        not env_refs,
+        "credential Secret referenced by %s" % env_refs,
+    )
+
     # The runtime-key Secret: one volume, mode 0444, mounted read-only into the runtime alone.
     runtime_key_vols = [
         n for n, v in secret_vols.items()
@@ -228,8 +311,10 @@ def main():
         rk = volumes[rk_name]["secret"]
         check(
             "runtime-key-mode-0444",
-            rk.get("defaultMode") == SECRET_FILE_MODE,
-            "defaultMode is %s" % rk.get("defaultMode"),
+            rk.get("defaultMode") == SECRET_FILE_MODE
+            and all(i.get("mode") in (None, SECRET_FILE_MODE) for i in rk.get("items", [])),
+            "defaultMode is %s, item modes %s"
+            % (rk.get("defaultMode"), [i.get("mode") for i in rk.get("items", [])]),
         )
         items = [i.get("key") for i in rk.get("items", [])]
         check(

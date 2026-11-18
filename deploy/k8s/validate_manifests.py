@@ -314,6 +314,19 @@ def main():
     ]
     check("runtime-key-secret-volume-present", len(runtime_key_vols) == 1)
     rk_name = runtime_key_vols[0] if len(runtime_key_vols) == 1 else None
+    # Any volume that names the seed Secret anywhere must be a plain `secret` volume, as the
+    # credential rule requires (cred_named). A projected or other volume would otherwise carry the
+    # seed past the holder checks below, which only look at the one secret volume.
+    rk_named = sorted(
+        n for n, v in volumes.items()
+        if any(isinstance(x, str) and x == RUNTIME_KEY_SECRET for _, x in walk(v))
+    )
+    rk_not_secret = [n for n in rk_named if "secret" not in volumes[n]]
+    check(
+        "runtime-key-volume-is-secret-type",
+        not rk_not_secret,
+        "volumes %s name %s but are not secret volumes" % (rk_not_secret, RUNTIME_KEY_SECRET),
+    )
     if rk_name:
         rk = volumes[rk_name]["secret"]
         check(
@@ -331,8 +344,8 @@ def main():
         )
     holders = sorted(
         [c.get("name") for c in containers.values()
-         if rk_name in mount_names_of(c)]
-        + [c.get("name") for c in inits if rk_name in mount_names_of(c)]
+         if mount_names_of(c) & set(rk_named)]
+        + [c.get("name") for c in inits if mount_names_of(c) & set(rk_named)]
     ) if rk_name else []
     check(
         "runtime-key-mounted-only-by-runtime",
@@ -1005,7 +1018,7 @@ def main():
         "--seed-file %s, mount %s" % (rt_seed, rt_key_mount),
     )
     seed_holders = sorted(
-        c.get("name") for c in all_ctrs if rk_name and rk_name in mount_names_of(c)
+        c.get("name") for c in all_ctrs if rk_name and mount_names_of(c) & set(rk_named)
     )
     check(
         "runtime-key-not-in-any-other-container-list",

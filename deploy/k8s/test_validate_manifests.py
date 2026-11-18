@@ -314,6 +314,19 @@ class ValidatorTests(unittest.TestCase):
         copy.edit_pod(mutate)
         self.assert_fails(copy, "runtime-key-mode-0444")
 
+    def test_runtime_key_through_a_projected_volume_in_the_agent_is_refused(self):
+        copy = Copy(self)
+
+        def mutate(pod):
+            pod["spec"]["volumes"].append({"name": "pj", "projected": {"sources": [
+                {"secret": {"name": "auth-proxy-runtime-key"}}]}})
+            copy.container(pod, "agent")["volumeMounts"].append(
+                {"name": "pj", "mountPath": "/k", "readOnly": True})
+
+        copy.edit_pod(mutate)
+        self.assert_fails(copy, "runtime-key-volume-is-secret-type")
+        self.assert_fails(copy, "runtime-key-not-in-any-other-container-list")
+
     def test_hostpath_volume_is_refused(self):
         copy = Copy(self)
 

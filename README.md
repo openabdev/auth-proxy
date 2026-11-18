@@ -145,7 +145,6 @@ Implemented and tested in Phase 1:
 - Matrix positive rows run against a feature-enabled test binary, not the release binary
 - Live run of the K8s pod on a cluster is not in CI: the validator checks the manifest only
 - The signature check on the runtime proof is not a constant-time comparison. The design note explains why; revisit if the proof path changes.
-- The manifest validator does not catch the runtime proof seed being exposed through env or secretKeyRef. Add a check.
 - The 503 error code on the hello path is `unavailable` in the code and `broker_unavailable` elsewhere in the design. Align them.
 - The final checks summary lists one test target with 0 passed; the workspace total (289) appears only in the report.
 
@@ -393,7 +392,10 @@ verified against a cluster.
     Minimum principal: grant none of `pods/exec`, `pods/attach`, `pods/ephemeralcontainers` and
     `nodes/proxy` in `auth-proxy` (or on its node, for `nodes/proxy`) to anyone, apart from a
     named break-glass administrator, and treat each like `get` on `auth-proxy-kiro`.
-    **[untested]**
+    The seed has the same run-time exposure: a principal that can create a `pods/ephemeralcontainers`
+    entry with `targetContainerName: runtime` (or run `kubectl debug --target=runtime`) can read it
+    through the shared process namespace, so treat that verb like `get` on `auth-proxy-runtime-key`
+    too. **[untested]**
 - Backups and snapshots: etcd snapshots, Velero-style namespace backups and node disk snapshots
   must be encrypted, or must exclude `auth-proxy-kiro`. This is repo policy and no cited page
   states it. **[untested]**

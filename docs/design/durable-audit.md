@@ -1,6 +1,7 @@
 # Durable, fail-closed audit: an opt-in mode
 
-Status: **draft, revision 2 after review feedback. Not final, no implementation before a re-review.**
+Status: **draft, revision 3. Not final, no implementation before a confirming council review.** Revision 3
+resolves the three blockers that the second council review (opus5) raised; section 0 lists them.
 Design note only. No code in this change.
 Issue: #32 (p2, enhancement). Related: #1 (RFC, open question 5), #5 (approval lines), PR #29
 (Muse stage 2, **in review, not merged, and still changing**).
@@ -16,12 +17,57 @@ Issue: #32 (p2, enhancement). Related: #1 (RFC, open question 5), #5 (approval l
 PR #29 is in review and moves. The first revision of this note read it at `6f3e678`; this revision
 re-read the points that matter at `e7818ad` (section 12). Every statement about PR #29 is a fact about
 those commits only. This design depends on the *shape* of PR #29 (a fallible write that must succeed
-before a write is forwarded, a `forward_started` record written after the upstream connection exists
-and before the first request byte), not on names, signatures or line numbers.
+before a write is forwarded, and a `forward_started` record that must be durable before the upstream
+connect and the first request byte, which PR #29 must move to; section 1.2), not on names, signatures or line numbers.
 
 Decisions are marked in section 11 as **DECIDED** (settled in review, change only with a new review) or
 **PROPOSED DEFAULT, owner approval pending** (the owner accepts them in one answer, or replaces them).
 Where the text depends on a pending default it says so.
+
+## 0. Revision 3: resolved blockers, chosen direction, and what is not guaranteed
+
+**Chosen direction: option B**, the durable fail-closed mode described in this note, for held writes
+first. Both council members chose B and rated it reversible. This note does not restate the alternatives
+labelled A and C; the labels are not defined in revisions 1 and 2.
+
+Blocker 1, `forward_started` and the first byte (section 3.2, 4.2, 7.1, 10 test 6). **Resolved by
+moving the durable write earlier.** `forward_started` is durable before the proxy connects upstream and
+before the request is handed to the HTTP client. No body poll, connection poll or other task in the
+forward path waits on the audit sink. If the write fails, or the table is closed or the policy changed
+while it waits, the request is refused with 503 `audit_unavailable`: **no connection is opened and no
+request byte is sent.**
+
+Blocker 2, stage-1 quota (4A, 4.3, 4.4, 4.8, 8.3, 10 test 7, section 11 item 21). **Resolved by keeping
+the quota fail-closed until restart, with no automatic recovery.** Stage 1 has no rotation. When the
+quota trips, the proxy refuses every gating write until the process restarts. It deletes nothing. The
+operator sees the signals listed in 4A item 3. The file holds only held-route records in stage 1, so read
+traffic cannot fill it (section 11 item 20).
+
+Blocker 3, directory checks versus `emptyDir` and `fsGroup` (4.1, 4.2, 4.8). **Resolved by removing the
+ancestor and directory mode and owner checks.** The proxy checks the segment file it creates: created
+with `O_EXCL`, a regular file, owned by the proxy's euid, no group or other bits in its mode, one link,
+and a group equal to the proxy's egid or the directory's group. The checks work on `emptyDir` with or
+without `fsGroup`. Section 4.2 lists what they do not prove.
+
+**Guaranteed** (for a held write, in `fail_closed`, on supported local storage): no connection and no
+request byte leave the proxy unless `held`, `approved` and `forward_started` were reported durable first,
+and a refused request sends nothing.
+
+**Not guaranteed:** that the outcome of a sent request is recorded; anything about records of reads,
+sidecar traffic, denials or refusals (they stay on stdout in stage 1 and are not durable); that the file
+is not deleted, truncated or replaced by someone with file access; the disk's flush honesty; restart
+recovery of records that were queued but not acknowledged; anything after an `emptyDir` pod is deleted,
+unless the records were shipped first; read access to the file by any UID that can bypass file mode
+(root in the container); and the dependence on PR #29's shape, which is in review and must change in one
+place (section 1.2).
+
+**Council points not addressed in this revision** (raised by sol or opus5, still open): the 2000 ms audit
+timeout versus PR #29's 2 s approval confirmation (sol 1, opus5 item 2); `approved` and the `Stuck` rule
+with channel 1024 (opus5 item (d)); the `prev_tail` predecessor choice and the clean-shutdown marker
+(sol 9); the segment-creation collision after a failed directory sync (sol 5); the gap arithmetic when a
+quota refusal happens before sequence assignment (sol 6, now answered by 4A item 3: quota writes no gap);
+the EXT4 magic family (sol 11); the shipper's UID (sol 12); the UID separation check (sol 10); the late
+`Ok` readiness rule (opus5 item (d)). These need a further revision before the note is final.
 
 ## 1. Problem and what exists today
 
@@ -78,6 +124,13 @@ In the PR #29 branch the mechanism is `AuditSink::try_write_hold` and `try_write
 The consequence for wording: **PR #29 does not write `forward_started` before contacting the upstream.
 It writes it after the TCP/TLS connection and before the first request byte.** Section 3.2 defines the
 guarantee on the first request byte for that reason.
+
+Revision 3 changes where the write sits. In a poll-based design, the write cannot wait on the disk inside
+the body poll: hyper flushes the buffered request head when a body poll returns `Pending`, so the head
+would leave before the write is durable [read by the council, hyper 1.9.0 `proto/h1/dispatch.rs`, not
+re-read in this revision]. Revision 3 therefore requires the `forward_started` write to move out of
+`HoldTable::claim_start` and `HeldBody::poll_next` to the point before the request is handed to the HTTP
+client (section 4.2). This is a change to PR #29, which is still in review. It is not made here.
 
 That rule is fail-closed in the sense "no record accepted, no write". It is **not durable**: on a
 file, `flush` of a `File` is a no-op in std [read std, `File::flush`] and the bytes sit in the page
@@ -164,10 +217,10 @@ and `heartbeat_secs`; they are not part of stage 1.
 
 **The action boundary is the first request byte** sent upstream (for a held write: the first byte
 flushed on the upstream connection; for the sidecar and for reads, when stage 3 gates them: the
-moment the request is handed to the HTTP client). The upstream TCP/TLS connect is **not** the boundary:
-PR #29 connects first and writes `forward_started` after, and a pooled connection may already be open
-for the sidecar [read, PR #29 at `e7818ad`]. A connect leaks only that a connection was made; it is
-not the action.
+moment the request is handed to the HTTP client). Revision 3 adds a stricter rule for held writes:
+`forward_started` is durable **before the connect and before the request is handed to the HTTP client**,
+so the connect is also after the record. The connect itself is not the action; it is ordered after the
+record only so that a refused request opens no connection.
 
 For a held write the order, with its durability points, is:
 
@@ -175,29 +228,34 @@ For a held write the order, with its durability points, is:
 2. `approved` is enqueued when the approval is seen and is durable **no later than the ack of
    `forward_started`** (same writer, same file, one sync covers both, section 3.3). If `approved` cannot
    be enqueued the forward is refused.
-3. The upstream connection is made. It is allowed to precede `forward_started`.
-4. `forward_started` is durable **after the connect and before any request byte**.
+3. `forward_started` is durable **before the upstream connect and before any request byte**. If it cannot
+   be made durable the request is refused with 503 `audit_unavailable`, and nothing is connected or sent.
+4. The upstream connection is made, after the ack of step 3.
 5. The first request byte is sent.
+
+No code path in the forward (body poll, connection task, pool) waits on the audit sink after step 3
+starts. Step 3 runs in the request handler before the request is given to the HTTP client, which is the
+only place where a blocking wait cannot leave a request head buffered and flushed behind it.
 
 | | `best_effort` (default) | `fail_closed` (stage 1: held writes) |
 |---|---|---|
 | Passthrough held write (PR #29, in review) | PR #29's rule as written: `held` and `forward_started` must be written and flushed (`Ok`), otherwise 503 `audit_unavailable`. Not durable. `approved` is best effort | Same refusals, same wire (section 9.1), but "written" means durable (section 4.1). `approved` is required: it is enqueued before the forward and covered by the ack of `forward_started` |
 | Passthrough read, sidecar request | One record after the fact. A write failure is counted. Never refused for audit reasons | **Unchanged in stage 1.** Not covered by the guarantee. Gated in stage 3 only if the owner accepts (open question 1) |
 | Refusal (deny, `unavailable`, ...) | One record at refusal time, best effort | One record at refusal time on the non-waiting path. If it cannot be written the refusal stands and the failure is counted |
-| Sink | stdout or file, no durability claim | file only, on supported local Linux storage (4.1) |
+| Sink | stdout or file, no durability claim | held-route records to the file, on supported local Linux storage (4.1). Other records stay on stdout (3.3) and carry no durability claim |
 | What a reader may conclude | Records that exist are true. Absence proves nothing | Section 7.3, with its conditions |
 
 [A, design]. The exact guarantee of `fail_closed`, for a request in scope, is one sentence:
 
 > If the proxy sent the first request byte of a request upstream, the records that authorize it
-> (`held` before admission, `approved`, and `forward_started` after the connect) were reported durable
-> by the operating system, on supported local Linux storage, before that byte, **or** a `gap` record
-> says records may be missing from an interval that contains them.
+> (`held` before admission, `approved`, and `forward_started` before the connect) were reported durable
+> by the operating system, on supported local Linux storage, before that byte. A request whose gating
+> record was not acknowledged is refused and sends nothing.
 
 What it does not say: that the outcome is recorded; that the record is on the *medium* (a disk that
 lies about flush defeats it); that the file was not deleted or truncated afterwards (section 7.3);
 that anything outside the proxy's observation happened. For a request out of scope (stage 1: reads and
-the sidecar) it says nothing.
+the sidecar) it says nothing. Section 0 lists the rest.
 
 ### 3.3 Record kinds and when they are written
 
@@ -206,11 +264,17 @@ refused if it cannot be. "Gating" is the same thing seen from the request. Every
 "after" and goes through the **non-waiting path** (4.7): attempted, counted when it fails, and it never
 changes what the request sees.
 
+**Stage 1 placement.** In `fail_closed` the file sink carries only **held-route** records (the rows
+marked PR #29 below, plus `start`, `gap` and `segment_start`). Records of reads, sidecar traffic,
+refusals on other routes, `netfilter`, `session` and `probe` stay on stdout exactly as today, in both
+modes. This keeps read volume from filling the file and latching the held-write quota (4A item 3,
+section 11 item 20).
+
 | Kind | Pipeline | When | Write-ahead (gating) in `fail_closed`? | If the write fails |
 |---|---|---|---|---|
 | `held` (PR #29) | passthrough held write | before the entry becomes visible (reserve, persist, commit, 4.2) | **yes** | 503 `audit_unavailable`, no entry, no notification [read, PR #29] |
 | `approved` (PR #29) | passthrough held write | when the waiting handler sees the approval, enqueued immediately before `forward_started` | **yes, decided** (open question 2): durable by the ack of `forward_started` | refuse `audit_unavailable`, nothing sent, approver is told `audit_unavailable` (the result code exists in PR #29) |
-| `forward_started` (PR #29) | passthrough held write | after the connect, before the first request byte | **yes** | 503 `audit_unavailable`, nothing sent |
+| `forward_started` (PR #29) | passthrough held write | after the claim check, **before the connect and before any request byte** (3.2, 4.2) | **yes** | 503 `audit_unavailable`, no connection, nothing sent |
 | `denied`, `expired`, `abandoned`, `superseded`, `dropped_on_reload`, `abandoned_after_approve`, `connect_failed` (PR #29) | held write | at the transition. In every one of them nothing was sent | no, **after** (non-waiting) | counted. The reader concludes "not sent" from the absence of `forward_started` (7.3) |
 | `completed` (PR #29) | held write | when the response body ends | no, **after** | counted |
 | `audit_unavailable` (PR #29 transition) | held write | when a gating write failed | no, **after**, non-waiting. The sink is probably down | counted |
@@ -284,9 +348,11 @@ prove a record reached storage. A `fail_closed` configuration that names them do
 **Kubernetes `emptyDir`.** Even on node disk it is deleted with the pod. It survives a container
 restart and, while the node's disk is intact, a node crash with the same pod [I]; it does not survive
 pod deletion, eviction or rescheduling. So "durable" on `emptyDir` means "survives a crash of the
-node's kernel, not the loss of the pod". A persistent volume, or shipping the records off the pod
-before they matter, is a **deployment requirement** (open question 12, and the `emptyDir` question in
-section 11).
+node's kernel, not the loss of the pod". The kubelet creates the volume root as world-writable (0777), and
+with `fsGroup` as group-writable with setgid [I, kubelet behaviour, not checked here]. Section 4.2 therefore
+does not check the directory's mode or owner. An `emptyDir` is acceptable only with shipping off the pod
+before the records matter (open question 16). Otherwise a persistent volume is a **deployment
+requirement** (open question 12).
 
 **macOS.** Not a supported target. Rust's std on Apple targets implements **both** `sync_all` and
 `sync_data` as `fcntl(F_FULLFSYNC)`, and on Linux `sync_data` as `fdatasync` [read std at rustc
@@ -298,13 +364,14 @@ So Rust's `sync_data` on macOS is the slow call of section 4.6, not the fast one
 **Directory and file security.** [A, design, except where tagged]
 
 - `dir` is an absolute path. The proxy opens it by walking the components from `/` with
-  `openat(O_DIRECTORY|O_NOFOLLOW)`. `O_NOFOLLOW` only protects the **last** component of a path, so the
-  walk is what makes a swapped symlink in the middle fail. Every ancestor must be owned by root or the
-  proxy's euid and not group- or world-writable (sticky directories are refused for this purpose). All
-  later operations (create, `fstat`, directory sync, size scan) use the directory descriptor with
+  `openat(O_DIRECTORY|O_NOFOLLOW)`, which makes a symlink in any component fail. If the final component
+  does not exist the proxy creates it with `mkdirat(0700)`. If it exists the proxy uses it **as found**:
+  no owner, group or mode check is applied to the directory or to its ancestors. This is what lets the
+  same rule run on an `emptyDir` (the kubelet creates it 0777, or group-writable with `fsGroup`) and on a
+  PVC. All later operations (create, `fstat`, directory sync, size scan) use the directory descriptor with
   `openat`/`fstatat`, never a path string.
-- The audit directory itself must be **owned by the proxy's euid with mode `0700`** (no group or other
-  bits at all). Startup `fstat`s the directory descriptor and refuses otherwise.
+- The file checks in the next bullets are the protection this section relies on. They are made on the
+  **segment file the proxy created**, not on the directory.
 - The proxy's UID must **differ from the agent's UID**. Where the profile declares the agent UID (the
   netfilter owner match and the probe status file's expected owner are configured today [read
   `netguard.rs`]), startup compares them and refuses to start on equality. Elsewhere it is a documented
@@ -314,8 +381,23 @@ So Rust's `sync_data` on macOS is the slow call of section 4.6, not the fast one
   0600)`. `O_EXCL` guarantees the file is new, so the `0600` applies. **`open(..., 0600)` does not change
   the mode or owner of a file that already exists**, so the proxy never reuses an existing file: every
   segment is new (4.5).
-- After open, on the opened descriptor: `fstat` and require a regular file, `st_uid == euid`,
-  `mode & 0o077 == 0` and `st_nlink == 1`. Any other result is a startup or recovery failure.
+- After open, on the opened descriptor, `fstat` and require: a regular file; `st_uid == euid`; `st_gid` equal
+  to the proxy's egid or to the directory's group (read with `fstat` on the directory descriptor, which is
+  the `fsGroup` case); `mode & 0o077 == 0`; and `st_nlink == 1`. Any other result is a startup or
+  recovery failure. These checks run on the file, so they hold on `emptyDir` with or without `fsGroup`:
+  `fsGroup` changes the group of the file and the directory, not the mode the proxy passed to `open`.
+- **What the file checks give, and what they do not** [A, design]:
+  - They confirm that the descriptor is the file the proxy just created, with the expected owner and no
+    group or other access at creation. `O_EXCL` already guarantees the file did not exist, so a symlink or
+    a planted file at that name makes the open fail.
+  - They do **not** stop another UID that can write the directory from renaming or unlinking the file, or
+    from creating a new file, while the proxy runs. A world-writable `emptyDir` lets any UID in the pod
+    that mounts it do that. The directory is not checked for this, so the protection is that only the
+    proxy's container mounts the volume, which is a deployment requirement.
+  - They do not stop a reader with `CAP_DAC_OVERRIDE` (root in the container) from reading the file.
+  - The owner check is close to a tautology: `O_EXCL` creates the file with the proxy's euid. It is kept
+    because it is cheap and because it catches a filesystem that reports another owner.
+  - Nothing here verifies that the agent runs under another UID (4.8, deployment precondition).
 - Take `flock(LOCK_EX|LOCK_NB)` on the **directory** descriptor and refuse to start if another process
   holds it, so two live proxies cannot write one directory. It is advisory and only stops cooperating
   processes [I]; the directory permissions above are the actual protection.
@@ -374,11 +456,15 @@ its own reservation, and duplicates are resolved at commit, in commit order [A].
 *Forward claim.*
 
 1. Under the lock: `closed` check, the policy look, and mark the entry `Claiming`. Release the lock.
-2. Outside the lock: enqueue `forward_started` and await the durable ack.
-3. Under the lock: if the table was closed or the policy changed while waiting, **do not send**: record a
-   non-waiting `claim_aborted` and refuse. The durable `forward_started` then exists for a request that
-   sent nothing, which the reader treats as "possibly sent" (7.3), the conservative direction. Otherwise
-   mark `Forwarding` and send the first byte.
+2. Outside the lock: enqueue `forward_started` and await the durable ack. The handler does this **before it
+   opens any connection and before it gives the request to the HTTP client**. Nothing else in the forward
+   path waits on the sink.
+3. Under the lock: if the table was closed or the policy changed while waiting, **do not connect and do not
+   send**: record a non-waiting `claim_aborted` and refuse. The durable `forward_started` then exists for a
+   request that sent nothing, which the reader treats as "possibly sent" (7.3), the conservative direction.
+   Otherwise mark `Forwarding`, open or reuse the connection, and send the first byte.
+4. If the ack is an error or times out, the entry is released, nothing is connected and nothing is sent. The
+   request is refused with 503 `audit_unavailable` (section 9.1), and the refusal is a non-waiting record.
 
 `drain_pending` (shutdown) closes the table, then waits for entries in `Claiming` for at most
 `shutdown_grace_ms`; an entry that is still `Claiming` at the deadline is not sent. This keeps the
@@ -394,8 +480,9 @@ The sink is in one of four states, and the transitions are the whole recovery st
 |---|---|---|
 | `Healthy` | the writer is free or working, no job older than `write_timeout_ms` | enqueue and wait up to `write_timeout_ms` |
 | `Stuck` | the oldest job is older than `write_timeout_ms` and the writer has not returned | refused at once (fast fail) |
-| `Failed` | the last write or sync returned an error, or the quota is reached | refused at once |
+| `Failed` | the last write or sync returned an error | refused at once |
 | `Recovering` | the writer is free and is creating a segment and writing the `gap` | refused at once |
+| `Quota` | the directory reached `max_total_bytes` (4A item 3). **Latched until the process restarts**; no recovery attempt | refused at once |
 
 | Event | Writer behaviour | Request sees | State |
 |---|---|---|---|
@@ -405,7 +492,7 @@ The sink is in one of four states, and the transitions are the whole recovery st
 | `ENOSPC` or `EIO` on `sync_data` | the batch is **not** acknowledged. The descriptor is untrusted (4.4) | same, for every request in the batch | `Failed` |
 | Writer blocked in `write` or `sync_data` (slow disk, stuck mount) | the thread cannot be cancelled. See "a blocked writer" below | 503 `audit_unavailable` after `write_timeout_ms`, then at once | `Stuck` |
 | Channel full | not enqueued | immediate 503 `audit_unavailable` | unchanged |
-| Quota reached (4A) | refuses gating jobs at enqueue | immediate 503 `audit_unavailable` | `Failed`, `reason = "quota"` |
+| Quota reached (4A item 3): the next record would exceed `max_total_bytes` | the record is not written and **no `seq` is assigned**; the latch is set; the writer makes no further attempt. No `gap` is written, because no sequence number is lost | immediate 503 `audit_unavailable` until restart | `Quota` |
 | Segment creation or directory sync fails during recovery | stays `Failed`, retried at the next attempt | as above | `Failed` |
 
 [A, design] on all rows. The write timeout starts when the request enqueues the job and ends at the ack.
@@ -462,7 +549,7 @@ therefore **never retries `fsync` on a descriptor that failed**:
 2. On its next attempt (at most one per `retry_ms`, and only when the writer is free), the writer
    closes the old descriptor, creates a **new segment** (4.5) whose name uses `first_seq = M + 1`,
    syncs the directory, and writes as the first record a `gap`:
-   `{"kind":"gap","seq":M+1,"reason":"fsync|write|enospc|timeout|open|quota","last_durable_seq":N,"lost_from_seq":N+1,"lost_to_seq":M,"prev_segment":"<name>"}`.
+   `{"kind":"gap","seq":M+1,"reason":"fsync|write|enospc|timeout|open","last_durable_seq":N,"lost_from_seq":N+1,"lost_to_seq":M,"prev_segment":"<name>"}`.
    Records with `lost_from_seq <= seq <= lost_to_seq` may be absent from the previous segment, or present
    and not durable, or present and durable. The marker says "may", not "are lost".
 3. **The gap has its own sequence number, `M + 1`.** The first record after it carries `M + 2`. The
@@ -472,7 +559,7 @@ therefore **never retries `fsync` on a descriptor that failed**:
 4. When the `gap` record and its sync succeed the sink is `Healthy` for gating purposes after the
    readiness rule of section 8.3, and gating records flow.
 5. If recovery fails (disk still full, directory unwritable) the sink stays `Failed` and the cycle
-   repeats at the next attempt.
+   repeats at the next attempt. A `Quota` latch is not a recovery failure: it is not retried (4A item 3).
 
 A reader that finds a `seq` discontinuity **without** a `gap` marker (a crash, a lost segment) must treat
 it as a gap too (7.2).
@@ -535,11 +622,13 @@ ample for held writes (bounded by a human approval) and the reason group commit 
 ### 4.7 The non-waiting path
 
 `StreamAudit::drop` writes the outcome today, synchronously, in a destructor on a runtime worker [read].
-A durable wait there would block a worker for a sync. In `fail_closed` every record that is not gating
-(outcomes, denies, refusals, terminal transitions, `abandoned`, `claim_aborted`) is a **non-waiting
-append**: put the job in the writer's channel and return. The writer syncs it with the next record. If
-the channel's non-waiting share is full the record is dropped and counted (4A). The client never waits for
-it, and the refusal of a request is never changed because its record could not be queued.
+A durable wait there would block a worker for a sync. In `fail_closed` the **held-route** records that are
+not gating (`denied`, `expired`, `abandoned`, `superseded`, `dropped_on_reload`, `abandoned_after_approve`,
+`connect_failed`, `completed`, `claim_aborted`, `audit_unavailable`) are **non-waiting appends**: put the
+job in the writer's channel and return. The writer syncs it with the next record. If the channel's
+non-waiting share is full the record is dropped and counted (4A). The client never waits for it, and the
+refusal of a request is never changed because its record could not be queued. Records of other routes stay
+on stdout in stage 1 (3.3). The non-waiting share and the deny token bucket are **in** stage 1 (section 10).
 
 ### 4.8 Startup rejection (exit code 2, message on stderr, nothing listens)
 
@@ -548,13 +637,17 @@ it, and the refusal of a request is never changed because its record could not b
 - `sink` is `stdout` or `journald`, or missing, or `dir` is missing, empty or not absolute;
 - `fsync` is missing, `none`, or unknown;
 - `write_timeout_ms` is 0, `max_record_bytes` or `max_total_bytes` is 0, or `channel_capacity` is 0;
-- the directory is not owned by the proxy's euid with mode `0700`, an ancestor is writable by others or
-  is a symlink, or the proxy's UID equals the declared agent UID;
+- `dir` exists and is not a directory, a path component is a symlink, or the directory cannot be opened
+  with the walk of 4.2;
+- the segment file fails a check of 4.2 (not a regular file, owner, group, mode or link count);
+- the proxy's UID equals the declared agent UID (where the profile declares it; otherwise a deployment
+  precondition, 4.2);
 - the filesystem is not ext4 or XFS (4.1);
 - the lock is held by another process;
 - the directory sync, the creation of the first segment or the first durable `start` record fails (the
   sink cannot do what the mode promises, so start refuses instead of starting unhealthy);
-- the directory already holds `max_total_bytes` or more in audit files (4A).
+- the directory already holds `max_total_bytes` or more in audit files (4A). This is how a restart after a quota
+  trip behaves until the shipped segments are removed (4A item 3).
 
 The message names the setting and the `ErrorKind` with a fixed phrase, never a path's contents and
 never an `io::Error` string that could echo input.
@@ -581,15 +674,34 @@ Bounds [A, design; the numbers are PROPOSED DEFAULT, owner approval pending, sec
    counted. A caller who can cause unlimited denies can still cause unlimited **counted drops** but not
    unlimited disk. Denies are additionally bounded by a token bucket (200 per second, burst 400 [A]):
    past it, denies are counted and one `deny_rate_limited` record with the count is written per second.
+   In stage 1 the bucket covers the held-route denies that go to the file (3.3); deny records of other routes
+   stay on stdout as today.
    This loses individual deny records on purpose; it is an owner-visible trade (section 11).
-3. **Total quota.** `max_total_bytes` over **all** `audit.*` files in the directory (a fresh scan at
-   startup and after each failed-at-quota probe, then a running count). **At the quota the proxy fails
-   closed:** gating records are refused with `audit_unavailable`, readiness is 503, non-waiting records are
-   dropped and counted, and a `gap` with `reason = "quota"` is written when space returns. **The proxy
-   never deletes or truncates a segment to make room.** Space returns only when whoever ships the
-   records removes shipped segments; the next recovery attempt rescans and resumes. (Deleting the oldest
-   segment instead is a retention decision that silently destroys unshipped evidence; it is not the
-   default and needs the owner.)
+3. **Total quota.** `max_total_bytes` over **all** `audit.*` files in the directory. The proxy scans the directory
+   at startup, then keeps a running count of the bytes it appends in this boot. The count does not see
+   deletions made by a shipper while the proxy runs, so the count only grows until restart. **In stage 1
+   the quota is fail-closed until restart, with no automatic recovery** [owner question 21]:
+   - When the next record would exceed `max_total_bytes`, the record is not written and no `seq` is
+     assigned. The writer latches the `Quota` state (4.3). It makes no further attempt in this process.
+   - **What the operator sees.** (a) Every new held request and every approval that needs `forward_started` is
+     refused with 503 `audit_unavailable` (9.1). (b) One line on stderr, written once at the trip, with a
+     fixed phrase: `auth-proxy: audit quota reached, durable held-route audit refused until restart`. No path
+     and no count of records. (c) The `last_error_class` of 8.1 is `quota`, but stage 1 binds no endpoint
+     that exposes it. (d) The pod stays Running. In the passthrough pipeline, which has no readiness gate
+     in stage 1, the pod also stays Ready. A sidecar profile reports 503 at `/admin/v1/ready` (8.3). (e) The
+     file holds no record of the trip, and the reader cannot see it from the file: the last record is the
+     last durable one, and there is no `gap`, because no sequence number was lost. Non-held records are on
+     stdout and are not affected by the file's quota.
+   - **Recovery is manual and restart-only.** The proxy never deletes or truncates a segment. The operator
+     stops the proxy, which closes the active segment, copies and removes the segments the shipper has
+     delivered (the tripped segment included, once it is closed), and starts the proxy again. The proxy
+     does not resume while the quota is latched. On start the scan (4.8) refuses to start with exit code 2
+     and a fixed message if the directory still holds `max_total_bytes` or more, so a restart without
+     removing shipped segments stays down and is visible as a crash loop.
+   - Rotation inside a boot (`max_segment_bytes`) would let the proxy close a segment and continue without a
+     restart. It is **not** in stage 1 (section 10 stage 2). The active segment of a running boot grows until
+     the latch is set. Deleting the oldest segment instead of latching is a retention decision that silently
+     destroys unshipped evidence; it is not proposed (section 11 item 14).
 4. **Isolated volume.** The directory should be a dedicated volume sized to `max_total_bytes` plus
    headroom, so audit exhaustion cannot consume the node's root filesystem or another workload's space.
    The quota protects the volume; the volume protects the node. The startup check of 4.1 refuses a
@@ -721,7 +833,8 @@ Records are numbered here as the proxy sees them: D = the gating record (`held`/
 | D durable, before A | D, no O | nothing | connection error | "authorized, possibly sent" (indistinguishable from the next row) |
 | after A began, before O | D, no O | **maybe** sent | connection error or a partial response | "authorized, **possibly sent**". See 7.3 |
 | after O | D and O | sent, response ended as the outcome says | normal | sent, with the outcome the proxy observed |
-| held write: before `forward_started` | `held` (and maybe `approved`), no `forward_started` | nothing sent | connection error | **not sent**. The ordering guarantees no first byte before `forward_started` is durable [I, relies on PR #29's ordering, in review] |
+| held write: before `forward_started` is durable | `held` (and maybe `approved`), no `forward_started` | nothing sent, no connection opened (4.2 step 3) | connection error | **not sent**, under the complete-set conditions of 7.3. The ordering guarantees no connect and no byte before `forward_started` is durable |
+| held write: `forward_started` durable, then crash before the connect | `forward_started`, no `connect_failed` | nothing sent | connection error | "authorized, possibly sent": the `connect_failed` record is non-waiting and may be lost |
 | held write: after `forward_started`, before `completed` | `forward_started`, no `completed` | maybe sent | connection error | "authorized, possibly sent", exactly the row in section 5.1 of the Muse design [read] |
 | held write: `forward_started` durable, table closed or policy changed, `claim_aborted` queued | `forward_started`, maybe `claim_aborted` | nothing sent | refusal | "authorized, possibly sent" unless `claim_aborted` is present; both are conservative |
 
@@ -833,7 +946,8 @@ gate uses [read netguard.rs]); otherwise unchanged. The sidecar's readiness beco
   again for readiness once the `gap` record is durable **and** either 3 further durable writes have
   succeeded or 10 seconds have passed, whichever comes first [A]. The recovery timer of 4.3 writes the
   `gap` on its own, so recovery needs no traffic, and a pod removed from Service endpoints by a 503
-  still recovers.
+  still recovers. The `Quota` latch (4.3, 4A item 3) is **not** cleared by this rule: it stays 503 until the
+  process restarts.
 - **The approval plane stays reachable while audit is unhealthy**, so a denial and a revocation remain
   possible. Approving fails *before* forwarding if its durable record cannot be written (3.3). The admin
   socket and its handlers do not touch the sink for a read, so they stay responsive when the sink is stuck.
@@ -872,7 +986,7 @@ refusal** and adds nothing to it:
 | Held write (PR #29, in review) | refused when `held` or `forward_started` cannot be written and flushed | same refusals, durable. `approved` required | same |
 | Sidecar request (swap) | never refused for audit | unchanged, not covered | refused before swap and before the request is handed to the client when `decision` is not durable |
 | Passthrough read | never refused for audit | unchanged, not covered | refused when `decision` is not durable (open question 1) |
-| Refusals | audited, never changed | audited (non-waiting), never changed. A refusal is not turned into `audit_unavailable` because its record failed | same |
+| Refusals | audited, never changed | held-route refusals audited on the non-waiting path, other refusals on stdout as today. Never changed, and a refusal is not turned into `audit_unavailable` because its record failed | same |
 | Session create, renew | audited after, best effort | same. Not gated. Gating deferred (open question 5, proposed default) | same |
 | Revoke, revoke-all | audited after, best effort | same. **Never gated** | same |
 | Netfilter gate state | audited after | same | same |
@@ -937,24 +1051,35 @@ any implementation.**
 
 ### Stage 1: durable fail-closed for held writes (after PR #29 merges)
 
-The smallest honest first version. In: a secure file sink (4.2), `sync_data` per record, a bounded
-dedicated writer, durable `held`, `approved` and `forward_started` with the reserve/persist/commit lock
-change, the exact 503 wire, the per-record size cap and the quota (4A). Out, deferred: group commit,
-heartbeat, rotation inside a boot, hash chain, the admin socket and rich metrics, gating of reads and the
-sidecar.
+The smallest honest first version. In: a secure file sink (4.2) with the file-level checks, `sync_data` per
+record, a bounded dedicated writer, durable `held`, `approved` and `forward_started` with the reserve /
+persist / commit change and the forward claim of 4.2 (`forward_started` before the connect), the exact 503
+wire, the per-record size cap, the quota latch of 4A item 3 (fail-closed until restart), the stage-1
+placement of 3.3 (the file holds held-route records only), the non-waiting share and the deny token bucket
+for held-route records. Out, deferred: rotation inside a boot (`max_segment_bytes`), group commit,
+heartbeat, hash chain, the admin socket and rich metrics, gating of reads and the sidecar.
+
+Changes to PR #29 that stage 1 needs, listed here so the PR #29 author can see them: move the
+`forward_started` write from `claim_start` / `HeldBody::poll_next` to before the request is handed to the
+HTTP client, and keep `approved` on the path of 4.2. Under `best_effort` the refusal rule is unchanged.
 
 Tests, in this order:
 
 1. **Records and startup** (no writer yet): key-set test per kind; the size cap with an oversized path
    and an oversized `X-Amz-Target`; every startup rejection of 4.8 exits 2 with a fixed message
-   (including mode, owner, link count, ancestor symlink, `st_nlink`, wrong filesystem type, quota
-   already reached, UID equal to the agent's); `best_effort` unchanged byte for byte (golden files).
+   (including dir not a directory, symlink in the walk, segment file owner, group, mode, link count and
+   type, wrong filesystem type, quota already reached, UID equal to the agent's when declared); an emptyDir
+   layout with mode 0777 and with a setgid group directory **is accepted**; `best_effort` unchanged byte for
+   byte (golden files).
 2. **Writer at the seam:** write error, short write, `sync_data` error, ack timeout, permanent block, late
    success after timeout (no gap, `late_acks_total`, descriptor trusted), cancellation versus ack, the
    gap arithmetic (`gap` has `seq = M + 1`, next record `M + 2`, `lost_from_seq = N + 1`, no retry of
    `sync_data` on the failed descriptor, asserted by the seam), "probe is writer free" (no probe while
    the writer is blocked), a recovery that needs no traffic, a shutdown that exits by `shutdown_grace_ms`
-   with the writer blocked.
+   with the writer blocked. **Quota latch:** at `max_total_bytes` the next record is refused with no `seq`
+   assigned and no `gap` written; the latch holds after the seam reports space free; the process writes
+   nothing further and deletes nothing; the stderr line is printed once; a restart with the directory still
+   at the cap exits 2, and a restart after the test removes the closed segments starts a new segment.
 3. **Segments:** `O_EXCL` creation, directory sync before the first record, a new segment per boot, a
    `prev_tail = torn` after a killed boot, an old file never opened for write, crash injected after each
    namespace step with restart discovery of every acknowledged record.
@@ -963,19 +1088,23 @@ Tests, in this order:
    are invisible to approve, reload and supersede; a cancelled handler releases its reservation;
    shutdown between persist and commit rolls back with `abandoned`.
 5. **Request refusals** (only after item 4): the exact status, `X-AP-Decision` and body of 9.1; the mock
-   upstream records zero contacts and zero bytes for every failure of item 2; a failed `held` creates no
-   entry and no notification; a failed `approved` enqueue refuses the forward; a failed `forward_started`
-   sends nothing; the refused request's non-waiting record is attempted.
+   upstream records **zero request bytes and zero connections** for every failure of item 2 and for every
+   refusal of this item, because every audit failure in this design happens before the connect (4.2 step 3).
+   A failed `held` creates no entry and no notification; a failed `approved` enqueue refuses the forward; a
+   failed `forward_started` opens no connection and sends nothing; the refused request's non-waiting record
+   is attempted.
 6. **Order test:** the seam backend and the mock upstream stamp one shared counter; assert
-   `sync(held) < entry visible`, and `sync(forward_started) < first request byte accepted by the mock
-   upstream`, and that the connect **may** precede `forward_started`. A file-level check that the line is
-   *visible* proves only that it was written, not synced, and is not used for this assertion.
+   `sync(held) < entry visible`, `sync(approved) and sync(forward_started) < TCP accept at the mock upstream`,
+   and `TCP accept < first request byte accepted by the mock upstream`. The connect **must not** precede
+   `forward_started`. A file-level check that the line is *visible* proves only that it was written, not
+   synced, and is not used for this assertion.
 7. **Hostile load:** a sustained flood of requests, denies and oversized paths with the sink failing
    and with the sink healthy. Assert: memory stays under `channel_capacity * max_record_bytes` plus a
    fixed margin; no line exceeds `max_record_bytes`; refusals are prompt once `Stuck` (fast fail, no
    `write_timeout_ms` wait per request); the approval plane and readiness answer within 200 ms during the
-   stall [A]; no unbounded thread or task growth; the quota refuses at the cap and nothing is deleted;
-   non-waiting records cannot fill the gating share of the channel.
+   stall [A]; no unbounded thread or task growth; the quota latches at the cap, nothing is deleted, and
+   the latch holds with the sink healthy again; non-waiting records cannot fill the gating share of the
+   channel; a flood of read outcomes on stdout does not change the file's byte count.
 8. **SIGKILL:** the harness kills the real binary at failpoints (before D, D written not synced, D durable
    before A, after A before O) and the checker applies the 7.2 reader and asserts the 7.1 conclusion. **These
    tests prove ordering and the reader's logic, not durability:** SIGKILL leaves the page cache intact, so
@@ -1018,7 +1147,7 @@ Only on the owner's request.
 | #32 criterion | Stage |
 |---|---|
 | `best_effort` byte for byte | 1 |
-| every request refused with a failing sink, zero upstream contacts | 1 for held writes; 3 for the rest |
+| every request refused with a failing sink, zero upstream contacts | 1 for held writes (zero request bytes, zero connections, 10 item 5); 3 for the rest |
 | write error, short write, fsync error, blocking sink, each refusal and counters | 1 |
 | gap marker after fsync error and recovery | 1 |
 | decision on disk before upstream, ordered test | 1 for held writes; 3 for the rest |
@@ -1074,24 +1203,44 @@ and any one can be replaced without changing the rest of the design except where
     (4.1). `flock` and `O_NOFOLLOW` are used; a read-only root with a volume is supported.
 14. **Total disk cap and behaviour at the cap.** **PROPOSED DEFAULT, owner approval pending:**
     `max_total_bytes` = 1 GiB per directory (a placeholder: the owner sets the value), **fail closed at
-    the cap, never delete unshipped records silently** (4A). Alternative: delete the oldest segment, which
-    destroys evidence and is not proposed.
+    the cap, never delete unshipped records silently** (4A). In stage 1 the latch holds until restart (item 21).
+    Alternative: delete the oldest segment, which destroys evidence and is not proposed.
 15. **Retention and shipping ownership.** **PROPOSED DEFAULT, owner approval pending:** the deployment
     ships closed segments and deletes them after delivery; the proxy deletes nothing. The owner names who
     runs the shipper and the retention period.
 16. **Is `emptyDir` acceptable?** **PROPOSED DEFAULT, owner approval pending:** only if the records are also
     **shipped off the pod**, because `emptyDir` is deleted with the pod (4.1). Otherwise a persistent
-    volume.
+    volume. On `emptyDir` the directory's mode and owner are not checked (4.2), so the file checks carry the
+    weight and item 22 applies.
 17. **Retention of sensitive fields.** **PROPOSED DEFAULT, owner approval pending:** `path` and `digest`
     only in redacted, bounded form (path redacted by PR #29's rule and truncated to 256 bytes; digest as a
     12-hex-character prefix or omitted). `identity` and `approver` names are kept, because binding the
     approver to the action is the purpose of the record. The owner may drop any of them.
 18. **Who may read the audit files.** **PROPOSED DEFAULT, owner approval pending:** only the proxy's UID
-    and the shipper's, the directory `0700` and the agent UID with no access at all (4.2). The owner names
-    the shipper's identity and any human readers.
+    and the shipper's. The file is created `0600` and is checked (4.2). The directory mode is no longer
+    enforced (4.2), so the agent must not mount the volume; the owner names the shipper's identity (it must
+    run as the proxy's UID, or with a reviewed ACL or group, because the file is `0600`) and any human readers.
 19. **Deny rate bound.** **PROPOSED DEFAULT, owner approval pending:** a token bucket of 200 denies per
     second with a per-second summary record (4A), accepting that individual deny records are lost under a
-    flood.
+    flood. In stage 1 it covers held-route denies only (4A item 2).
+20. **Where non-held records go in stage 1.** **PROPOSED DEFAULT, owner approval pending:** the file sink
+    carries held-route records only. Reads, sidecar traffic, other refusals, `netfilter`, `session` and
+    `probe` stay on stdout as today, in both modes (3.3). Reason: read volume must not fill the file and latch
+    the held-write quota. Alternative: all records to the file, with a rate bound on reads, and a quota that
+    reads can reach. Owner accepts that the audit trail is then split across two sinks, and that a reader needs
+    both.
+21. **Quota recovery in stage 1.** **PROPOSED DEFAULT, owner approval pending:** the quota is fail-closed until
+    the process restarts, with no automatic recovery, and the operator's procedure is the one in 4A item 3:
+    stop, ship and remove closed segments, start. Owner accepts the operator signals of 4A item 3 (503s, one
+    stderr line, the exit-2 crash loop when the cap is still reached), and that a passthrough pod stays Ready
+    while the quota is latched because stage 1 has no passthrough readiness gate. Alternative for later: segment
+    rollover inside a boot (`max_segment_bytes`, section 10 stage 2), which lets the proxy continue without a
+    restart.
+22. **Directory and volume ownership.** **PROPOSED DEFAULT, owner approval pending:** the proxy creates a missing
+    audit directory with mode `0700` and uses an existing one as found (4.2). The file checks of 4.2 apply to
+    every segment. On `emptyDir` the directory is not protected from other UIDs that mount it, so the deployment
+    mounts it in the proxy container only. The owner chooses between an init container that creates and chowns
+    the directory (for a PVC with `fsGroup` or a different owner) and the proxy's own `mkdirat`.
 
 ## 12. Evidence and method
 
@@ -1119,4 +1268,10 @@ and any one can be replaced without changing the rest of the design except where
 - Review feedback incorporated in revision 2: the action boundary, supported storage, file security, the
   blocked-writer state machine, immutable segments, secrecy, reader conclusions, readiness, test order,
   the disk and DoS bound, and a smaller first stage.
-- Not done: no code was run against this design; no Linux measurement; no fault injection.
+- Revision 3 (second council review, opus5 blockers 1 to 3): the hyper behaviour behind blocker 1 is the
+  council's reading of hyper 1.9.0 `proto/h1/dispatch.rs` (poll_loop calls poll_write, then poll_flush, and a
+  Pending body poll leaves the buffered head to be flushed). It was not re-read in this revision. The
+  `forward_started` placement, the quota latch, the stage-1 placement and the file-level checks are design
+  decisions in this note, not measurements.
+- Not done: no code was run against this design; no Linux measurement; no fault injection; no test of the
+  file checks on a real emptyDir or fsGroup volume.

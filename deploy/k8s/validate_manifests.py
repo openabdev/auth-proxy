@@ -314,6 +314,19 @@ def main():
     ]
     check("runtime-key-secret-volume-present", len(runtime_key_vols) == 1)
     rk_name = runtime_key_vols[0] if len(runtime_key_vols) == 1 else None
+    # Any volume that names the seed Secret anywhere must be a plain `secret` volume, as the
+    # credential rule requires (cred_named). A projected or other volume would otherwise carry the
+    # seed past the holder checks below, which only look at the one secret volume.
+    rk_named = sorted(
+        n for n, v in volumes.items()
+        if any(isinstance(x, str) and x == RUNTIME_KEY_SECRET for _, x in walk(v))
+    )
+    rk_not_secret = [n for n in rk_named if "secret" not in volumes[n]]
+    check(
+        "runtime-key-volume-is-secret-type",
+        not rk_not_secret,
+        "volumes %s name %s but are not secret volumes" % (rk_not_secret, RUNTIME_KEY_SECRET),
+    )
     if rk_name:
         rk = volumes[rk_name]["secret"]
         check(
@@ -331,8 +344,8 @@ def main():
         )
     holders = sorted(
         [c.get("name") for c in containers.values()
-         if rk_name in mount_names_of(c)]
-        + [c.get("name") for c in inits if rk_name in mount_names_of(c)]
+         if mount_names_of(c) & set(rk_named)]
+        + [c.get("name") for c in inits if mount_names_of(c) & set(rk_named)]
     ) if rk_name else []
     check(
         "runtime-key-mounted-only-by-runtime",
@@ -880,6 +893,162 @@ def main():
         runtime_est > non_lo >= 0 and runtime_rej > runtime_est,
         "runtime ESTABLISHED = %d, runtime REJECT = %d, after the agent non-lo rule (%d)"
         % (runtime_est, runtime_rej, non_lo),
+    )
+
+    # ---- Runtime container hardening (issue #24) ----
+    # These rules add to the ones above and relax none of them. Every rule here fails on a minimal
+    # bad manifest in test_validate_manifests.py.
+    pod_sc = spec.get("securityContext", {}) or {}
+    runtime = containers.get("runtime", {})
+
+    # Seccomp: every init, app and ephemeral container ends up with RuntimeDefault (or a node-local
+    # Localhost profile). Unconfined is refused at the pod and at each container.
+    def effective_seccomp(c):
+        return (c.get("securityContext", {}) or {}).get("seccompProfile") or pod_sc.get(
+            "seccompProfile"
+        ) or {}
+
+    bad_seccomp = sorted(
+        "%s=%s" % (c.get("name"), effective_seccomp(c).get("type"))
+        for c in all_ctrs
+        if effective_seccomp(c).get("type") not in ("RuntimeDefault", "Localhost")
+        or (
+            effective_seccomp(c).get("type") == "Localhost"
+            and not effective_seccomp(c).get("localhostProfile")
+        )
+    )
+    check(
+        "every-container-has-an-enforcing-seccomp-profile",
+        not bad_seccomp,
+        "containers without RuntimeDefault or Localhost: %s" % bad_seccomp,
+    )
+
+    # AppArmor is optional, because a node without it refuses a pod that names a profile. When a
+    # profile is named, in the field or in the annotation, it must not be Unconfined.
+    aa_bad = []
+    for scope, sc_ in [("pod", pod_sc)] + [
+        (c.get("name"), c.get("securityContext", {}) or {}) for c in all_ctrs
+    ]:
+        prof = sc_.get("appArmorProfile")
+        if prof is not None and (
+            prof.get("type") not in ("RuntimeDefault", "Localhost")
+            or (prof.get("type") == "Localhost" and not prof.get("localhostProfile"))
+        ):
+            aa_bad.append("%s appArmorProfile %s" % (scope, prof.get("type")))
+    for k, v in (pods[0].get("metadata", {}).get("annotations", {}) or {}).items():
+        if k.startswith("container.apparmor.security.beta.kubernetes.io/") and not (
+            v == "runtime/default" or str(v).startswith("localhost/")
+        ):
+            aa_bad.append("annotation %s=%s" % (k, v))
+    check("apparmor-profile-if-set-is-not-unconfined", not aa_bad, "; ".join(aa_bad))
+
+    # Every container, init and ephemeral included: no capability beyond the one the design gives
+    # it, no escalation, a read-only root filesystem, nothing privileged.
+    CAP_ALLOWLIST = {
+        PREP_NAME: ["CHOWN", "FSETID"],
+        "netinit": ["NET_ADMIN"],
+        "netcheck": ["NET_ADMIN"],
+    }
+    hard_problems = []
+    for c in all_ctrs:
+        s_ = c.get("securityContext", {}) or {}
+        n_ = c.get("name")
+        if (s_.get("capabilities", {}) or {}).get("drop") != ["ALL"]:
+            hard_problems.append("%s: capabilities.drop is not [ALL]" % n_)
+        if caps_added(c) != CAP_ALLOWLIST.get(n_, []):
+            hard_problems.append("%s: capabilities.add is %s" % (n_, caps_added(c)))
+        if s_.get("allowPrivilegeEscalation") is not False:
+            hard_problems.append("%s: allowPrivilegeEscalation is not false" % n_)
+        if s_.get("readOnlyRootFilesystem") is not True:
+            hard_problems.append("%s: readOnlyRootFilesystem is not true" % n_)
+        if s_.get("privileged"):
+            hard_problems.append("%s: privileged" % n_)
+        if s_.get("procMount") not in (None, "Default"):
+            hard_problems.append("%s: procMount %s" % (n_, s_.get("procMount")))
+        if any(p_.get("hostPort") for p_ in c.get("ports", []) or []):
+            hard_problems.append("%s: hostPort" % n_)
+    check("every-container-drops-all-and-is-read-only-root", not hard_problems, "; ".join(hard_problems))
+
+    # Fixed UID and GID: only the three containers that need root run as root, and every other
+    # container sets a non-root UID and a GID of its own (no inherited GID 0).
+    ROOT_CONTAINERS = [PREP_NAME, "netinit", "netcheck"]
+    root_holders = sorted(
+        c.get("name") for c in all_ctrs if (c.get("securityContext", {}) or {}).get("runAsUser") == 0
+    )
+    check(
+        "only-volume-prep-netinit-netcheck-run-as-root",
+        root_holders == sorted(ROOT_CONTAINERS),
+        "root containers: %s" % root_holders,
+    )
+    loose_ids = []
+    for c in all_ctrs:
+        if c.get("name") in ROOT_CONTAINERS:
+            continue
+        s_ = c.get("securityContext", {}) or {}
+        uid_, gid_ = s_.get("runAsUser"), s_.get("runAsGroup")
+        if not (isinstance(uid_, int) and uid_ >= 1000 and s_.get("runAsNonRoot") is True):
+            loose_ids.append("%s: runAsUser %s runAsNonRoot %s" % (c.get("name"), uid_, s_.get("runAsNonRoot")))
+        if not (isinstance(gid_, int) and gid_ >= 1000):
+            loose_ids.append("%s: runAsGroup %s" % (c.get("name"), gid_))
+    check("non-root-containers-have-a-fixed-uid-and-gid", not loose_ids, "; ".join(loose_ids))
+
+    # The runtime holds the proof seed, so its surface is the smallest in the pod: the only writable
+    # mount is the agent socket directory, and it has no env, port or Secret-backed env.
+    rt_writable = sorted(
+        m.get("name") for m in runtime.get("volumeMounts", []) if not m.get("readOnly")
+    )
+    check(
+        "runtime-only-writable-mount-is-the-agent-socket-dir",
+        rt_writable == [agent_vol],
+        "runtime writable mounts: %s" % rt_writable,
+    )
+    check(
+        "runtime-has-no-env-port-or-envfrom",
+        not runtime.get("env") and not runtime.get("envFrom") and not runtime.get("ports"),
+        "runtime has env/envFrom/ports",
+    )
+    check(
+        "runtime-seed-flag-is-the-secret-item",
+        rt_seed == "%s/%s" % (rt_key_mount, RUNTIME_KEY_ITEM)
+        and all(
+            "subPath" not in m and "subPathExpr" not in m
+            for m in runtime_mounts
+            if m.get("name") == rk_name
+        ),
+        "--seed-file %s, mount %s" % (rt_seed, rt_key_mount),
+    )
+    seed_holders = sorted(
+        c.get("name") for c in all_ctrs if rk_name and mount_names_of(c) & set(rk_named)
+    )
+    check(
+        "runtime-key-not-in-any-other-container-list",
+        seed_holders == ["runtime"],
+        "runtime-key is mounted by %s (init and ephemeral containers included)" % seed_holders,
+    )
+    seed_env = [
+        c.get("name")
+        for c in all_ctrs
+        for e in c.get("env", []) or []
+        if (e.get("valueFrom", {}).get("secretKeyRef", {}) or {}).get("name") == RUNTIME_KEY_SECRET
+    ] + [
+        c.get("name")
+        for c in all_ctrs
+        for ef in c.get("envFrom", []) or []
+        if (ef.get("secretRef", {}) or {}).get("name") == RUNTIME_KEY_SECRET
+    ]
+    check("runtime-key-not-referenced-by-env", not seed_env, "referenced by env in %s" % seed_env)
+
+    # Pod level: a short grace period, no API token, no service-link env.
+    grace = spec.get("terminationGracePeriodSeconds")
+    check(
+        "termination-grace-period-is-short",
+        isinstance(grace, int) and not isinstance(grace, bool) and 1 <= grace <= 15,
+        "terminationGracePeriodSeconds is %s" % grace,
+    )
+    check(
+        "no-service-account-token-and-no-service-links",
+        spec.get("automountServiceAccountToken") is False
+        and spec.get("enableServiceLinks") is False,
     )
 
     print()

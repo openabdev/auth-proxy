@@ -95,6 +95,9 @@ Rules the codes depend on:
   `auth-proxy-runtime-key`, key `runtime_ed25519.seed`. The runtime container mounts it read-only
   at `/var/run/auth-proxy-runtime/runtime_ed25519.seed`, mode `0444`. No other container mounts the
   Secret, and the validator enforces that.
+  The container's own surface (seccomp, read-only root, one writable mount, no capability, no env)
+  is set in `pod.yaml` and enforced by the validator; see README "Runtime container hardening".
+  A compromised runtime container can still sign for as long as it runs.
 - The proxy holds only the public key: `runtime_pubkey` (standard base64, 32 bytes) on each
   `[[identity]]`. It is not a secret. A malformed key makes the proxy refuse to start.
 - Ed25519 rather than HMAC: an HMAC proxy would hold the same secret as the runtime, and the

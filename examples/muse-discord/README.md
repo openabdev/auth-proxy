@@ -186,11 +186,14 @@ reusable key material is committed here.
   error (exit 2) instead of resending the header to the `Location` host.
   `test_caller.py` pins this with a 302 to a counting external server.
 - The key never reaches stdout or stderr. Every write goes through one output
-  function, `_emit` in `caller.py`, which removes the configured key in every
-  form it can take (raw, case-mixed, percent-encoded, JSON `\u` and HTML
-  escaped), any `/ap/...` prefix, any `apk_...` token, any 64-hex run and any
-  run of 40 or more token characters (which also covers its hex and base64
-  forms), replaces control and other
+  function, `_emit` in `caller.py`, which removes the configured key and the
+  `AP_AUTHORIZATION` value (the full header value and the credential after its
+  scheme) in the forms `_char_pattern` lists: raw, case-insensitive,
+  percent-encoded, JSON `\u` and HTML numeric entities. It does not cover
+  double-encoded or zero-width-split forms. It also removes any `/ap/...`
+  prefix, any `apk_...` token, any 64-hex run and any run of 40 or more token
+  characters (which also covers the key's hex and base64 forms), replaces
+  control and other
   non-printable characters with `?`, and truncates (stdout 8 MiB, one stderr
   line 4096 characters, an upstream error body 2048). `sys.stdout` and
   `sys.stderr` are replaced by guards that call it, so even a stray `print` is

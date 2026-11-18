@@ -67,11 +67,13 @@ exception raised while building or sending the request is mapped to a fixed
 message.
 
 Single output path: everything written to stdout or stderr goes through
-_emit(). It removes the configured key in every form it can take (raw,
-percent-encoded in either hex case, JSON \\u00XX and HTML entity escapes,
-case-mixed), any "/ap/..." prefix, any "apk_..." token, any 64-hex run and any
-run of 40 or more token characters (which also covers the key's hex and
-base64 forms); it replaces
+_emit(). It removes the configured key and the Authorization value (the full
+header value and the credential after its scheme) in the forms
+_char_pattern lists: raw, case-insensitive, percent-encoded, JSON \\u00XX and
+HTML numeric entities. It does not cover double-encoded or zero-width-split
+forms. It also removes any "/ap/..." prefix, any "apk_..." token, any 64-hex
+run and any run of 40 or more token characters (which also covers the key's
+hex and base64 forms); it replaces
 control and other non-printable characters with "?" (newline and tab are kept);
 and it truncates to MAX_STDOUT_CHARS (stdout) or MAX_STDERR_CHARS (stderr).
 run() also replaces sys.stdout and sys.stderr with guards that call _emit(), so
@@ -190,6 +192,14 @@ def register_secrets(*values: str) -> None:
     _secret_values[:] = [v for v in values if v and len(v) >= 8]
     parts = ["".join(_char_pattern(c) for c in v) for v in _secret_values]
     _scrub_re = re.compile("|".join(parts), re.IGNORECASE) if parts else None
+
+
+def _authorization_secrets(value: str) -> list[str]:
+    """The Authorization value and the credential after its scheme. A reflected
+    token is dot-delimited and its segments can each be under the generic
+    40-character rule, so only the registered value is guaranteed to match."""
+    _scheme, _sep, credential = value.partition(" ")
+    return [value, credential.strip()] if credential.strip() else [value]
 
 
 def scrub(text: str, limit: int) -> str:
@@ -513,7 +523,7 @@ def run(argv: list[str]) -> int:
     sys.stdout and sys.stderr are replaced by guards that scrub every write, and
     an unexpected exception prints fixed text and exits 70, never a traceback
     (a traceback can carry the key)."""
-    register_secrets(os.environ.get("AP_CALLER_KEY", ""))
+    register_secrets(os.environ.get("AP_CALLER_KEY", ""), *_authorization_secrets(os.environ.get("AP_AUTHORIZATION", "")))
     saved = sys.stdout, sys.stderr
     _raw_streams[False], _raw_streams[True] = saved
     sys.stdout, sys.stderr = _Guard(False), _Guard(True)

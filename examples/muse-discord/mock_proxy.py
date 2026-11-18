@@ -204,7 +204,10 @@ class Handler(BaseHTTPRequestHandler):
         forwarded = [(k, v) for k, v in self.headers.items() if not k.lower().startswith("x-ap-")]
         if rel == "/api/v10/users/@me":
             return upstream_json(self, 200, {
-                "upstream_saw_authorization": authorization[0] if authorization else None,
+                # A boolean, not the value: the caller scrubs its stdout, so the
+                # header is compared here against the value the test passed in.
+                "upstream_authorization_matches": bool(authorization)
+                and authorization[0] == os.environ.get("MOCK_EXPECT_AUTHORIZATION", ""),
                 # The gate removes the caller-key header and every x-ap-* header.
                 # Computed from the forwarded values, so a key smuggled into any
                 # other header is visible here.

@@ -73,6 +73,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http import client as http_client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -155,7 +156,7 @@ def start_raw_server(behave, partial: bool = False) -> socketserver.ThreadingTCP
 
 
 def start_mock(redirect_location: str = "", policy: str = "") -> tuple[subprocess.Popen, str]:
-    env = dict(os.environ, MOCK_PORT="0", MOCK_CALLER_KEY=CALLER_KEY)
+    env = dict(os.environ, MOCK_PORT="0", MOCK_CALLER_KEY=CALLER_KEY, MOCK_EXPECT_AUTHORIZATION=AUTHORIZATION)
     if policy:
         env["MOCK_POLICY"] = policy
     if redirect_location:
@@ -259,6 +260,25 @@ def run_inproc_report(decision: str, code: str) -> tuple[int, str]:
     return rc, err.getvalue()
 
 
+def discord_like_token() -> str:
+    """A synthetic Discord-shaped token: three dot-separated base64url segments,
+    each shorter than the generic 40-character token rule. Never a real token."""
+    return ".".join([
+        base64.urlsafe_b64encode(secrets.token_bytes(18)).decode().rstrip("="),
+        secrets.token_urlsafe(4)[:6],
+        secrets.token_urlsafe(20)[:27],
+    ])
+
+
+def reflect_server(status: int, body_of) -> socketserver.ThreadingTCPServer:
+    """A loopback server that answers with `body_of(raw_request)`."""
+    def behave(conn, req):
+        body = body_of(req)
+        conn.sendall((f"HTTP/1.1 {status} X\r\nContent-Type: text/plain\r\n"
+                      f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode() + body)
+    return start_raw_server(behave)
+
+
 def http(base: str, method: str, path: str, headers: list[tuple[str, str]] | None = None,
          body: bytes | None = None) -> tuple[int, dict, str]:
     """Raw request with repeatable headers, no redirects."""
@@ -287,7 +307,7 @@ def main() -> int:
             seen = json.loads(r.stdout) if r.returncode == 0 else {}
             check(f"{placement} form: granted read succeeds", r.returncode == 0, r.stderr)
             check(f"{placement} form: Authorization reaches upstream unchanged",
-                  seen.get("upstream_saw_authorization") == AUTHORIZATION)
+                  seen.get("upstream_authorization_matches") is True)
             check(f"{placement} form: caller key stays off the upstream request",
                   seen.get("upstream_saw_caller_key_header") is False
                   and seen.get("upstream_saw_key_in_path") is False)
@@ -778,6 +798,45 @@ def main() -> int:
         finally:
             mock2.kill()
             mock2.wait(timeout=10)
+
+    # 17. The Authorization credential is a secret: a reflected Discord-shaped token never reaches a stream.
+    token = discord_like_token()
+    reflect_modes = [
+        ("2xx reflects the raw request", 200, lambda req: req, 0),
+        ("4xx reflects the raw request", 400, lambda req: req, 2),
+        ("2xx reflects only the credential", 200, lambda req: token.encode(), 0),
+        ("5xx reflects only the credential", 500, lambda req: token.encode(), 2),
+    ]
+    for mode, status, body_of, want_rc in reflect_modes:
+        for auth_value, auth_label in (("Bot " + token, "scheme"), (token, "bare")):
+            server = reflect_server(status, body_of)
+            try:
+                r = run_caller(f"http://127.0.0.1:{server.server_address[1]}", ["get-messages", CHANNEL],
+                               authorization=auth_value)
+            finally:
+                server.shutdown()
+                server.server_close()
+            out = r.stdout + r.stderr
+            check(f"{mode} ({auth_label}): exit {want_rc}", r.returncode == want_rc, f"rc={r.returncode} {out[:200]}")
+            check(f"{mode} ({auth_label}): the reflected Discord token is absent from stdout and stderr",
+                  token not in r.stdout and token not in r.stderr and token[:24] not in out, out[:200])
+            check(f"{mode} ({auth_label}): the reflection was received and scrubbed",
+                  "[redacted]" in out, out[:200])
+
+    # Scrub before cut: an encoded key that straddles MAX_SHOWN_CHARS must not survive as a decodable prefix.
+    encoded_key = "".join(f"%{ord(c):02x}" for c in CALLER_KEY)
+    cut_body = (" " * (caller_mod.MAX_SHOWN_CHARS - 30) + encoded_key + " tail").encode()
+    server = reflect_server(400, lambda req: cut_body)
+    try:
+        r = run_caller(f"http://127.0.0.1:{server.server_address[1]}", ["get-messages", CHANNEL])
+    finally:
+        server.shutdown()
+        server.server_close()
+    decoded = urllib.parse.unquote(r.stderr)
+    check("scrub before cut: exit 2", r.returncode == 2, f"rc={r.returncode}")
+    check("scrub before cut: the decoded stderr holds no key prefix or fragment",
+          "apk_" not in decoded and CALLER_KEY[4:20] not in decoded, decoded[:300])
+    check("scrub before cut: the straddling key is replaced whole", "[redacted]" in r.stderr, r.stderr[:300])
 
     # Validators accept no trailing newline and no non-ASCII digit.
     check("key, route, header and id validators use fullmatch",

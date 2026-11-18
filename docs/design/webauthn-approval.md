@@ -122,7 +122,8 @@ The notification stays a doorbell: a fixed sentence and a link to the page [read
 
 The gate accepts synced passkeys (iCloud Keychain, BE=1) and device-bound credentials (BE=0) alike: it records
 each credential's BE and BS flags at enrolment, prints them on the console and in the audit line, refuses any
-later assertion whose flags differ from the enrolled ones, and offers no configuration switch to require
+later assertion whose BE differs from the enrolled one or whose BS is set while BE is clear, accepts a BS change on
+a synced credential and stores the new value (section 4.2, check 8), and offers no configuration switch to require
 device-bound credentials, because with attestation `none` the flag is self-reported and cannot carry a
 security boundary. An owner who wants hardware keys only enrols only hardware keys.
 
@@ -160,8 +161,8 @@ The command writes `sha256(token)`, the label and the expiry to `enrol/<id>.json
 (mode 0600, same owner as the proxy) and prints a URL whose token is in the **fragment**
 (`https://<host>:<port>/enroll#t=<token>`). The fragment is not sent to the server, so it does not reach
 the front's logs or a `Referer`. The page script reads it and puts it in a POST body. The proxy reads the
-`enrol/` directory when an enrolment request arrives (a bounded read: at most 4 files) and deletes the file
-on first use or at expiry. No control socket is added to the proxy. The token never goes through ntfy.
+`enrol/` directory when `POST /enroll/begin` arrives (a bounded read: at most 4 files). `begin` spends the token
+by recording the attempt id in the file, once, and the file is deleted at expiry. No control socket is added to the proxy. The token never goes through ntfy.
 
 **Browser side.** `navigator.credentials.create` with:
 
@@ -196,12 +197,20 @@ formats are `none` and `apple`, not `packed`, and with `none` requested only `no
 records what a real phone returns. Because `none` carries no proof of the authenticator, the BE flag cannot be
 verified either (section 2.3).
 
+**Server side, `POST /enroll/begin`.** The token is spent here, once. The gate checks that the token is present,
+unexpired, unspent, and that its hash matches (compared in constant time). It then writes the new attempt id
+into the token file (atomic write, so a restart cannot reopen the token), issues a random 16-byte attempt id,
+and issues the registration challenge (section 4.1 `finish`, check 2). It returns the attempt id and the
+creation options. A token that does not match, or is spent or expired, refuses with a code. If the browser
+cancels `create()` after `begin`, the token is burnt and the operator mints a new one on the console.
+
 **Server side, `POST /enroll/finish`.** All of these, in order, first failure refuses with a code:
 
-1. The enrolment token is present, unexpired and unused (the file exists and the hash matches, compared in
-   constant time). It is spent when the ceremony *starts*, so a guessed token gets one try.
-2. The registration challenge is the one issued for this token: 32 bytes from the OS RNG, single use, 120 s,
-   in memory.
+1. The attempt is the one that spent the token. The request carries the attempt id that `begin` returned, it
+   matches the id recorded in the token file, and its registration challenge is live. A missing, foreign or
+   expired attempt refuses.
+2. The registration challenge is the one issued by `begin` for this attempt: 32 bytes from the OS RNG, single
+   use, 120 s, in memory.
 3. `clientDataJSON`: `type` is `webauthn.create`, `challenge` matches, `origin` equals the configured
    origin, `crossOrigin` is absent or false, `topOrigin` is absent.
 4. `attestationObject` parses under the strict CBOR subset of section 5.2: `fmt` is `none`, `attStmt` is an
@@ -209,16 +218,21 @@ verified either (section 2.3).
 5. `authData`: `rpIdHash` equals `sha256(rp_id)`, UP set, **UV set**, AT set, ED clear, and the credential
    id is 16 to 1023 bytes.
 6. The credential public key is a COSE EC2 key with `alg` -7, `crv` 1 (P-256), and 32-byte `x` and `y`.
-7. **Confirmation assertion.** Before the credential is stored, the page does one `get()` for it over a
-   fresh enrolment-confirmation challenge, and the gate verifies it with the same code as section 4.2. This
-   proves the key can sign, that UV works on this device, and that the point is valid, since the verifier
-   rejects a point that is not on the curve at verification time. Only then is the credential written.
+7. **Confirmation, two endpoints.** `POST /enroll/finish` does not write the credential. It holds the parsed
+   credential in memory, one per attempt for 120 s, and returns confirmation options: a fresh 32-byte challenge
+   from the OS RNG, single use, and `allowCredentials` set to the new credential id. The page calls `get()` over
+   that challenge and posts the assertion to `POST /enroll/confirm` (section 7.1). The gate verifies it with the
+   same code as section 4.2. This proves the key can sign, that UV works on this device, and that the point is
+   valid, since the verifier rejects a point that is not on the curve at verification time. Only a successful
+   confirm writes the credential.
 
 **What is stored** (and nothing else): credential id, public key, signature counter (the value from the
 confirmation assertion), a label the operator typed on the console, and the creation time. Two more fields
-are stored: the backup-eligible (BE) and backup-state (BS) flags, recorded for the console and the audit line.
-Check 8 (section 4.2) compares them on every approval, because a change of them later is a signal. BE is
-self-reported (section 2.3), so the check protects stability, not device binding. No attestation object, no `authData`, no user handle, no
+are stored: the backup-eligible (BE) flag, fixed at enrolment, and the backup-state (BS) flag, which section 4.2
+check 8 updates. Both are written to the enrolment audit record (section 12). Check 8 compares BE on every approval
+and BS on device-bound credentials. A changed BE is refused. A changed BS on a synced credential is accepted and
+stored, because iCloud Keychain sets BS once a new passkey has synced. BE is self-reported (section 2.3), so the
+check protects stability, not device binding. No attestation object, no `authData`, no user handle, no
 transports.
 
 ### 4.2 Authentication ceremony (one per held entry)
@@ -291,7 +305,9 @@ table lock held (PR #29: approve_if)
      origin == configured origin; crossOrigin absent or false; topOrigin absent
   6. credential id is in the CURRENT credential set (a revoked one is refused here)
   7. authenticatorData: rpIdHash == sha256(rp_id); UP set; UV set; ED clear
-  8. BE flag equals the stored BE flag, BS flag equals the stored BS flag, and BS may not be set while BE is clear
+  8. BE flag equals the stored BE flag, and BS may not be set while BE is clear. BS may change only on a synced
+     credential (BE set): a changed BS is accepted and `backup_state` is updated in the same critical section as
+     the counter. On a device-bound credential (BE clear) BS must equal the stored value, which is 0.
   9. counter policy (below)
  10. ECDSA P-256 / SHA-256 signature over authData || sha256(clientDataJSON) verifies
  11. finish(Approved) and delete the challenge record; the handler is told to forward
@@ -474,7 +490,9 @@ having an approve action in the notification.
 | `POST /pending/<id>/challenge` | Returns request options plus `binding`. Idempotent per entry. |
 | `POST /pending/<id>/approve` | Body `{"csrf": ...}` (Basic path, `basic` mode only) or `{"webauthn": {...}}`. Answers `{"result": ...}` with the same result names and statuses as PR #29. |
 | `POST /pending/<id>/deny` | Unchanged. |
-| `GET /enroll`, `POST /enroll/begin`, `POST /enroll/finish` | Enrolment, section 4.1. |
+| `GET /enroll`, `POST /enroll/begin` | Enrolment page. `begin` spends the token and returns the attempt id and creation options, section 4.1. |
+| `POST /enroll/finish` | Verifies the registration, holds the credential in memory and returns the confirmation options, section 4.1 check 7. |
+| `POST /enroll/confirm` | Body `{"attempt": ..., "assertion": {...}}`, capped at 4 KiB, unknown fields refused. Verifies the confirmation assertion with the section 4.2 code. On success it writes the credential to `approvers.json`, records `approver_enrolled` (section 12) and answers `{"result": "enrolled"}`. On failure it answers `{"result": "refused", "code": ...}` with the code of the failed check, writes nothing, discards the held credential, and leaves the token spent. |
 
 ### 7.2 A CLI or native client
 
@@ -505,10 +523,10 @@ the content.
   "anything else refuses to start"].
 - **Shape.** `{"version": 1, "credentials": [{"label", "id" (base64url), "pubkey" (standard base64 of the
   65-byte uncompressed point, as the runtime public key is stored in standard base64 [read
-  session-plane.md]), "counter", "created", "backup_eligible"}]}`.
+  session-plane.md]), "counter", "created", "backup_eligible", "backup_state"}]}`. `backup_eligible` is fixed at enrolment. `backup_state` is the BS value of the most recent accepted assertion, which section 4.2 check 8 reads and, for synced credentials, updates together with `counter`.
 - **Atomic update.** Write a temp file in the same directory with mode 0600, `fsync`, `rename` over the
   target, `fsync` the directory. Keep the previous version as `approvers.json.bak` (mode 0600). The
-  counter write happens outside the table lock and is skipped if unchanged.
+  counter and `backup_state` write happens outside the table lock and is skipped if unchanged.
 - **Reload.** The proxy compares the file's modification time and length when it issues a challenge and at
   every verification, and reloads when they changed. An unreadable or invalid file keeps the last good set
   and writes an audit line; at startup it refuses to start (the same posture as an invalid policy [read

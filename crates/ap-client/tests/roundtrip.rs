@@ -85,6 +85,7 @@ async fn start_server(root: &Path, caller_sha: &str) -> Server {
     let app = App::new(
         cfg_path,
         cfg,
+        &text,
         root.join("tokens"),
         ap_broker::expiry::file_in(&root.join("tokens")),
         Arc::new(FileStore::new(root.join("secrets"))),

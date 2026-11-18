@@ -80,7 +80,7 @@ enabled = true
         std::fs::write(&path, &text).unwrap();
         let cfg = ap_core::config::load(&text).expect("valid");
         let (sink, audit) = buffer_sink();
-        let app = PtApp::new(path, cfg, sink, client_for(&up));
+        let app = PtApp::new(path, cfg, &text, sink, client_for(&up));
         Pt {
             app,
             key,

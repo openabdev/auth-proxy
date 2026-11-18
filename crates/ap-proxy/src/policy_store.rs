@@ -35,18 +35,20 @@ pub(crate) struct PolicyStore {
 }
 
 impl PolicyStore {
-    /// A store over `path`, seeded with `cfg`, which was read from that file at startup.
-    pub(crate) fn new(path: PathBuf, cfg: Config) -> PolicyStore {
+    /// A store over `path`, seeded with `cfg`, which was parsed from `text`, the bytes read from
+    /// that file at startup. The snapshot's source is `text`, not a fresh read of the file, so
+    /// the policy in force always matches the bytes it came from.
+    pub(crate) fn new(path: PathBuf, cfg: Config, text: &str) -> PolicyStore {
         let snap = Arc::new(Snapshot::from_config(&cfg));
-        let loaded = read_source(&path).map(|source| Loaded {
-            source,
+        let loaded = Loaded {
+            source: Arc::from(text.as_bytes()),
             generation: 1,
             snap,
             cfg: Arc::new(cfg),
-        });
+        };
         PolicyStore {
             path,
-            slot: RwLock::new(loaded),
+            slot: RwLock::new(Some(loaded)),
             generation: AtomicU64::new(1),
         }
     }
@@ -84,5 +86,42 @@ impl PolicyStore {
         if let Ok(mut slot) = self.slot.write() {
             *slot = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ap_core::config::load;
+    use ap_core::error::Code;
+
+    const KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// A valid policy whose only grant lets `muse` GET under `paths`.
+    fn policy(paths: &str) -> String {
+        format!(
+            "version = 1\n[listen]\nproxy = \"127.0.0.1:8443\"\n[passthrough]\npublic_authority = \"gate.example.test\"\n[[identity]]\nname = \"muse\"\ncaller_key_sha256 = \"{KEY}\"\n[[route]]\nname = \"discord\"\nhost = \"discord.com\"\nmode = \"passthrough\"\n[[grant]]\nidentity = \"muse\"\nroute = \"discord\"\nmethods = [\"GET\"]\npaths = [\"{paths}\"]\n"
+        )
+    }
+
+    #[test]
+    fn startup_policy_is_not_replaced_by_a_file_changed_before_the_store_is_built() {
+        let text_a = policy("/api/v10/channels/");
+        let cfg_a = load(&text_a).expect("policy A is valid");
+        let path = std::env::temp_dir().join(format!(
+            "ap-policy-store-startup-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, &text_a).expect("write policy A");
+        // The grant is revoked between the startup parse and the store's construction.
+        std::fs::write(&path, policy("/api/v10/other/")).expect("write policy B");
+        let store = PolicyStore::new(path.clone(), cfg_a, &text_a);
+        let loaded = store.current();
+        let _ = std::fs::remove_file(&path);
+        let got = loaded.map(|l| {
+            l.snap
+                .evaluate_verdict("muse", "discord", "GET", "/api/v10/channels/1/messages")
+        });
+        assert_eq!(got, Some(Err(Code::PolicyDenied)));
     }
 }

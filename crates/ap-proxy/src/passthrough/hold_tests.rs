@@ -355,7 +355,15 @@ path_patterns = ["/hold/*"]
             None => buffer_sink(),
         };
         let client = client_for(up);
-        let mut app = PtApp::build(policy.clone(), cfg, sink, client.clone(), client, o.limits);
+        let mut app = PtApp::build(
+            policy.clone(),
+            cfg,
+            &text,
+            sink,
+            client.clone(),
+            client,
+            o.limits,
+        );
         if let Some(n) = &o.notifier {
             PtApp::set_notifier(&mut app, n.clone(), NOTIFY_BASE);
         }

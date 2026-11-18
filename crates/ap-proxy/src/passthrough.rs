@@ -80,17 +80,19 @@ impl PtApp {
     pub(crate) fn new(
         policy_path: std::path::PathBuf,
         cfg: Config,
+        policy_text: &str,
         audit: AuditSink,
         client: reqwest::Client,
     ) -> Arc<PtApp> {
         let held_client = client.clone();
-        Self::with_held_client(policy_path, cfg, audit, client, held_client)
+        Self::with_held_client(policy_path, cfg, policy_text, audit, client, held_client)
     }
 
     /// An app with a separate client for approved requests (see `forward::held_client`).
     pub(crate) fn with_held_client(
         policy_path: std::path::PathBuf,
         cfg: Config,
+        policy_text: &str,
         audit: AuditSink,
         client: reqwest::Client,
         held_client: reqwest::Client,
@@ -99,7 +101,15 @@ impl PtApp {
             .passthrough
             .as_ref()
             .map_or_else(default_limits, hold::Limits::from_config);
-        Self::build(policy_path, cfg, audit, client, held_client, limits)
+        Self::build(
+            policy_path,
+            cfg,
+            policy_text,
+            audit,
+            client,
+            held_client,
+            limits,
+        )
     }
 
     /// Announce new hold entries through `notifier`, linking to `{base}/pending/{id}`. Called
@@ -140,13 +150,14 @@ impl PtApp {
     pub(crate) fn build(
         policy_path: std::path::PathBuf,
         cfg: Config,
+        policy_text: &str,
         audit: AuditSink,
         client: reqwest::Client,
         held_client: reqwest::Client,
         limits: hold::Limits,
     ) -> Arc<PtApp> {
         Arc::new(PtApp {
-            policy: PolicyStore::new(policy_path, cfg),
+            policy: PolicyStore::new(policy_path, cfg, policy_text),
             audit,
             client,
             held_client,

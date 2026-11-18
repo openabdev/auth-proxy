@@ -130,7 +130,7 @@ paths = ["/api/", "/up/"]
         std::fs::write(&path, &text).unwrap();
         let cfg = ap_core::config::load(&text).unwrap();
         let (sink, _audit) = buffer_sink();
-        let app = PtApp::new(path, cfg, sink, client_for(&up));
+        let app = PtApp::new(path, cfg, &text, sink, client_for(&up));
         let l = crate::listener::bind_loopback("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();

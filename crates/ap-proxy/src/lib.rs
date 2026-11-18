@@ -171,7 +171,7 @@ pub async fn run(opts: Options) -> i32 {
         }
     };
     if cfg.is_passthrough_only() {
-        return run_passthrough(&opts, cfg).await;
+        return run_passthrough(&opts, cfg, &text).await;
     }
     let listen = cfg.listen.proxy;
     // The store is never created here. A missing file means it was lost or never provisioned,
@@ -201,6 +201,7 @@ pub async fn run(opts: Options) -> i32 {
     let app = match App::new(
         opts.config.clone(),
         cfg,
+        &text,
         opts.token_dir.clone(),
         expiry_store,
         broker,
@@ -288,7 +289,7 @@ async fn agent_response(app: Arc<App>, req: Request) -> Response {
 
 /// A passthrough-only deployment (the Muse gate). It needs no expiry store, broker, session
 /// socket or admin socket, so none is read or bound, and the sidecar flags are ignored.
-async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
+async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config, text: &str) -> i32 {
     if opts.netfilter.is_some() {
         eprintln!(
             "auth-proxy: the netfilter self-check applies to the sidecar profile; \
@@ -349,6 +350,7 @@ a passthrough-only config has no per-UID rules"
     let mut app = passthrough::PtApp::with_held_client(
         opts.config.clone(),
         cfg,
+        text,
         AuditSink::stdout(),
         client,
         held_client,

@@ -188,7 +188,7 @@ path_patterns = ["/hold/*", "/webhooks/*/*"]
         let cfg = ap_core::config::load(&text).expect("valid policy");
         let approval = cfg.approval.clone().expect("approval block");
         let (sink, audit) = buffer_sink();
-        let app = PtApp::new(policy, cfg, sink, client_for(&up));
+        let app = PtApp::new(policy, cfg, &text, sink, client_for(&up));
         let state =
             ApprovalApp::build(Arc::clone(&app.hold), &approval, delay, app.policy_source());
         let l = crate::listener::bind_loopback("127.0.0.1:0".parse().unwrap())

@@ -946,6 +946,30 @@ impl Ht {
         std::fs::write(&self.policy, new).unwrap();
     }
 
+    /// Rewrite the policy file with `f`, which must keep its length, then put back the mtime it
+    /// had. The file stamp (mtime and length) is then the same as before the rewrite.
+    fn rewrite_same_stamp(&self, f: impl FnOnce(String) -> String) {
+        let before = std::fs::metadata(&self.policy).unwrap();
+        let mtime = before.modified().unwrap();
+        let old = std::fs::read_to_string(&self.policy).unwrap();
+        let new = f(old.clone());
+        assert_ne!(old, new, "the rewrite changed nothing");
+        assert_eq!(old.len(), new.len(), "the rewrite must keep the length");
+        std::fs::write(&self.policy, new).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.policy)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        let after = std::fs::metadata(&self.policy).unwrap();
+        assert_eq!(
+            (after.len(), after.modified().unwrap()),
+            (before.len(), mtime),
+            "the stamp must match the one before the rewrite"
+        );
+    }
+
     /// Approve the way the approval listener does: checked against the policy in force now.
     async fn approve_checked(&self, id: &str) -> ApproveResult {
         self.approve_with(id, self.app.policy_source()).await
@@ -1014,6 +1038,16 @@ impl Ht {
     }
 }
 
+/// `text` with the pilot hold grant's `/hold/*` patterns renamed to `/deny/*`. The length is the
+/// same, so the file stamp only changes if the store reads the mtime and length alone.
+fn hold_to_deny(text: String) -> String {
+    text.replacen(
+        "path_patterns = [\"/hold/*\", \"/hold/*/messages\"",
+        "path_patterns = [\"/deny/*\", \"/deny/*/messages\"",
+        1,
+    )
+}
+
 /// `text` without the grant block that starts with `head` (up to the next `[[grant]]` or the end).
 fn without_grant(text: &str, head: &str) -> String {
     let start = text.find(head).expect("grant block");
@@ -1021,6 +1055,21 @@ fn without_grant(text: &str, head: &str) -> String {
         .find("[[grant]]")
         .map_or(text.len(), |n| start + 2 + n);
     format!("{}{}", &text[..start], &text[end..])
+}
+
+/// A same-length policy swap that keeps the file's mtime is still a change: approval sees the
+/// new policy, drops the hold and forwards nothing.
+#[tokio::test]
+async fn a_same_length_same_mtime_swap_that_removes_the_hold_grant_drops_it_at_approve() {
+    let mock = Mock::start().await;
+    let t = Ht::new("rl-same-stamp", &mock.up).await;
+    let h = t.spawn(t.post("/discord/hold/ok", r#"{"n":1}"#));
+    let id = t.held(1).await;
+    t.rewrite_same_stamp(hold_to_deny);
+    assert_eq!(t.approve_checked(&id).await, ApproveResult::PolicyChanged);
+    t.assert_dropped(h, &mock).await;
+    assert!(mock.recorded().is_empty(), "a request went upstream");
+    assert_eq!(t.count("forward_started"), 0);
 }
 
 const PILOT_HOLD: &str =

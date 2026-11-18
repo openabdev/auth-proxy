@@ -1,38 +1,26 @@
 //! The policy file as the pipeline sees it: loaded, validated and reloaded on change.
 //!
-//! The file's stamp (mtime and size) is checked on every read. A change triggers a reload. A file
-//! that cannot be read or validated drops the snapshot, and every request that needs it gets 503
-//! until a valid file appears.
+//! The file's bytes are read on every check and compared with the bytes the snapshot was parsed
+//! from. Metadata is not trusted: a rewrite that keeps the length and the mtime still changes the
+//! policy. A change triggers a reload. A file that cannot be read or validated drops the snapshot,
+//! and every request that needs it gets 503 until a valid file appears.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
 
 use ap_core::config::{self, Config};
 use ap_core::policy::Snapshot;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stamp {
-    modified: SystemTime,
-    len: u64,
+/// The bytes of the policy file, or `None` when it cannot be read.
+fn read_source(path: &Path) -> Option<Arc<[u8]>> {
+    std::fs::read(path).ok().map(Arc::from)
 }
 
-fn stamp_of(path: &Path) -> Option<Stamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    Some(Stamp {
-        modified: meta.modified().ok()?,
-        len: meta.len(),
-    })
-}
-
-/// A policy file that loaded and validated, with the stamp it was read under.
+/// A policy file that loaded and validated, with the exact bytes it was parsed from.
 #[derive(Clone)]
 pub(crate) struct Loaded {
-    stamp: Stamp,
+    source: Arc<[u8]>,
     /// Counts loads of this store: every successful (re)load gets the next number. A held
     /// request records the generation it was admitted under.
     pub(crate) generation: u64,
@@ -50,8 +38,8 @@ impl PolicyStore {
     /// A store over `path`, seeded with `cfg`, which was read from that file at startup.
     pub(crate) fn new(path: PathBuf, cfg: Config) -> PolicyStore {
         let snap = Arc::new(Snapshot::from_config(&cfg));
-        let loaded = stamp_of(&path).map(|stamp| Loaded {
-            stamp,
+        let loaded = read_source(&path).map(|source| Loaded {
+            source,
             generation: 1,
             snap,
             cfg: Arc::new(cfg),
@@ -65,22 +53,22 @@ impl PolicyStore {
 
     /// The policy in force now. `None` means the caller answers 503.
     pub(crate) fn current(&self) -> Option<Loaded> {
-        let Some(stamp) = stamp_of(&self.path) else {
+        let Some(source) = read_source(&self.path) else {
             self.drop_policy();
             return None;
         };
         if let Ok(guard) = self.slot.read() {
             if let Some(l) = guard.as_ref() {
-                if l.stamp == stamp {
+                if l.source == source {
                     return Some(l.clone());
                 }
             }
         }
-        let loaded = std::fs::read_to_string(&self.path)
+        let loaded = std::str::from_utf8(&source)
             .ok()
-            .and_then(|text| config::load(&text).ok())
+            .and_then(|text| config::load(text).ok())
             .map(|cfg| Loaded {
-                stamp,
+                source,
                 generation: self.generation.fetch_add(1, Ordering::SeqCst) + 1,
                 snap: Arc::new(Snapshot::from_config(&cfg)),
                 cfg: Arc::new(cfg),

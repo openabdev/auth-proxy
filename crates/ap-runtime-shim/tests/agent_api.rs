@@ -128,6 +128,7 @@ async fn harness(tag: &str) -> Harness {
     let app = App::new(
         cfg_path,
         cfg,
+        &text,
         root.join("tokens"),
         file_in(&root.join("tokens")),
         Arc::new(FileStore::new(root.join("secrets"))),

@@ -3,9 +3,80 @@
 //! The snapshot answers one question: may this identity make this request on this route?
 //! Reloading is the caller's job (ap-proxy stats the file and swaps in a new snapshot).
 
-use crate::config::{Config, Grant, Route};
+use crate::config::{Config, Decision, Grant, Route};
 use crate::error::Code;
 use std::collections::HashMap;
+
+/// What a matching grant does with a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Allow,
+    Hold,
+}
+
+/// Whole-path segment match. A `*` pattern segment matches exactly one non-empty path segment;
+/// every other segment must be equal. The segment counts must match, so a trailing `/` or a
+/// longer path never matches.
+fn pattern_matches(pattern: &str, path: &str) -> bool {
+    let (Some(pat), Some(path)) = (pattern.strip_prefix('/'), path.strip_prefix('/')) else {
+        return false;
+    };
+    let mut p = pat.split('/');
+    let mut s = path.split('/');
+    loop {
+        match (p.next(), s.next()) {
+            (None, None) => return true,
+            (Some(a), Some(b)) => {
+                if b.is_empty() || (a != "*" && a != b) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// True when some path that starts with `prefix` also matches `pattern`, or would match it
+/// once a trailing `/` is dropped. Conservative: it answers yes whenever a doubt remains.
+pub(crate) fn prefix_overlaps_pattern(prefix: &str, pattern: &str) -> bool {
+    let (Some(pre), Some(pat)) = (prefix.strip_prefix('/'), pattern.strip_prefix('/')) else {
+        return true;
+    };
+    let psegs: Vec<&str> = pat.split('/').collect();
+    let segs: Vec<&str> = pre.split('/').collect();
+    let (last, whole) = segs.split_last().expect("split yields one item");
+    for (i, s) in whole.iter().enumerate() {
+        match psegs.get(i) {
+            Some(&p) if p == "*" && !s.is_empty() || p == *s => {}
+            _ => return false,
+        }
+    }
+    match psegs.get(whole.len()) {
+        Some(&p) => p == "*" || p.starts_with(last),
+        // The prefix names every segment of the pattern and ends in `/`: the trailing-slash
+        // spelling of a held resource.
+        None => last.is_empty(),
+    }
+}
+
+/// True when one path could match both patterns, trailing `/` ignored.
+pub(crate) fn patterns_overlap(a: &str, b: &str) -> bool {
+    let (Some(a), Some(b)) = (a.strip_prefix('/'), b.strip_prefix('/')) else {
+        return true;
+    };
+    let trim = |s: &'_ str| -> Vec<String> {
+        let mut v: Vec<String> = s.split('/').map(str::to_string).collect();
+        if v.len() > 1 && v.last().is_some_and(String::is_empty) {
+            v.pop();
+        }
+        v
+    };
+    let (x, y) = (trim(a), trim(b));
+    x.len() == y.len()
+        && x.iter()
+            .zip(&y)
+            .all(|(p, q)| p == q || p == "*" || q == "*")
+}
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -34,6 +105,51 @@ impl Snapshot {
     /// The route with this name, if the snapshot has one.
     pub fn route(&self, name: &str) -> Option<&Route> {
         self.routes.get(name)
+    }
+
+    /// Passthrough decision: `Hold` when a hold grant matches (hold beats allow), `Allow` when
+    /// only allow grants match. A grant matches on a `paths` prefix or a `path_patterns` entry
+    /// matched against the whole path. Errors follow `evaluate`: `policy_empty` without grants,
+    /// `policy_denied` when none matches. `evaluate` itself is unchanged.
+    pub fn evaluate_verdict(
+        &self,
+        identity: &str,
+        route: &str,
+        method: &str,
+        path: &str,
+    ) -> Result<Verdict, Code> {
+        let grants = match self.grants.get(identity) {
+            Some(g) if !g.is_empty() => g,
+            _ => return Err(Code::PolicyEmpty),
+        };
+        let mut verdict = None;
+        // The trailing-slash spelling of a held resource is the same resource. A hold pattern
+        // matches whole paths only, so it never claims `/x/` and an allow prefix could carry it
+        // unheld: it is denied instead, whatever allow grants say.
+        let mut hold_shadow = false;
+        for g in grants {
+            if g.route != route || !g.methods.iter().any(|m| m == method) {
+                continue;
+            }
+            if g.decision == Decision::Hold && path.len() > 1 {
+                if let Some(bare) = path.strip_suffix('/') {
+                    hold_shadow |= g.path_patterns.iter().any(|p| pattern_matches(p, bare));
+                }
+            }
+            let hit = g.paths.iter().any(|p| path.starts_with(p.as_str()))
+                || g.path_patterns.iter().any(|p| pattern_matches(p, path));
+            if !hit {
+                continue;
+            }
+            match g.decision {
+                Decision::Hold => return Ok(Verdict::Hold),
+                Decision::Allow => verdict = Some(Verdict::Allow),
+            }
+        }
+        if hold_shadow {
+            return Err(Code::PolicyDenied);
+        }
+        verdict.ok_or(Code::PolicyDenied)
     }
 
     /// Decide whether `identity` may send `method` `path` to `route`.
@@ -184,6 +300,157 @@ mod tests {
         );
         assert_eq!(
             s.evaluate(ID, RT, "POST", "/v10", &[TARGET]),
+            Err(Code::PolicyDenied)
+        );
+    }
+
+    fn pt(grants: &str) -> Snapshot {
+        let text = format!(
+            "version = 1\n[listen]\nproxy = \"127.0.0.1:8443\"\n[passthrough]\npublic_authority = \"gate.example.test\"\n[[identity]]\nname = \"muse\"\ncaller_key_sha256 = \"{IDLE_KEY}\"\n[[route]]\nname = \"discord\"\nhost = \"discord.com\"\nmode = \"passthrough\"\n{grants}"
+        );
+        Snapshot::from_config(&load(&text).expect("valid"))
+    }
+
+    const HOLD: &str = "[[grant]]\nidentity = \"muse\"\nroute = \"discord\"\ndecision = \"hold\"\nmethods = [\"POST\"]\npath_patterns = [\"/api/v10/channels/*/messages\"]\n";
+    const ALLOW: &str = "[[grant]]\nidentity = \"muse\"\nroute = \"discord\"\nmethods = [\"GET\", \"POST\"]\npaths = [\"/api/v10/channels/\"]\n";
+
+    #[test]
+    fn verdict_hold_matches_whole_path_only() {
+        let s = pt(HOLD);
+        let v = |m, p| s.evaluate_verdict("muse", "discord", m, p);
+        assert_eq!(v("POST", "/api/v10/channels/1/messages"), Ok(Verdict::Hold));
+        assert_eq!(
+            v("POST", "/api/v10/channels/1/messages/2/reactions"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            v("POST", "/api/v10/channels/1/messages/"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            v("POST", "/api/v10/channels//messages"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            v("POST", "/api/v10/channels/1/2/messages"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            v("GET", "/api/v10/channels/1/messages"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            s.evaluate_verdict("muse", "other", "POST", "/api/v10/channels/1/messages"),
+            Err(Code::PolicyDenied)
+        );
+        assert_eq!(
+            s.evaluate_verdict("nobody", "discord", "POST", "/api/v10/channels/1/messages"),
+            Err(Code::PolicyEmpty)
+        );
+    }
+
+    /// A snapshot that skips the loader's overlap refusal, to test the engine on its own: the
+    /// allow grant is loaded for GET, then widened to POST.
+    fn pt_overlapping(grants: &str) -> Snapshot {
+        let text = format!(
+            "version = 1\n[listen]\nproxy = \"127.0.0.1:8443\"\n[passthrough]\npublic_authority = \"gate.example.test\"\n[[identity]]\nname = \"muse\"\ncaller_key_sha256 = \"{IDLE_KEY}\"\n[[route]]\nname = \"discord\"\nhost = \"discord.com\"\nmode = \"passthrough\"\n{grants}"
+        );
+        let mut cfg = load(&text).expect("valid");
+        for g in &mut cfg.grants {
+            if g.decision == Decision::Allow {
+                g.methods.push("POST".into());
+            }
+        }
+        Snapshot::from_config(&cfg)
+    }
+
+    #[test]
+    fn verdict_hold_beats_allow_in_either_grant_order() {
+        let path = "/api/v10/channels/1/messages";
+        let allow_get = ALLOW.replace("[\"GET\", \"POST\"]", "[\"GET\"]");
+        for text in [format!("{allow_get}{HOLD}"), format!("{HOLD}{allow_get}")] {
+            let s = pt_overlapping(&text);
+            // The allow grant now covers POST too: hold still wins, in either order.
+            assert_eq!(
+                s.evaluate_verdict("muse", "discord", "POST", path),
+                Ok(Verdict::Hold)
+            );
+            assert_eq!(
+                s.evaluate_verdict("muse", "discord", "GET", path),
+                Ok(Verdict::Allow)
+            );
+            // The trailing-slash spelling is the same resource: never allowed unheld.
+            assert_eq!(
+                s.evaluate_verdict("muse", "discord", "POST", &format!("{path}/")),
+                Err(Code::PolicyDenied)
+            );
+            assert_eq!(
+                s.evaluate_verdict(
+                    "muse",
+                    "discord",
+                    "POST",
+                    "/api/v10/channels/1/messages/2/reactions"
+                ),
+                Ok(Verdict::Allow)
+            );
+        }
+    }
+
+    #[test]
+    fn loader_refuses_an_allow_grant_that_overlaps_a_hold_pattern() {
+        let try_load = |grants: &str| {
+            let text = format!(
+                "version = 1\n[listen]\nproxy = \"127.0.0.1:8443\"\n[passthrough]\npublic_authority = \"gate.example.test\"\n[[identity]]\nname = \"muse\"\ncaller_key_sha256 = \"{IDLE_KEY}\"\n[[route]]\nname = \"discord\"\nhost = \"discord.com\"\nmode = \"passthrough\"\n{grants}"
+            );
+            load(&text)
+        };
+        let allow = |methods: &str, key: &str, val: &str| {
+            format!(
+                "[[grant]]\nidentity = \"muse\"\nroute = \"discord\"\nmethods = {methods}\n{key} = [\"{val}\"]\n"
+            )
+        };
+        // Overlapping: same method, prefix or pattern reaching the hold pattern, or its
+        // trailing-slash spelling.
+        for (key, val) in [
+            ("paths", "/api/v10/channels/"),
+            ("paths", "/"),
+            ("paths", "/api"),
+            ("paths", "/api/v10/channels/1/mess"),
+            ("paths", "/api/v10/channels/1/messages"),
+            ("paths", "/api/v10/channels/1/messages/"),
+            ("path_patterns", "/api/v10/channels/*/messages"),
+            ("path_patterns", "/api/v10/channels/7/*"),
+            ("path_patterns", "/api/v10/*/*/messages"),
+        ] {
+            let err = try_load(&format!("{HOLD}{}", allow("[\"POST\"]", key, val)))
+                .expect_err(&format!("{key} {val} must be refused"));
+            assert!(err.to_string().contains("overlaps hold pattern"), "{err}");
+        }
+        // Disjoint: another method, another route prefix, a longer or different path.
+        for (m, key, val) in [
+            ("[\"GET\"]", "paths", "/api/v10/channels/"),
+            ("[\"POST\"]", "paths", "/api/v10/guilds/"),
+            ("[\"POST\"]", "paths", "/api/v10/channels/1/messages/2/"),
+            ("[\"POST\"]", "paths", "/api/v11/"),
+            ("[\"POST\"]", "path_patterns", "/api/v10/channels/*"),
+            ("[\"POST\"]", "path_patterns", "/api/v10/channels/*/pins"),
+        ] {
+            try_load(&format!("{HOLD}{}", allow(m, key, val)))
+                .unwrap_or_else(|e| panic!("{m} {key} {val} must load: {e}"));
+        }
+    }
+
+    #[test]
+    fn evaluate_ignores_path_patterns() {
+        let s = pt(HOLD);
+        assert_eq!(
+            s.evaluate(
+                "muse",
+                "discord",
+                "POST",
+                "/api/v10/channels/1/messages",
+                &[]
+            ),
             Err(Code::PolicyDenied)
         );
     }

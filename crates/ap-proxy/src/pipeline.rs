@@ -69,9 +69,11 @@ impl App {
     /// `token_dir` holds the authority token hashes. `expiry_store` is the session expiry store
     /// file. Fails when the expiry store cannot be read, so the proxy never serves sessions
     /// without it.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         policy_path: PathBuf,
         cfg: Config,
+        policy_text: &str,
         token_dir: PathBuf,
         expiry_store: PathBuf,
         broker: Arc<dyn Broker>,
@@ -99,7 +101,7 @@ impl App {
             }
         }
         let authority_lease_secs = cfg.sessions.authority_lease_secs;
-        let policy = PolicyStore::new(policy_path, cfg);
+        let policy = PolicyStore::new(policy_path, cfg, policy_text);
         Ok(Arc::new(App {
             policy,
             listen_authority,

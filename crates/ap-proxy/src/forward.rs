@@ -20,11 +20,15 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use reqwest::redirect::Policy;
 use reqwest::{Client, ClientBuilder};
 
-/// Builder with the production client settings. Tests extend it with extra roots or a
+/// Builder with the production client settings (no proxy, HTTPS only, no redirects). Tests extend it with extra roots or a
 /// `resolve` override. Nothing else changes between production and tests.
 pub fn client_builder() -> ClientBuilder {
     Client::builder()
         .use_rustls_tls()
+        // The upstream is the route's fixed host. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+        // their lowercase forms and any system proxy setting must never carry the caller's
+        // request, the credential or the body to another endpoint. No setting turns this off.
+        .no_proxy()
         .https_only(true)
         .redirect(Policy::none())
         .tcp_nodelay(true)
@@ -39,6 +43,22 @@ pub fn client() -> Result<Client, String> {
     let builder = crate::matrix_hooks::apply(client_builder())?;
     #[cfg(not(feature = "matrix-upstream"))]
     let builder = client_builder();
+    builder.build().map_err(|e| e.to_string())
+}
+
+/// Builder for the client that sends approved (held) requests. It speaks HTTP/1.1 only and keeps
+/// no idle connections, so every approved request opens its own connection and the first poll of
+/// its body stream happens before any request byte is flushed (design 3.4 step 8).
+pub fn held_client_builder() -> ClientBuilder {
+    client_builder().http1_only().pool_max_idle_per_host(0)
+}
+
+/// The client for approved requests, with the same test overrides as [`client`].
+pub fn held_client() -> Result<Client, String> {
+    #[cfg(feature = "matrix-upstream")]
+    let builder = crate::matrix_hooks::apply(held_client_builder())?;
+    #[cfg(not(feature = "matrix-upstream"))]
+    let builder = held_client_builder();
     builder.build().map_err(|e| e.to_string())
 }
 
@@ -223,6 +243,54 @@ pub fn guarded_body(body: Body, max: u64, stall: Duration, flags: BodyFlags) -> 
         },
     );
     reqwest::Body::wrap_stream(stream)
+}
+
+/// Why [`buffer_body`] gave up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferError {
+    /// More than `max` bytes arrived.
+    Overflow,
+    /// A chunk took longer than the stall limit.
+    Stalled,
+    /// The caller's connection failed while the body was being read.
+    Read,
+}
+
+/// Read a whole request body into memory. Bytes are counted against `max`, and each chunk must
+/// arrive within `stall`. Used for held requests, which are kept in memory until a human decides.
+pub async fn buffer_body(body: Body, max: u64, stall: Duration) -> Result<Bytes, BufferError> {
+    let mut stream = Box::pin(body.into_data_stream());
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match tokio::time::timeout(stall, stream.next()).await {
+            Err(_) => return Err(BufferError::Stalled),
+            Ok(None) => return Ok(Bytes::from(buf)),
+            Ok(Some(Err(_))) => return Err(BufferError::Read),
+            Ok(Some(Ok(chunk))) => {
+                if (buf.len() as u64).saturating_add(chunk.len() as u64) > max {
+                    return Err(BufferError::Overflow);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+        }
+    }
+}
+
+/// Read and discard up to `max` bytes of `body`, for at most `total`, so a client still writing a
+/// large body can read the refusal instead of seeing a reset (design 3.4 step 1). Errors and the
+/// time limit end the drain quietly.
+pub async fn drain_body(body: Body, max: u64, total: Duration) {
+    let drain = async {
+        let mut stream = Box::pin(body.into_data_stream());
+        let mut seen: u64 = 0;
+        while let Some(Ok(chunk)) = stream.next().await {
+            seen = seen.saturating_add(chunk.len() as u64);
+            if seen >= max {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(total, drain).await;
 }
 
 /// Response-only hop-by-hop fields, in addition to `HOP_HEADERS`.

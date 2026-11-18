@@ -113,6 +113,21 @@ const MAX_DECODE_LAYERS: usize = 4;
 /// percent-encode (non-ASCII, controls, space, DEL, `"`, `<`, `>`, backtick, `{`, `}`) are
 /// refused too, because for those the matched path would not be the path that is sent.
 pub fn path_ambiguous(p: &str) -> bool {
+    path_ambiguous_with(p, false)
+}
+
+/// [`path_ambiguous`] plus one more refusal, used where a `hold` grant can be overridden by a
+/// broader allow match (the passthrough pipeline): a percent-escape of an RFC 3986 unreserved
+/// byte (`A-Z a-z 0-9 - . _ ~`), in any decode layer. `%6D` and `m` name the same resource, and
+/// hold patterns compare raw bytes, so the spelling would let a caller pick the verdict. Refusing
+/// keeps the form that policy matches byte-identical to the form that is sent and shown. The
+/// sidecar pipeline has no hold verdict and no precedence between grants, so an unmatched spelling
+/// there is a plain `no_grant`, and it keeps accepting these escapes.
+pub fn path_ambiguous_passthrough(p: &str) -> bool {
+    path_ambiguous_with(p, true)
+}
+
+fn path_ambiguous_with(p: &str, refuse_unreserved: bool) -> bool {
     if p.contains('\\')
         || p.bytes()
             .any(|b| b <= 0x20 || b >= 0x7f || b"\"<>`{}".contains(&b))
@@ -149,6 +164,7 @@ pub fn path_ambiguous(p: &str) -> bool {
                     if b < 0x20
                         || b == 0x7f
                         || matches!(b, b'.' | b'/' | b'\\')
+                        || (refuse_unreserved && is_unreserved(b))
                         || (depth >= 2 && b == b';')
                     {
                         return true;
@@ -171,6 +187,66 @@ pub fn path_ambiguous(p: &str) -> bool {
         cur = out;
     }
     (0..cur.len()).any(|i| cur[i] == b'%' && hex_pair(&cur, i).is_some())
+}
+
+/// RFC 3986 section 2.3 unreserved characters.
+fn is_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
+}
+
+/// Most percent-decode layers a caller-key search looks through. Deeper than the path check
+/// goes, so the search never gives up before `path_ambiguous` would have.
+const KEY_SEARCH_LAYERS: usize = MAX_DECODE_LAYERS + 4;
+
+/// True when `s` (a route-relative path or a query string) carries an `apk_` caller key, in
+/// any percent-encoded spelling.
+///
+/// `s` is searched raw, then after each percent-decode layer up to a fixed point (hex digits in
+/// either case, decoded by value like [`path_ambiguous`]). On every layer the match is ASCII
+/// case-insensitive and finds either the authenticated `key`'s 64 hex digits (the `apk_` prefix
+/// may itself be encoded, so the digits are the needle) or any well-formed `apk_<64 hex>` key.
+/// A string still decodable after [`KEY_SEARCH_LAYERS`] layers counts as carrying one: the
+/// answer is fail-closed, never "not found". The key is never copied into a message.
+pub fn echoes_caller_key(s: &str, key: &str) -> bool {
+    let digits = key.strip_prefix("apk_").unwrap_or(key).as_bytes();
+    let mut cur = s.as_bytes().to_vec();
+    for _ in 0..=KEY_SEARCH_LAYERS {
+        if has_key_text(&cur, digits) {
+            return true;
+        }
+        let mut out = Vec::with_capacity(cur.len());
+        let mut decoded = false;
+        let mut i = 0;
+        while i < cur.len() {
+            if cur[i] == b'%' {
+                if let Some(b) = hex_pair(&cur, i) {
+                    out.push(b);
+                    decoded = true;
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(cur[i]);
+            i += 1;
+        }
+        if !decoded {
+            return false;
+        }
+        cur = out;
+    }
+    true
+}
+
+fn has_key_text(hay: &[u8], digits: &[u8]) -> bool {
+    if !digits.is_empty()
+        && hay
+            .windows(digits.len())
+            .any(|w| w.eq_ignore_ascii_case(digits))
+    {
+        return true;
+    }
+    hay.windows(4 + 64)
+        .any(|w| w[..4].eq_ignore_ascii_case(b"apk_") && w[4..].iter().all(u8::is_ascii_hexdigit))
 }
 
 fn hex_pair(b: &[u8], i: usize) -> Option<u8> {

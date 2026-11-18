@@ -39,6 +39,9 @@ jobs:
       - name: Clippy (stage1-probe)
         run: cargo clippy -p ap-proxy --all-targets --features stage1-probe -- -D warnings
 
+      - name: Clippy (matrix-upstream)
+        run: cargo clippy -p ap-proxy --all-targets --features matrix-upstream,stage1-probe -- -D warnings
+
       - name: Unit and integration tests
         run: cargo test --workspace
 
@@ -55,6 +58,9 @@ jobs:
           fi
           if grep -q __ap_test_panic target/release/auth-proxy; then
             echo "panic-injection string found in the release auth-proxy"; exit 1
+          fi
+          if grep -q AP_TEST_HOLD_PAUSE target/release/auth-proxy; then
+            echo "hold-pause test hook string found in the release auth-proxy"; exit 1
           fi
           if grep -q AP_TEST_UPSTREAM_CA target/release/auth-proxy; then
             echo "test hook strings found in the release auth-proxy"; exit 1
@@ -83,13 +89,16 @@ jobs:
           set -o pipefail
           python3 tests/matrix/matrix.py --bin target/debug --json matrix.json | tee matrix.txt
 
-      - name: Passthrough matrix cargo target (Muse gate, stage 1)
-        run: cargo test -p ap-proxy --features matrix-upstream,stage1-probe --test matrix_passthrough
+      - name: Build the matrix binary without stage1-probe (separate target dir)
+        run: CARGO_TARGET_DIR=target/noprobe cargo build -p ap-proxy --features matrix-upstream
+
+      - name: Passthrough matrix cargo target (Muse gate; both builds)
+        run: AP_MATRIX_NOPROBE_BIN="$PWD/target/noprobe/debug" cargo test -p ap-proxy --features matrix-upstream,stage1-probe --test matrix_passthrough
 
       - name: Passthrough matrix driver (writes matrix-pt.json and matrix-pt.txt)
         run: |
           set -o pipefail
-          python3 tests/matrix/passthrough.py --bin target/debug --json matrix-pt.json | tee matrix-pt.txt
+          python3 tests/matrix/passthrough.py --bin target/debug --noprobe-bin target/noprobe/debug --json matrix-pt.json | tee matrix-pt.txt
 
       - name: Upload matrix results
         if: always()

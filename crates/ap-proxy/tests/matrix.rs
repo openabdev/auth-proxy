@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Directory holding the built binaries. `CARGO_BIN_EXE_auth-proxy` is set by cargo for this
-/// package's binary, so it holds up when cargo keeps test executables in a separate build
+/// package's binaries, so it holds up when cargo keeps test executables in a separate build
 /// directory (Cargo 1.100 layout) and with the classic `target/<profile>/deps` layout. `ap-egress`
 /// is built into the same profile directory by the build step.
 fn bin_dir() -> PathBuf {

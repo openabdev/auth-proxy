@@ -6,7 +6,7 @@ build it. It needs a nightly toolchain and `cargo install cargo-fuzz --locked`.
 
 | Target | Input | What it checks |
 |---|---|---|
-| `canon_path` | a request path | `parse_ap_path` (the `/ap/<caller-key>/<route>/...` form), the header-mode route splitter, `path_ambiguous`, and that an accepted path is byte-identical under the `http` and `url` parsers |
+| `canon_path` | a request path, and the same bytes shaped into a request aimed at a hold pattern | `parse_ap_path` (the `/ap/<caller-key>/<route>/...` form), the header-mode route splitter, `path_ambiguous`, that an accepted path is byte-identical under the `http` and `url` parsers, and the hold-gate oracle: an independent RFC 3986 normaliser decides whether a request is the same resource as a hold pattern, and the gate must then hold or refuse it, never forward it unheld |
 | `canon_host` | a host name | `canonical_host` accepts only the byte-exact lowercase DNS spelling, never something `url` reads as an IP |
 | `canon_origin` | byte 0 bit 0 = HTTP/2, line 1 = target, later lines = Host values | `check_origin_form`: an accepted request has one Host equal to the route authority |
 | `canon_headers` | one `name:value` per line | caller key, surrogate and framing rules over raw header bytes |

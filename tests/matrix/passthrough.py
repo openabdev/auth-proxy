@@ -2,9 +2,14 @@
 """Black-box matrix for the Muse gated passthrough, stage 1 (docs/design/muse-gated-passthrough.md,
 section 7). Separate from matrix.py, whose first 41 rows are unchanged.
 
-  passthrough.py --bin DIR [--work DIR] [--json OUT]
+  passthrough.py --bin DIR [--noprobe-bin DIR] [--work DIR] [--json OUT]
 
-DIR holds an `auth-proxy` built with `--features matrix-upstream,stage1-probe`. Each row asserts the
+DIR holds an `auth-proxy` built with `--features matrix-upstream,stage1-probe`. The optional
+--noprobe-bin DIR holds one built with `--features matrix-upstream` only, from a separate target
+dir, so default-feature behaviour is proven; it adds the rows that need a build without the probe
+route. Without it those rows are not run, and the expected-row count shrinks with them (it is
+never padded). Rows PT-20..PT-27 (and PT-29..PT-31) are stage 2: they drive the real approval listener over HTTP
+(Basic auth, CSRF token), kill -9 and SIGTERM the process, and rewrite the policy. Each row asserts the
 client-visible outcome AND what the mock upstream received. The upstream is the harness mock, so
 nothing real is involved; every sentinel is random per run.
 
@@ -12,6 +17,8 @@ Not automatable here (see docs/runbooks/muse-stage1.md): acceptance 11 (ACL isol
 real-connector and real-front parts of 10 and 12.
 """
 import argparse
+import base64
+import http.client
 import json
 import os
 import secrets
@@ -29,12 +36,17 @@ from harness import Env, sha256_hex, wait_port  # noqa: E402
 PORT_A = 18200  # main instance
 PORT_B = 18201  # small-limits instance
 PORT_C = 18202  # refused-at-startup checks
+PORT_D = 18203  # stage 2 hold instance, public listener
+PORT_E = 18204  # stage 2 hold instance, approval listener
 AUTHORITY = "gate.example.test"
 KEY_HEADER = "x-ap-caller-key"
 
 CASES = []  # (id, row, name, instance, fn)
 EXPECTED = ["PT-01", "PT-02", "PT-03", "PT-04", "PT-05", "PT-06", "PT-07", "PT-08", "PT-09",
-            "PT-10a", "PT-12", "PT-13", "PT-14", "PT-15", "PT-16", "PT-17", "PT-18", "PT-19"]
+            "PT-10a", "PT-12", "PT-13", "PT-14", "PT-15", "PT-16", "PT-17", "PT-18", "PT-19",
+            "PT-20", "PT-21", "PT-22", "PT-23", "PT-24", "PT-25", "PT-26", "PT-27", "PT-29", "PT-30", "PT-31"]
+# Rows that need a build without the probe route (--noprobe-bin).
+EXPECTED_NOPROBE = ["PT-28", "PT-12n", "PT-13n"]
 
 
 def case(cid, row, name, instance="main"):
@@ -155,6 +167,10 @@ class Ctx:
         self.auth = "Bot SENTINEL-" + secrets.token_hex(12)
         self.path_token = "PATHTOKEN" + secrets.token_hex(10)
         self.port = PORT_A
+        self.key_b = "apk_" + secrets.token_hex(32)
+        self.pw = secrets.token_hex(32)
+        self.basic = "Basic " + base64.b64encode(f"approver:{self.pw}".encode()).decode()
+        self.noprobe = None
 
     def good(self, extra=(), key=True, auth=True):
         h = []
@@ -169,6 +185,156 @@ class Ctx:
 
     def ulog(self):
         return self.e.ulog()
+
+    # ---------------------------------------------------------- stage 2 (hold instance)
+    def start_hold(self, extra_env=None, text=None):
+        """(Re)start the hold instance with a fresh upstream log."""
+        cfg = os.path.join(self.e.work, "config-hold.toml")
+        self.e.write_file(cfg, text or hold_text(self))
+        self.e.ureset()
+        self.e.start_passthrough(cfg, PORT_D, extra_env)
+        if not wait_port(PORT_E, self.e.proc, 10):
+            raise RuntimeError("the approval listener did not come up")
+        self.port = PORT_D
+
+    def held_req(self, n, path="/discord/v1/xap", key=None):
+        body = json.dumps({"n": n}).encode()
+        hs = [(KEY_HEADER, key or self.key), ("Authorization", self.auth),
+              ("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+        return build("POST", path, hs, body), body
+
+    def api(self, method, path, body=None, basic=None):
+        conn = http.client.HTTPConnection("127.0.0.1", PORT_E, timeout=10)
+        h = {"Authorization": basic or self.basic, "Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body)
+            h["Content-Type"] = "application/json"
+        conn.request(method, path, body=data, headers=h)
+        r = conn.getresponse()
+        raw = r.read()
+        conn.close()
+        try:
+            j = json.loads(raw)
+        except ValueError:
+            j = None
+        return r.status, j
+
+    def pending(self):
+        st, j = self.api("GET", "/pending")
+        return j["pending"] if st == 200 and j else []
+
+    def wait_pending(self, n, timeout=8.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            p = self.pending()
+            if len(p) >= n:
+                return p
+            time.sleep(0.1)
+        return self.pending()
+
+    def decide(self, rid, action):
+        """Approve or deny through the real listener: fetch the page JSON for the CSRF token, post it."""
+        st, j = self.api("GET", f"/pending/{rid}")
+        if st != 200 or not j or "csrf" not in j:
+            # A decided entry has no token to offer: report it as a refusal with its state.
+            return (st if st != 200 else 409), f"no-csrf:{(j or {}).get('state')}"
+        st, j = self.api("POST", f"/pending/{rid}/{action}", {"csrf": j["csrf"]})
+        return st, (j or {}).get("result")
+
+    def transitions(self, rid):
+        out = []
+        with open(self.e.audit_file, "rb") as f:
+            for ln in f.read().decode(errors="replace").splitlines():
+                try:
+                    d = json.loads(ln)
+                except ValueError:
+                    continue
+                if d.get("request_id") == rid and "transition" in d:
+                    out.append(d["transition"])
+        return out
+
+
+class Caller(threading.Thread):
+    """One request on its own thread, so the row can act on the proxy while it waits."""
+
+    def __init__(self, port, raw, timeout=25):
+        super().__init__(daemon=True)
+        self.port, self.raw, self.timeout, self.r = port, raw, timeout, None
+        self.start()
+
+    def result(self, wait=30):
+        self.join(wait)
+        return self.r
+
+
+def _run_caller(self):
+    self.r = exchange(self.port, self.raw, timeout=self.timeout)
+
+
+Caller.run = _run_caller
+
+
+def hold_text(c, include_b=True):
+    """Stage 2 policy: two identities, hold grants by path pattern, the approval listener."""
+    ident_b = f"""
+[[identity]]
+name = "muse-b"
+caller_key_sha256 = "{sha256_hex(c.key_b)}"
+""" if include_b else ""
+    grant_b = """
+[[grant]]
+identity = "muse-b"
+route = "discord"
+decision = "hold"
+methods = ["POST"]
+path_patterns = ["/v1/xap"]
+""" if include_b else ""
+    return f"""version = 1
+
+[listen]
+proxy = "127.0.0.1:{PORT_D}"
+
+[limits]
+max_body_bytes = 4096
+
+[passthrough]
+public_authority = "{AUTHORITY}"
+hold_secs = 6
+cooldown_secs = 0
+
+[approval]
+listen = "127.0.0.1:{PORT_E}"
+user = "approver"
+password_sha256 = "{sha256_hex(c.pw)}"
+public_base_url = "https://approve.example.test"
+
+[probe]
+enabled = false
+
+[[identity]]
+name = "muse-pilot"
+caller_key_sha256 = "{sha256_hex(c.key)}"
+{ident_b}
+[[route]]
+name = "discord"
+host = "api.up.test"
+port = 18443
+mode = "passthrough"
+
+[[grant]]
+identity = "muse-pilot"
+route = "discord"
+methods = ["GET"]
+paths = ["/v1/"]
+
+[[grant]]
+identity = "muse-pilot"
+route = "discord"
+decision = "hold"
+methods = ["POST"]
+path_patterns = ["/v1/xap", "/v1/sse"]
+{grant_b}"""
 
 
 def code_of(r):
@@ -611,6 +777,402 @@ def pt14(c):
     return r["status"] == 200 and not socks, f"status={r['status']} sockets={socks}"
 
 
+
+# ------------------------------------------------------------------ stage 2 rows (instance "hold")
+def only(c, rid_list):
+    return rid_list[0]["id"] if rid_list else None
+
+
+@case("PT-20", "acc 1,3,7", "hold, approve through the real listener: nothing upstream until approval, then one verbatim request and response", "hold")
+def pt20(c):
+    c.start_hold()
+    raw, body = c.held_req(1)
+    t = Caller(c.port, raw)
+    p = c.wait_pending(1)
+    rid = only(c, p)
+    time.sleep(0.5)
+    before = len(c.ulog())
+    st, j = c.api("GET", f"/pending/{rid}") if rid else (0, None)
+    page = json.dumps(j)
+    no_cred = c.auth not in page and c.key not in page
+    ast, res = c.decide(rid, "approve") if rid else (0, None)
+    r = t.result()
+    up = c.ulog()
+    names = [k for k, _ in up[0]["headers"]] if up else []
+    auth = [v for k, v in up[0]["headers"] if k == "authorization"] if up else []
+    ok = (rid is not None and before == 0 and no_cred and ast == 200 and r is not None
+          and r["status"] == 200 and r["headers"].get("x-ap-decision") == "denied"
+          and r["headers"].get("x-ap-other") == "kept" and r["body"].startswith(b"upstream-body")
+          and len(up) == 1 and up[0]["method"] == "POST" and up[0]["path"] == "/v1/xap"
+          and up[0]["body_len"] == len(body) and auth == [c.auth] and KEY_HEADER not in names)
+    again = c.decide(rid, "approve") if rid else (0, None)
+    ok &= again[0] in (404, 409, 410) and len(c.ulog()) == 1
+    return ok, (f"pending={len(p)} upstream_before={before} no_cred_in_page={no_cred} approve={ast}/{res} "
+                f"status={r and r['status']} upstream={len(up)} second_approve={again}")
+
+
+@case("PT-21", "acc 4", "hold, deny through the real listener: 423 human_denied, nothing upstream", "hold")
+def pt21(c):
+    c.start_hold()
+    raw, _ = c.held_req(2)
+    t = Caller(c.port, raw)
+    rid = only(c, c.wait_pending(1))
+    dst, res = c.decide(rid, "deny") if rid else (0, None)
+    r = t.result()
+    time.sleep(0.3)
+    ok = (rid is not None and dst == 200 and r is not None and r["status"] == 423
+          and r["headers"].get("x-ap-decision") == "denied" and code_of(r) == "human_denied"
+          and len(c.ulog()) == 0)
+    return ok, f"deny={dst}/{res} status={r and r['status']} code={r and code_of(r)} upstream={len(c.ulog())}"
+
+
+@case("PT-22", "acc 5", "hold expires after hold_secs: 410 expired, no Retry-After, nothing upstream, the id is gone", "hold")
+def pt22(c):
+    c.start_hold()
+    raw, _ = c.held_req(3)
+    t0 = time.time()
+    t = Caller(c.port, raw)
+    rid = only(c, c.wait_pending(1))
+    r = t.result()
+    took = time.time() - t0
+    late = c.decide(rid, "approve") if rid else (0, None)
+    ok = (rid is not None and r is not None and r["status"] == 410
+          and r["headers"].get("x-ap-decision") == "expired" and code_of(r) == "expired"
+          and "retry-after" not in r["headers"] and 5 <= took < 12 and len(c.ulog()) == 0
+          and late[0] in (404, 409, 410) and c.pending() == [])
+    return ok, f"status={r and r['status']} took={took:.1f}s late_approve={late} upstream={len(c.ulog())}"
+
+
+@case("PT-23", "acc 9", "kill -9 while held: connection closed with no response, nothing upstream, the restarted process holds nothing", "hold")
+def pt23(c):
+    e = c.e
+    c.start_hold()
+    raw, _ = c.held_req(4)
+    t = Caller(c.port, raw)
+    rid = only(c, c.wait_pending(1))
+    e.proc.kill()
+    e.proc.wait()
+    r = t.result(10)
+    c.start_hold()
+    time.sleep(1.0)
+    gone = c.api("GET", f"/pending/{rid}")[0] if rid else 0
+    ok = (rid is not None and r is not None and r["status"] == 0 and r["closed"]
+          and len(c.ulog()) == 0 and c.pending() == [] and gone == 404)
+    return ok, f"status={r and r['status']} closed={r and r['closed']} upstream={len(c.ulog())} old_id_after_restart={gone}"
+
+
+@case("PT-24", "acc 10", "kill -9 between approve and send: nothing upstream, no forward_started, nothing replayed after restart", "hold")
+def pt24(c):
+    e = c.e
+    c.start_hold(extra_env={"AP_TEST_HOLD_PAUSE_MS": "4000"})
+    raw, _ = c.held_req(5)
+    t = Caller(c.port, raw)
+    rid = only(c, c.wait_pending(1))
+    dec = {}
+    th = threading.Thread(target=lambda: dec.setdefault("r", _try(lambda: c.decide(rid, "approve"))), daemon=True)
+    th.start()
+    time.sleep(1.2)
+    mid_pending = len(c.pending())
+    mid_up = len(c.ulog())
+    e.proc.kill()
+    e.proc.wait()
+    th.join(10)
+    r = t.result(10)
+    c.start_hold()
+    time.sleep(5.5)  # longer than the pause the killed process was in
+    tr = c.transitions(rid)
+    ok = (rid is not None and mid_pending == 0 and mid_up == 0 and r is not None and r["status"] == 0
+          and r["closed"] and len(c.ulog()) == 0 and c.pending() == []
+          and "held" in tr and "approved" in tr and "forward_started" not in tr and "completed" not in tr)
+    return ok, (f"paused_pending={mid_pending} paused_upstream={mid_up} status={r and r['status']} "
+                f"upstream_after_restart={len(c.ulog())} transitions={tr}")
+
+
+def _try(f):
+    try:
+        return f()
+    except Exception as ex:  # the process was killed under the call
+        return ("error", repr(ex))
+
+
+@case("PT-25", "acc 6", "SIGTERM while held: 503 shutdown, nothing upstream, exit 0", "hold")
+def pt25(c):
+    e = c.e
+    c.start_hold()
+    raw, _ = c.held_req(6)
+    t = Caller(c.port, raw)
+    rid = only(c, c.wait_pending(1))
+    e.proc.terminate()
+    r = t.result(10)
+    try:
+        rc = e.proc.wait(10)
+    except subprocess.TimeoutExpired:
+        rc = None
+    listening = wait_port(PORT_D, None, 0.5)
+    ok = (rid is not None and r is not None and r["status"] == 503
+          and r["headers"].get("x-ap-decision") == "unavailable" and code_of(r) == "shutdown"
+          and len(c.ulog()) == 0 and rc == 0 and not listening)
+    return ok, f"status={r and r['status']} code={r and code_of(r)} exit={rc} listening={listening} upstream={len(c.ulog())}"
+
+
+@case("PT-26", "acc 26", "SIGTERM during an approved forward: a started response completes, exit 0 (streaming); approved but before the send, 503 shutdown with zero upstream", "hold")
+def pt26(c):
+    e = c.e
+    out, ok = [], True
+    # a) approved, response streaming (the mock sends 20 events over about a second)
+    c.start_hold()
+    raw, _ = c.held_req(7, path="/discord/v1/sse")
+    t = Caller(c.port, raw)
+    rid = only(c, c.wait_pending(1))
+    th = threading.Thread(target=lambda: _try(lambda: c.decide(rid, "approve")), daemon=True)
+    th.start()
+    deadline = time.time() + 5
+    while time.time() < deadline and not c.ulog():
+        time.sleep(0.02)
+    e.proc.terminate()
+    r = t.result(20)
+    rc = e.proc.wait(10)
+    th.join(5)
+    full = r is not None and r["status"] == 200 and r["body"].endswith(b"0\r\n\r\n") and b'"i": 19' in r["body"]
+    good = full and rc == 0 and len(c.ulog()) == 1
+    ok &= good
+    out.append(f"stream: complete={full} exit={rc} upstream={len(c.ulog())}")
+    # b) approved but still inside the pause before the send
+    c.start_hold(extra_env={"AP_TEST_HOLD_PAUSE_MS": "1500"})
+    raw, _ = c.held_req(8)
+    t = Caller(c.port, raw)
+    rid = only(c, c.wait_pending(1))
+    th = threading.Thread(target=lambda: _try(lambda: c.decide(rid, "approve")), daemon=True)
+    th.start()
+    time.sleep(0.5)
+    e.proc.terminate()
+    r = t.result(20)
+    rc = e.proc.wait(10)
+    th.join(5)
+    good = (r is not None and r["status"] == 503 and r["headers"].get("x-ap-decision") == "unavailable"
+            and code_of(r) == "shutdown" and rc == 0 and len(c.ulog()) == 0)
+    ok &= good
+    out.append(f"pause: status={r and r['status']} code={r and code_of(r)} exit={rc} upstream={len(c.ulog())}")
+    return ok, " | ".join(out)
+
+
+@case("PT-27", "acc 21", "policy reload: a removed identity's hold is dropped (503), others stay; a removed policy file drops every hold", "hold")
+def pt27(c):
+    e = c.e
+    out, ok = [], True
+    c.start_hold()
+    cfg = os.path.join(e.work, "config-hold.toml")
+    ra, _ = c.held_req(9)
+    rb, _ = c.held_req(10, key=c.key_b)
+    ta, tb = Caller(c.port, ra), Caller(c.port, rb)
+    p = c.wait_pending(2)
+    t0 = time.time()
+    e.write_file(cfg, hold_text(c, include_b=False))
+    rbr = tb.result(8)
+    took = time.time() - t0
+    still = [x for x in c.pending()]
+    a_waiting = ta.is_alive()
+    good = (len(p) == 2 and rbr is not None and rbr["status"] == 503 and code_of(rbr) == "dropped_on_reload"
+            and took < 5 and len(still) == 1 and a_waiting and len(c.ulog()) == 0)
+    ok &= good
+    out.append(f"identity_removed: status={rbr and rbr['status']} code={rbr and code_of(rbr)} after={took:.1f}s left={len(still)}")
+    if still:
+        c.decide(still[0]["id"], "deny")
+    ta.result(8)
+    # the file goes away
+    e.write_file(cfg, hold_text(c, include_b=False))
+    rc_, _ = c.held_req(11)
+    tc = Caller(c.port, rc_)
+    c.wait_pending(1)
+    t0 = time.time()
+    os.remove(cfg)
+    rcr = tc.result(8)
+    took = time.time() - t0
+    nxt = exchange(c.port, c.held_req(12)[0])
+    e.write_file(cfg, hold_text(c, include_b=False))
+    time.sleep(1.2)
+    good = (rcr is not None and rcr["status"] == 503 and code_of(rcr) == "dropped_on_reload" and took < 5
+            and nxt["status"] == 503 and code_of(nxt) == "policy_unavailable" and len(c.ulog()) == 0)
+    ok &= good
+    out.append(f"file_removed: status={rcr and rcr['status']} code={rcr and code_of(rcr)} after={took:.1f}s next={nxt['status']}/{code_of(nxt)}")
+    return ok, " | ".join(out)
+
+
+# ------------------------------------------------------------------ no-probe build rows
+@case("PT-28", "acc 24", "a build without stage1-probe: no probe string, probe route refused with zero upstream, [probe] enabled refused at startup", "np-startup")
+def pt28(c):
+    e = c.e
+    out, ok = [], True
+    binpath = os.path.join(e.bindir, "auth-proxy")
+    with open(binpath, "rb") as f:
+        has = b"__ap_probe" in f.read()
+    ok &= not has
+    out.append(f"binary_has_probe_string={has}")
+    cfg = os.path.join(e.work, "config-np.toml")
+    e.write_file(cfg, pt_text(c.key, PORT_C, probe=False))
+    e.start_passthrough(cfg, PORT_C)
+    try:
+        hs = c.good([("Content-Length", "2")])
+        r1 = exchange(PORT_C, build("POST", "/__ap_probe/423/10", hs, b"{}"))
+        r2 = exchange(PORT_C, build("POST", f"/ap/{c.key}/__ap_probe/423/10", c.good([("Content-Length", "2")], key=False), b"{}"))
+    finally:
+        e.stop_proxy()
+    for name, r in (("header", r1), ("prefix", r2)):
+        good = (r["status"] == 423 and r["headers"].get("x-ap-decision") == "denied"
+                and code_of(r) == "route_unknown")
+        ok &= good
+        out.append(f"{name}:{r['status']}/{code_of(r)}")
+    ok &= len(c.ulog()) == 0
+    cfg2 = os.path.join(e.work, "config-np-on.toml")
+    e.write_file(cfg2, pt_text(c.key, PORT_C, probe=True))
+    p = subprocess.run([binpath, "--config", cfg2], capture_output=True, env=e._proxy_env(), timeout=10)
+    ok &= p.returncode == 2 and not wait_port(PORT_C, None, 0.5)
+    out.append(f"probe_enabled_exit={p.returncode}")
+    out.append(f"upstream={len(c.ulog())}")
+    return ok, " ".join(out)
+
+
+@case("PT-29", "acc 12", "sentinel sweep on the real binary: approval page, list and caller answers, a panic while a hold exists, then every file and the proxy log", "hold")
+def pt29(c):
+    e = c.e
+    c.start_hold()
+    raw, _ = c.held_req(7)
+    t = Caller(c.port, raw)
+    rid = only(c, c.wait_pending(1))
+    seen = []
+
+    def page(path, accept):
+        conn = http.client.HTTPConnection("127.0.0.1", PORT_E, timeout=10)
+        conn.request("GET", path, headers={"Authorization": c.basic, "Accept": accept})
+        r = conn.getresponse()
+        data = r.read().decode(errors="replace")
+        seen.append(f"{r.getheaders()} {data}")
+        conn.close()
+        return r.status
+
+    sts = [page("/pending", "text/html"), page("/pending", "application/json"),
+           page(f"/pending/{rid}", "text/html"), page(f"/pending/{rid}", "application/json")] if rid else []
+    # Wrong password: the refusal must not echo it.
+    conn = http.client.HTTPConnection("127.0.0.1", PORT_E, timeout=10)
+    conn.request("GET", "/pending", headers={"Authorization": "Basic " + base64.b64encode(b"approver:SENTINEL-WRONG-PW").decode()})
+    bad = conn.getresponse()
+    seen.append(f"{bad.status} {bad.read().decode(errors='replace')}")
+    conn.close()
+    # Panic injected on the public listener while the hold exists: the entry survives.
+    r = c.get("/__ap_test_panic", port=c.port)
+    still = len(c.pending())
+    ast, res = c.decide(rid, "approve") if rid else (0, None)
+    caller = t.result()
+    if caller:
+        seen.append(f"{caller['headers']} {caller['body']!r}")
+    e.stop_proxy()  # flush every file
+    needles = [c.auth.split(" ", 1)[1], c.key, c.pw, base64.b64encode(f"approver:{c.pw}".encode()).decode(), "SENTINEL-WRONG-PW"]
+    in_responses = [n for n in needles if any(n in x for x in seen)]
+    hits = []
+    for root, _d, files in os.walk(e.work):
+        rel = os.path.relpath(root, e.work)
+        if rel == "secrets" or rel.startswith("secrets" + os.sep):
+            continue
+        for fn in files:
+            p = os.path.join(root, fn)
+            try:
+                data = open(p, "rb").read()
+            except OSError:
+                continue
+            if any(n.encode() in data for n in needles):
+                hits.append(os.path.relpath(p, e.work))
+    log = open(os.path.join(e.work, f"proxy-{PORT_D}.log"), "rb").read()
+    ok = (rid is not None and all(s == 200 for s in sts) and bad.status == 401 and not in_responses
+          and not hits and b"panic at" in log and still == 1 and ast == 200
+          and caller is not None and caller["status"] == 200)
+    return ok, (f"page_statuses={sts} wrong_pw={bad.status} in_responses={len(in_responses)} files_with_sentinel={hits} "
+                f"panic_line={b'panic at' in log} pending_after_panic={still} approve={ast}/{res} "
+                f"caller={caller and caller['status']}")
+
+
+@case("PT-30", "acc 6", "the caller key repeated in the route path or the query is refused before any hold, audit line or upstream request, on the hold and allow routes, in both key forms", "hold")
+def pt30(c):
+    c.start_hold()
+    k = c.key
+    digits = k[len("apk_"):]
+    enc = "".join(f"%{b:02x}" for b in k.encode())
+    body = b"{}"
+    post_hs = [("Authorization", c.auth), ("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+
+    def forms(method, rel):
+        if method == "POST":
+            return [("header", build(method, rel, [(KEY_HEADER, k)] + post_hs, body)),
+                    ("path", build(method, f"/ap/{k}{rel}", post_hs, body))]
+        return [("header", build(method, rel, [(KEY_HEADER, k), ("Authorization", c.auth)])),
+                ("path", build(method, f"/ap/{k}{rel}", [("Authorization", c.auth)]))]
+
+    rels = [("POST", f"/discord/v1/xap?a={k}"), ("POST", f"/discord/v1/xap?a={enc}"),
+            ("POST", f"/discord/v1/xap?a=%61PK%5F{digits.upper()}"), ("POST", f"/discord/v1/xap?a={enc.replace('%', '%25')}"),
+            ("POST", f"/discord/v1/{k}"), ("POST", f"/discord/v1/{k.upper()}"), ("POST", f"/discord/v1/{digits}"),
+            ("GET", f"/discord/v1/{k}"), ("GET", f"/discord/v1/x?t={k}"), ("GET", f"/discord/v1/x?t={enc}"),
+            ("GET", f"/discord/v1/{enc}")]
+    checks = []
+    for method, rel in rels:
+        for label, raw in forms(method, rel):
+            # An encoded copy inside the path is refused earlier, as an ambiguous path.
+            checks.append(canon_refused(c, f"{method} {label} {rel[:26]}", raw, {"caller_key_ambiguous", "path_ambiguous"}))
+    plain = canon_refused(c, "plain", forms("POST", f"/discord/v1/{k}")[0][1], {"caller_key_ambiguous"})
+    pending = len(c.pending())
+    e = c.e
+    e.stop_proxy()
+    needles = [digits.encode(), digits.upper().encode(), enc[len("%61%70%6b%5f"):].encode()]
+    hits = []
+    for root, _d, files in os.walk(e.work):
+        rel_dir = os.path.relpath(root, e.work)
+        if rel_dir == "secrets" or rel_dir.startswith("secrets" + os.sep):
+            continue
+        for fn in files:
+            if fn.startswith("config"):
+                continue  # the policy file holds the key's hash only; skip configs to be safe
+            try:
+                data = open(os.path.join(root, fn), "rb").read()
+            except OSError:
+                continue
+            if any(n in data for n in needles):
+                hits.append(fn)
+    ok, d = run_all(checks)
+    return ok and plain[0] and pending == 0 and not hits, f"{d} {plain[1]} pending={pending} files_with_key={hits}"
+
+
+@case("PT-31", "acc 1,3", "a percent-encoded unreserved character in the path is refused on the hold route and the allow route: the form matched is the form sent", "hold")
+def pt31(c):
+    c.start_hold()
+    k = c.key
+    body = b"{}"
+    post_hs = [("Authorization", c.auth), ("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+    checks = []
+    held = ["/discord/v1/%78ap", "/discord/v1/%58ap", "/discord/v1/x%61p", "/discord/v1/xa%70", "/discord/v1/xa%50",
+            "/discord/v1/%73se", "/discord/v1/ss%65", "/discord/v1/%2578ap", "/discord/v1/%252578ap", "/discord/v1/%7Exap",
+            "/discord/v1/x%2Dp", "/discord/v1/x%2dp", "/discord/v1/x%5Fp", "/%64iscord/v1/xap"]
+    for p in held:
+        checks.append(canon_refused(c, "hold hdr " + p[-12:], build("POST", p, [(KEY_HEADER, k)] + post_hs, body), {"path_ambiguous", "route_unknown"}))
+        checks.append(canon_refused(c, "hold path " + p[-12:], build("POST", f"/ap/{k}{p}", post_hs, body), {"path_ambiguous", "route_unknown"}))
+    for p in ["/discord/v1/%61bc", "/discord/v1/ab%43", "/discord/v1/a%2Db", "/discord/v1/a%7Eb", "/discord/v1/%2561bc"]:
+        checks.append(canon_refused(c, "allow hdr " + p[-12:], build("GET", p, [(KEY_HEADER, k), ("Authorization", c.auth)]), {"path_ambiguous"}))
+        checks.append(canon_refused(c, "allow path " + p[-12:], build("GET", f"/ap/{k}{p}", [("Authorization", c.auth)]), {"path_ambiguous"}))
+    # The trailing-slash spelling of the held resource is never forwarded unheld either.
+    checks.append(canon_refused(c, "trailing slash", build("POST", "/discord/v1/xap/", [(KEY_HEADER, k)] + post_hs, body), {"no_grant"}))
+    pending = len(c.pending())
+    # The plain spelling is held, then denied to clean up.
+    raw, _ = c.held_req(31)
+    t = Caller(c.port, raw)
+    rid = only(c, c.wait_pending(1))
+    c.decide(rid, "deny") if rid else None
+    r = t.result()
+    ok, d = run_all(checks)
+    return (ok and pending == 0 and rid is not None and r is not None and r["status"] == 423 and len(c.ulog()) == 0,
+            f"{d} pending_before_plain={pending} plain_held={rid is not None} plain_denied={r and r['status']}")
+
+
+CASES.append(("PT-12n", "acc 28", "framing conflicts on a build without the probe route", "np-main", pt12))
+CASES.append(("PT-13n", "acc 28", "allowed-body boundary on a build without the probe route", "np-limits", pt13))
+
+
 def canon_refused(c, label, raw, codes=None, statuses=range(400, 500)):
     """Refused: a 4xx (an HTTP-layer parse error counts) and nothing at the upstream."""
     c.e.ureset()
@@ -737,6 +1299,20 @@ def run_instance(c, instance, results):
         e.write_file(cfg, pt_text(c.key, PORT_B, limits=lim, probe=False))
         e.start_passthrough(cfg, PORT_B)
         c.port = PORT_B
+    elif instance == "np-main":
+        e.bindir = c.noprobe
+        e.write_file(cfg, pt_text(c.key, PORT_A, probe=False))
+        e.start_passthrough(cfg, PORT_A)
+        c.port = PORT_A
+    elif instance == "np-limits":
+        e.bindir = c.noprobe
+        lim = "max_connections = 3\nheader_read_secs = 1\nbody_read_secs = 1"
+        e.write_file(cfg, pt_text(c.key, PORT_B, limits=lim, probe=False))
+        e.start_passthrough(cfg, PORT_B)
+        c.port = PORT_B
+    elif instance == "np-startup":
+        e.bindir = c.noprobe
+    # "hold" rows start their own instance: most of them kill or restart it.
     try:
         for cid, row, name, _, fn in cases:
             e.ureset()
@@ -748,11 +1324,13 @@ def run_instance(c, instance, results):
             print(f"{'PASS' if ok else 'FAIL'} | {cid} | {row} | {name} | {detail}", flush=True)
     finally:
         e.stop_proxy()
+        e.bindir = c.bindir
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True, help="directory with auth-proxy (matrix-upstream + stage1-probe build)")
+    ap.add_argument("--noprobe-bin", help="directory with an auth-proxy built without stage1-probe (adds PT-28, PT-12n, PT-13n)")
     ap.add_argument("--work", help="work directory (default: a fresh temp dir)")
     ap.add_argument("--json", help="write the per-case results here")
     a = ap.parse_args()
@@ -763,22 +1341,34 @@ def main():
     work = os.path.abspath(a.work) if a.work else tempfile.mkdtemp(prefix="apm-pt-")
     os.makedirs(work, exist_ok=True)
     c = Ctx(Env(bindir, work))
+    c.bindir = bindir
+    expected = list(EXPECTED)
+    instances = ["main", "secrets", "limits", "startup", "hold"]
+    if a.noprobe_bin:
+        c.noprobe = os.path.abspath(a.noprobe_bin)
+        if not os.path.exists(os.path.join(c.noprobe, "auth-proxy")):
+            print(f"missing binary auth-proxy in {c.noprobe}", file=sys.stderr)
+            return 2
+        expected += EXPECTED_NOPROBE
+        instances += ["np-main", "np-limits", "np-startup"]
+    else:
+        print("note: --noprobe-bin not given; rows " + ", ".join(EXPECTED_NOPROBE) + " are not run")
     results = []
     try:
-        for instance in ("main", "secrets", "limits", "startup"):
+        for instance in instances:
             run_instance(c, instance, results)
     finally:
         c.e.close()
     ids = [r["id"] for r in results]
-    missing = [i for i in EXPECTED if i not in ids]
-    extra = [i for i in ids if i not in EXPECTED]
+    missing = [i for i in expected if i not in ids]
+    extra = [i for i in ids if i not in expected]
     passed = sum(1 for r in results if r["verdict"] == "PASS")
     if a.json:
         with open(a.json, "w") as f:
             json.dump({"bin": bindir, "results": results, "missing": missing}, f, indent=1)
-    print(f"\nrows: {len(results)} run, {len(EXPECTED)} expected, missing={missing or 'none'} extra={extra or 'none'}")
-    print(f"summary: {passed} PASS of {len(EXPECTED)} rows; work dir {work}")
-    return 0 if (passed == len(EXPECTED) and not missing and not extra) else 1
+    print(f"\nrows: {len(results)} run, {len(expected)} expected, missing={missing or 'none'} extra={extra or 'none'}")
+    print(f"summary: {passed} PASS of {len(expected)} rows; work dir {work}")
+    return 0 if (passed == len(expected) and not missing and not extra) else 1
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@
 //! is fixed, so a failure reproduces; the same invariants run under cargo-fuzz for open-ended input.
 
 mod common;
+use ap_core::canon::path_ambiguous_passthrough;
 use common::invariants::*;
 
 /// xorshift64*: deterministic, no dependency.
@@ -297,4 +298,101 @@ fn generated_headers_hold_the_invariants() {
             .collect();
         check_headers(&pairs, "x-ap-caller-key");
     }
+}
+
+/// The oracle closes the family: for requests aimed at every hold pattern, in every position and
+/// spelling the generator knows, a request whose RFC 3986 same-resource form is held is never
+/// forwarded unheld (see `check_gate`). The run must reach all three outcomes, or it proves
+/// nothing.
+#[test]
+fn generated_hold_probes_are_never_forwarded_unheld() {
+    let mut r = Rng(SEED ^ 0x401D);
+    let (mut held, mut refused, mut denied, mut oracle_hits) = (0, 0, 0, 0);
+    for _ in 0..60_000 {
+        let (method, path) = hold_probe(&mut |n| r.below(n));
+        check_gate(method, &path);
+        if oracle_matches_hold(&path) {
+            oracle_hits += 1;
+            match gate_shipped(method, &path) {
+                Gate::Held => held += 1,
+                Gate::Refused => refused += 1,
+                Gate::Denied => denied += 1,
+                Gate::Allowed => unreachable!("check_gate asserted"),
+            }
+        }
+    }
+    assert!(oracle_hits > 5_000, "oracle matched only {oracle_hits}");
+    assert!(held > 500, "never held a plain probe: {held}");
+    assert!(refused > 500, "never refused an encoded probe: {refused}");
+    assert!(denied > 50, "never denied a trailing-slash probe: {denied}");
+}
+
+/// Named regression forms, one per pattern position and spelling, for the hold path and the
+/// allow path. Every one is refused as ambiguous, so none reaches an allow prefix.
+#[test]
+fn unreserved_escapes_are_refused_in_every_pattern_position() {
+    let refused = [
+        // literal segment, middle of the pattern
+        "/hold/1/%6Dessages",
+        "/hold/1/%6dessages",
+        "/hold/1/%4Dessages",
+        "/hold/1/mess%61ges",
+        "/hold/1/mess%41ges",
+        // first segment (literal)
+        "/%68old/1/messages",
+        "/%48old/1/messages",
+        // last segment
+        "/hold/1/message%73",
+        "/hold/1/message%53",
+        // wildcard segment
+        "/hold/%31/messages",
+        "/hold/%4D/messages",
+        "/hold/a%2Db/messages",
+        "/hold/a%2db/messages",
+        "/hold/a%2Eb/messages",
+        "/hold/a%2eb/messages",
+        "/hold/%7E/messages",
+        "/hold/%7e/messages",
+        "/hold/a%5Fb/messages",
+        // wildcard in first position, literal last
+        "/%4Dx/pin",
+        "/x/%70in",
+        "/x/pi%6e",
+        // layered
+        "/hold/1/%256Dessages",
+        "/hold/1/%256dessages",
+        "/hold/1/%25256Dessages",
+        "/%2568old/1/messages",
+        "/hold/%25%32%44/messages",
+        "/hold/1/%2%36Dessages",
+        // allow path
+        "/other/x/%6Dessages",
+        "/other/x/%4D",
+        "/other/x/a%2Db",
+        "/other/x/a%7Eb",
+    ];
+    for p in refused {
+        for m in ["POST", "PUT", "GET"] {
+            assert!(path_ambiguous_passthrough(p), "{p:?} must be refused");
+            assert_eq!(gate_shipped(m, p), Gate::Refused, "{m} {p:?}");
+            check_gate(m, p);
+        }
+    }
+    // The plain spellings still reach their verdicts.
+    assert_eq!(gate_shipped("POST", "/hold/1/messages"), Gate::Held);
+    assert_eq!(gate_shipped("PUT", "/x/pin"), Gate::Held);
+    assert_eq!(gate_shipped("POST", "/other/x/anything"), Gate::Allowed);
+    assert_eq!(gate_shipped("GET", "/hold/1/messages"), Gate::Allowed);
+    // The trailing-slash spelling is the same resource and is never allowed unheld.
+    for p in [
+        "/hold/1/messages/",
+        "/x/pin/",
+        "/api/v10/channels/1/messages/",
+    ] {
+        assert_eq!(gate_shipped("POST", p), Gate::Denied, "{p:?}");
+    }
+    // Escapes of reserved, non-unreserved bytes that the gate does not read as separators still
+    // pass: `%20` names no unreserved character.
+    assert!(!path_ambiguous_passthrough("/other/x/a%20b"));
+    assert!(!path_ambiguous_passthrough("/other/x/a%3Bb"));
 }

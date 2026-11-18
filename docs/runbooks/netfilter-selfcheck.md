@@ -145,3 +145,16 @@ Write surface in the pod (the manifest validator asserts each point):
   `netprobe` (UID 1000, the agent UID, but a separate process that mounts nothing else). The proxy
   mounts both read-only. Both are `emptyDir`; there is no `hostPath` volume and no `fsGroup`.
 - Files are created with mode 0644, so the owner check and the no-group/world-write rule hold.
+
+## Interaction with the Muse gate (holds and approvals)
+
+The netfilter gate and the hold table never run in the same process. The gate belongs to the sidecar
+profile, where the agent shares the pod with per-UID egress rules. Holds, the approval listener and
+the notifier belong to a passthrough-only config (the Muse gate), which has no per-UID rules. A
+passthrough-only config started with any `--netfilter-*` flag exits with status 2 (covered by
+`passthrough_config_with_the_netfilter_check_exits_with_status_2`), so no process can park a request
+in a world where the check is failing, and no approval can be granted into one. The fail-closed
+choice is therefore enforced at startup: the combination is refused, not degraded. Passthrough and
+standalone runs without the flags are unaffected by the gate. In the sidecar profile the admin socket
+and `/ready` stay responsive while the gate is closed; only the agent listener answers
+`503 netfilter_unverified`.

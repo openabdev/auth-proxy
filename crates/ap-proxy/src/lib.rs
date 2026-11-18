@@ -4,13 +4,16 @@
 //! two Unix sockets, and serves until one of them stops. Startup failures return exit code 2.
 
 pub mod admin_http;
+pub mod approval;
 pub mod audit_sink;
 pub mod evidence;
 pub mod forward;
+pub mod hold;
 pub mod listener;
 #[cfg(feature = "matrix-upstream")]
 pub mod matrix_hooks;
 pub mod netguard;
+pub mod notify;
 pub mod passthrough;
 pub mod pipeline;
 mod policy_store;
@@ -29,6 +32,7 @@ use axum::extract::Request;
 use axum::response::Response;
 use axum::serve::ListenerExt;
 use axum::Router;
+use tokio::signal::unix::{signal, SignalKind};
 
 use audit_sink::AuditSink;
 use netguard::NetfilterOpts;
@@ -147,7 +151,8 @@ where
 }
 
 /// Start the proxy and serve until a listener stops. Returns the process exit code: 2 for an
-/// invalid config or a socket that cannot be bound, 1 for a listener that stops while serving.
+/// invalid config or a socket that cannot be bound, 1 for a listener that stops while serving. A
+/// passthrough process that stops on SIGTERM or SIGINT after draining returns 0.
 pub async fn run(opts: Options) -> i32 {
     #[cfg(feature = "matrix-upstream")]
     eprintln!("{}", matrix_hooks::WARNING);
@@ -166,7 +171,7 @@ pub async fn run(opts: Options) -> i32 {
         }
     };
     if cfg.is_passthrough_only() {
-        return run_passthrough(&opts, cfg).await;
+        return run_passthrough(&opts, cfg, &text).await;
     }
     let listen = cfg.listen.proxy;
     // The store is never created here. A missing file means it was lost or never provisioned,
@@ -196,6 +201,7 @@ pub async fn run(opts: Options) -> i32 {
     let app = match App::new(
         opts.config.clone(),
         cfg,
+        &text,
         opts.token_dir.clone(),
         expiry_store,
         broker,
@@ -283,7 +289,7 @@ async fn agent_response(app: Arc<App>, req: Request) -> Response {
 
 /// A passthrough-only deployment (the Muse gate). It needs no expiry store, broker, session
 /// socket or admin socket, so none is read or bound, and the sidecar flags are ignored.
-async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config) -> i32 {
+async fn run_passthrough(opts: &Options, cfg: ap_core::config::Config, text: &str) -> i32 {
     if opts.netfilter.is_some() {
         eprintln!(
             "auth-proxy: the netfilter self-check applies to the sidecar profile; \
@@ -306,6 +312,13 @@ a passthrough-only config has no per-UID rules"
             return 1;
         }
     };
+    let held_client = match forward::held_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("auth-proxy: cannot build the upstream client: {e}");
+            return 1;
+        }
+    };
     let listen = cfg.listen.proxy;
     let listener = match listener::bind_loopback(listen).await {
         Ok(l) => l,
@@ -314,19 +327,138 @@ a passthrough-only config has no per-UID rules"
             return 2;
         }
     };
+    // The approval listener is a second socket (design 3.6). Without an `[approval]` block there
+    // is none, and holds simply expire.
+    let approval_listener = match &cfg.approval {
+        Some(a) => match listener::bind_loopback(a.listen).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("auth-proxy: cannot bind the approval listener: {e}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+    let approval_cfg = cfg.approval.clone();
+    let notify_cfg = cfg.notify.clone();
     // A panic line carries the source location only, never the payload, which could hold a
     // header value.
     std::panic::set_hook(Box::new(|info| match info.location() {
         Some(l) => eprintln!("auth-proxy: panic at {}:{}", l.file(), l.line()),
         None => eprintln!("auth-proxy: panic"),
     }));
-    let app = passthrough::PtApp::new(opts.config.clone(), cfg, AuditSink::stdout(), client);
+    let mut app = passthrough::PtApp::with_held_client(
+        opts.config.clone(),
+        cfg,
+        text,
+        AuditSink::stdout(),
+        client,
+        held_client,
+    );
+    if let Some(n) = notify_cfg {
+        let Some(a) = &approval_cfg else {
+            eprintln!("auth-proxy: [notify] needs an [approval] block to link to");
+            return 2;
+        };
+        let topic = match notify::read_secret_file(std::path::Path::new(&n.topic_file)) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("auth-proxy: notify topic file: {e}");
+                return 2;
+            }
+        };
+        let token = match n.token_file.as_deref().map(std::path::Path::new) {
+            Some(p) => match notify::read_secret_file(p) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("auth-proxy: notify token file: {e}");
+                    return 2;
+                }
+            },
+            None => None,
+        };
+        match notify::NtfyNotifier::new(&n.base_url, &topic, token.as_deref()) {
+            Ok(nt) => passthrough::PtApp::set_notifier(&mut app, Arc::new(nt), &a.public_base_url),
+            Err(e) => {
+                eprintln!("auth-proxy: cannot build the notifier: {e}");
+                return 2;
+            }
+        }
+    }
     let limits = listener::public::PublicLimits {
         max_connections: pt.max_connections,
         header_read: std::time::Duration::from_secs(pt.header_read_secs),
     };
+    let (mut sigterm, mut sigint) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            eprintln!("auth-proxy: cannot install the signal handlers");
+            return 1;
+        }
+    };
+    let approval = async {
+        match (approval_listener, approval_cfg) {
+            (Some(l), Some(cfg)) => {
+                let state =
+                    approval::ApprovalApp::new(Arc::clone(&app.hold), &cfg, app.policy_source());
+                listener::approval::serve_approval(l, state, Default::default()).await;
+            }
+            _ => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(approval);
+    let permits = Arc::new(tokio::sync::Semaphore::new(pt.max_connections));
+    let (shutdown, down) = tokio::sync::watch::channel(false);
+    let public = listener::public::serve_public_until(
+        listener,
+        Arc::clone(&app),
+        limits,
+        Arc::clone(&permits),
+        down,
+    );
+    tokio::pin!(public);
+    // Held requests notice a reload within a second (design 3.9).
+    let mut reload = tokio::time::interval(std::time::Duration::from_secs(1));
+    reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     eprintln!("auth-proxy: listening");
-    listener::public::serve_public(listener, app, limits).await;
-    eprintln!("auth-proxy: public listener stopped");
-    1
+    loop {
+        tokio::select! {
+            () = &mut public => {
+                eprintln!("auth-proxy: public listener stopped");
+                return 1;
+            }
+            () = &mut approval => {
+                eprintln!("auth-proxy: approval listener stopped");
+                return 1;
+            }
+            _ = reload.tick() => {
+                app.reload_tick();
+            }
+            _ = sigterm.recv() => break,
+            _ = sigint.recv() => break,
+        }
+    }
+    // Shutdown (design 3.7): stop accepting, answer every pending hold 503 `shutdown`, and let
+    // requests already approved run to their end or to `request_deadline_secs`. A second signal
+    // ends the wait.
+    eprintln!("auth-proxy: shutting down");
+    // The approval future is not polled again, so it accepts nothing more; an approval already
+    // accepted meets the closed table at `claim_start`.
+    let _ = shutdown.send(true);
+    app.hold.drain_pending();
+    let wait = std::time::Duration::from_secs(pt.request_deadline_secs)
+        .saturating_add(std::time::Duration::from_secs(2));
+    let ended = permits.acquire_many(pt.max_connections as u32);
+    tokio::select! {
+        _ = ended => {}
+        () = tokio::time::sleep(wait) => {
+            eprintln!("auth-proxy: shutdown wait reached the request deadline");
+        }
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+    }
+    0
 }

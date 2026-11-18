@@ -1,8 +1,11 @@
 # Muse gated passthrough: a hold-the-connection approval gate
 
-Status: design only, no code. Branch `design/muse-gated-passthrough`, based on `main` at the merge of
-PR #11 (`b3f7864`). Scope: a minimal proof of concept (PoC) for one consumer, Muse calling the Discord
-HTTP API through auth-proxy in standalone service mode.
+Status: stage 1 is implemented and measured. Stage 2 (held-connection approval) is implemented on
+branch `feat/muse-stage2` and tested in CI against a mock upstream; it is not deployed, and the
+through-the-front measurements (hold window, disconnect signal) are still open. Scope: a minimal proof
+of concept (PoC) for one consumer, Muse calling the Discord HTTP API through auth-proxy in standalone
+service mode. See "Stage 2 implementation notes" at the end of section 7 for where the code differs from
+this text.
 
 This document supersedes, for this PoC only, two earlier sketches: the "platform vault path" in the
 README Deployment models section, and the parked-and-polled design in
@@ -217,6 +220,12 @@ journal, error bodies and panic message never contain the `/ap/<key>` prefix or 
 is the stripped, redacted route-relative path), and the matrix scans every output for it. Anything in front of
 the gate that logs URLs would still see it, and the key is unsafe wherever such a log is kept.
 
+The key is also refused anywhere else in the request target. A route-relative path or a query string that carries
+the authenticated key again, in any percent-encoded spelling or letter case (found by the same layered decoding
+as path canonicalization, fail-closed when the layers do not end), is `caller_key_ambiguous` before the Trail has a
+path, before a hold exists and before the upstream is called, so the key never reaches the audit stream, the
+approval page or Discord.
+
 ### 3.3 Policy: a third verdict, and segment patterns
 
 Phase 1 policy answers allow or deny. A grant is `{identity, credential, route, methods, paths}` with
@@ -225,6 +234,16 @@ prefix matching on `paths` [I policy.rs `evaluate`; config.rs `Grant`]. Two chan
 1. **Verdict.** A grant gains `decision = "allow" | "hold"`. A passthrough grant has no `credential`
    (today `credential` is a required field [I config.rs `Grant`]). If more than one grant matches, `hold`
    beats `allow` (the stricter wins). No match is deny, as today.
+   Two passthrough routes may not share one host and port (the upstream resource is the authority and path, not
+   the route name, so a second route name would be a second verdict for the same resource); policy load refuses
+   the config. Policy load also refuses an `allow` grant (a prefix or a pattern) of the same identity, route and method that
+   overlaps a `hold` pattern, so the rule is not relied on: a spelling of a held resource that the pattern does
+   not claim, such as a trailing `/`, would otherwise reach the allow grant. The matcher also answers a
+   trailing-slash spelling of a held path with `no_grant`, whatever allow grants exist. The path that policy
+   matches is byte-identical to the path that is sent and shown: a percent-escape of an RFC 3986 unreserved
+   character (`A-Z a-z 0-9 - . _ ~`) is refused as `path_ambiguous` on the passthrough listener, in every decode
+   layer, so two spellings of one resource can never get different verdicts. The sidecar has no hold verdict and
+   keeps accepting those escapes (matrix row C1-3). The query is not matched, and is sent as received.
 2. **Exact segment patterns for writes.** Prefix matching cannot say "`POST /channels/{id}/messages` and
    nothing under it". A prefix `/api/v10/channels/` would also match `POST /api/v10/channels/1/messages/2/reactions`
    and every other POST below it. Add `path_patterns`, where each segment is a literal or `*` (exactly
@@ -530,8 +549,21 @@ passthrough mode adds fields and transitions, and keeps that property:
   `code = upstream_reset` or `body_failed_after_send` after a post-first-byte failure. Each carries the request
   id, identity, route, method, the redacted route-relative path (below), the digest, and for decisions the
   approver identity.
-- `dropped_on_reload`: when a policy reload removes an identity, its `Pending` entries move to `Dropped`,
-  are answered 503 `unavailable`, and nothing is sent. Entries of identities that remain are untouched.
+- `dropped_on_reload`: on every policy reload each `Pending` entry is checked again against the new policy.
+  An entry whose identity, route, method or path no longer yields `hold` (identity removed, route removed or
+  renamed, hold grant removed, method removed, pattern narrowed, or a policy that is invalid or gone) moves to
+  `Dropped`, is answered 503 `unavailable`, and nothing is sent. Entries that still yield `hold` are untouched.
+  An entry also records the upstream its route named when it was held (scheme, host, port, and the route's
+  `keep_auth_headers`); the `held` record carries `upstream` and `policy_generation`, and the approval page
+  shows "Sent to". A route that now names another host or port (or other kept headers) drops the entry the
+  same way, so an approval never sends to an authority the current policy does not name.
+  The approve reads the policy inside the hold table's critical section, in the same step that takes the
+  entry out of the table, and the start claim reads it once more under the same lock immediately before
+  `forward_started` and the first upstream byte. If either read no longer yields `hold` for the recorded
+  upstream, nothing is sent: the entry is dropped (503 `dropped_on_reload`), and the approve answers
+  `policy_changed` (HTTP 410). A reload that lands at any point before that claim therefore either leaves a
+  hold that is approved under the policy in force at send time, or refuses with nothing sent. The claim
+  opens the upstream connection first and writes no request byte until it passes.
 - `auth_present` (boolean). It gives stage 1 evidence that Muse's swap happened without logging the token.
 - Path redaction. Discord paths can carry secrets: the token segment of `/webhooks/{id}/{token}...` and
   `/interactions/{id}/{token}/...` is replaced by `<redacted>` in the audit record, on the approval page
@@ -874,9 +906,11 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
     entry and notification. Order: during a cooldown a duplicate is 503 `cooldown`; at
     `max_held_per_identity` an identical retry supersedes instead of getting 503; a cooldown leaves the
     identity's existing `Pending` entries held.
-21. **Reload drops holds:** removing an identity from the policy and reloading answers its held requests
-    503 `unavailable` with audit `dropped_on_reload`, sends nothing upstream, and leaves other identities'
-    holds untouched.
+21. **Reload drops holds:** removing an identity, the route or the hold grant, removing the method, narrowing the
+    pattern, or replacing the policy with an invalid file, then reloading, answers the affected held requests
+    503 `unavailable` with audit `dropped_on_reload`, sends nothing upstream, and leaves holds that the new
+    policy still holds untouched. An approve that arrives after the file changed but before the reload tick is
+    refused (`policy_changed`) and sends nothing.
 22. **Approval page:** a body containing HTML and script is shown escaped; every response, errors included,
     carries `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; form-action 'self'`,
     `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`,
@@ -898,6 +932,36 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
     `audit_unavailable` with no notification and no entry, and the mock upstream records nothing; an allowed
     read still passes. With the sink failing between approve and send, the caller gets 503
     `audit_unavailable`, the approve result is `audit_unavailable`, and nothing reaches the mock.
+
+### Stage 2 implementation notes
+
+Where the implementation differs from, or settles, the text above:
+
+- **Codes.** The `Upgrade` row is answered with the Phase 1 code `websocket_unsupported` (501) and the
+  `CONNECT` row with `connect_refused` (405), not the names `upgrade_not_supported` and
+  `method_not_allowed` in the section 3.5 table. Status and decision header match the table.
+- **Unknown route.** An unknown route (and the approval paths, which are not routes on the public
+  listener) is answered 423 `route_unknown` with `X-AP-Decision`, as in stage 1, not 404.
+- **Milestones.** "Connect done" (`forward_started`) is the first poll of the request body stream, which
+  reqwest does only after a connection exists. "First byte handed over" resolves when the first body chunk
+  is yielded. A test checks that the upstream has accepted the connection and received no request byte
+  while the milestone hook is paused.
+- **Disconnect.** Hyper drops the handler future when the peer closes (tested on the direct path), so no
+  peer-watch fallback was needed. Through the front it is still unmeasured.
+- **Notification on supersede.** The notifier has one `notify` method. A new distinct entry notifies once;
+  a supersede does not notify again, and the old entry's page links to the newest one. An in-place update
+  of the notification would need a second method.
+- **Policy file removed.** Waiting holds are answered 503 `dropped_on_reload`, and new requests get 503
+  `policy_unavailable`.
+- **Non-UTF-8 bodies.** The approval page shows a lossy rendering with a banner. No new refusal.
+- **Test hooks.** `AP_TEST_HOLD_PAUSE_MS` exists only under the `matrix-upstream` feature and CI greps it
+  out of the default release binary.
+- **Black-box coverage of the front.** Acceptance 11 (network half), 18 and 19 through the real front, and
+  the hold window through the front need the deployment and are on the owner checklist.
+- **Duplicate delivery.** Exactly-once is not claimed: forwarded, response lost, retried, approved again
+  runs twice (see `docs/runbooks/muse-stage2.md`).
+- **Not claimed.** Protection from the Muse platform, exactly-once delivery, and an approval plane that is
+  unreachable from the caller path (a network control).
 
 ## 8. Open questions for the owner
 

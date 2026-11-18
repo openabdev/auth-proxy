@@ -65,6 +65,12 @@ pub struct Config {
     pub passthrough: Option<Passthrough>,
     #[serde(default)]
     pub probe: Probe,
+    /// Approval plane (design 3.6). Passthrough deployments only.
+    #[serde(default)]
+    pub approval: Option<Approval>,
+    /// Notifier (design 3.4 step 5). Absent means holds are not announced and simply expire.
+    #[serde(default)]
+    pub notify: Option<Notify>,
 }
 
 /// How a route treats the request credential.
@@ -78,7 +84,7 @@ pub enum RouteMode {
     Passthrough,
 }
 
-/// What a matching grant does. Stage 1 supports `allow` only.
+/// What a matching grant does. `hold` is valid only on passthrough grants with `path_patterns`.
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
@@ -113,6 +119,83 @@ pub struct Passthrough {
     /// No byte from upstream, 1..=3600.
     #[serde(default = "default_upstream_idle_secs")]
     pub upstream_idle_secs: u64,
+    /// How long a held request waits for a human, 5..=600.
+    #[serde(default = "default_hold_secs")]
+    pub hold_secs: u64,
+    /// Largest body a held request may carry, 1..=8 MiB.
+    #[serde(default = "default_held_body_max_bytes")]
+    pub held_body_max_bytes: u64,
+    /// Held requests at once, 1..=1024.
+    #[serde(default = "default_max_held_total")]
+    pub max_held_total: usize,
+    /// Held requests at once per identity, 1..=`max_held_total`.
+    #[serde(default = "default_max_held_per_identity")]
+    pub max_held_per_identity: usize,
+    /// Seconds an identity is refused after a human deny, 0..=3600 (0 disables).
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+}
+
+fn default_hold_secs() -> u64 {
+    120
+}
+
+fn default_held_body_max_bytes() -> u64 {
+    1024 * 1024
+}
+
+fn default_max_held_total() -> usize {
+    32
+}
+
+fn default_max_held_per_identity() -> usize {
+    4
+}
+
+fn default_cooldown_secs() -> u64 {
+    60
+}
+
+/// The approval listener and its single approver credential (design 3.6). No secret lives here:
+/// the password is stored as a hash.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Approval {
+    /// Loopback address of the approval listener. Must differ from `listen.proxy`.
+    pub listen: SocketAddr,
+    /// Basic-auth user name.
+    pub user: String,
+    /// Lowercase hex sha256 of the approver password.
+    pub password_sha256: String,
+    /// Base URL the notification link is built from. http or https, no userinfo, query or fragment.
+    pub public_base_url: String,
+    /// Basic-auth realm.
+    #[serde(default = "default_realm")]
+    pub realm: String,
+}
+
+fn default_realm() -> String {
+    "auth-proxy approval".to_string()
+}
+
+/// How the owner is told that a request is waiting.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyKind {
+    Ntfy,
+}
+
+/// Notifier settings. The topic and token are read from files at startup, never from this file.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Notify {
+    pub kind: NotifyKind,
+    pub base_url: String,
+    /// Absolute path of a regular file (mode 0600) holding the topic.
+    pub topic_file: String,
+    /// Absolute path of a regular file (mode 0600) holding a bearer token. Optional.
+    #[serde(default)]
+    pub token_file: Option<String>,
 }
 
 fn default_caller_key_header() -> String {
@@ -258,10 +341,16 @@ pub struct Grant {
     pub credential: String,
     pub route: String,
     pub methods: Vec<String>,
+    /// Prefix paths. At least one of `paths` and `path_patterns` is required.
+    #[serde(default)]
     pub paths: Vec<String>,
+    /// Whole-path segment patterns (`/a/*/b`): a segment is a literal or `*` for exactly one
+    /// non-empty segment. Passthrough routes only. Required for `hold`.
+    #[serde(default)]
+    pub path_patterns: Vec<String>,
     #[serde(default)]
     pub aws_targets: Vec<String>,
-    /// `allow` (default). `hold` is not supported in stage 1.
+    /// `allow` (default) or `hold` (passthrough routes, `path_patterns` only).
     #[serde(default)]
     pub decision: Decision,
 }
@@ -374,6 +463,48 @@ fn valid_prefix_path(p: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A whole-path pattern: `/`, then one or more segments, each a literal or `*`. No `%`, no
+/// empty segment (so no `//` and no trailing `/`), no dot segment, and `*` only as a full segment.
+fn valid_path_pattern(p: &str) -> Result<(), &'static str> {
+    if !p.starts_with('/') {
+        return Err("must start with /");
+    }
+    if p.contains('%') {
+        return Err("must not contain %");
+    }
+    for seg in p[1..].split('/') {
+        if seg.is_empty() {
+            return Err("must not contain an empty segment");
+        }
+        if seg == "." || seg == ".." {
+            return Err("must not contain a dot segment");
+        }
+        if seg.contains('*') && seg != "*" {
+            return Err("* is only allowed as a whole segment");
+        }
+        if !seg.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err("must be printable ASCII without spaces");
+        }
+    }
+    Ok(())
+}
+
+/// `http(s)://host[:port][/path]` with no userinfo, query, fragment or whitespace.
+fn valid_base_url(u: &str) -> bool {
+    let rest = match u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))
+    {
+        Some(r) => r,
+        None => return false,
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    !host.is_empty()
+        && u.len() <= 512
+        && !u.contains(['@', '?', '#'])
+        && u.bytes().all(|b| b.is_ascii_graphic())
+}
+
 /// A lowercase header token, or one followed by a single `*` (prefix match).
 fn valid_header_pattern(s: &str) -> bool {
     let token = s.strip_suffix('*').unwrap_or(s);
@@ -424,6 +555,89 @@ fn validate_passthrough(p: &Passthrough) -> Result<(), ConfigError> {
     ] {
         if !(1..=max).contains(&v) {
             return Err(invalid(format!("passthrough.{field} must be in 1..={max}")));
+        }
+    }
+    for (field, v, min, max) in [
+        ("hold_secs", p.hold_secs, 5, 600),
+        (
+            "held_body_max_bytes",
+            p.held_body_max_bytes,
+            1,
+            8 * 1024 * 1024,
+        ),
+        ("cooldown_secs", p.cooldown_secs, 0, 3600),
+    ] {
+        if !(min..=max).contains(&v) {
+            return Err(invalid(format!(
+                "passthrough.{field} must be in {min}..={max}"
+            )));
+        }
+    }
+    if !(1..=1024).contains(&p.max_held_total) {
+        return Err(invalid("passthrough.max_held_total must be in 1..=1024"));
+    }
+    if !(1..=p.max_held_total).contains(&p.max_held_per_identity) {
+        return Err(invalid(
+            "passthrough.max_held_per_identity must be in 1..=max_held_total",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_approval(a: &Approval, proxy: SocketAddr) -> Result<(), ConfigError> {
+    if !a.listen.ip().is_loopback() {
+        return Err(invalid("approval.listen must be a loopback address"));
+    }
+    if a.listen.port() == 0 || a.listen.port() == proxy.port() {
+        return Err(invalid(
+            "approval.listen must have a port other than 0 and other than listen.proxy",
+        ));
+    }
+    if a.user.is_empty()
+        || a.user.len() > 64
+        || !a.user.bytes().all(|b| b.is_ascii_graphic() && b != b':')
+    {
+        return Err(invalid(
+            "approval.user must be 1..=64 printable ASCII bytes without ':'",
+        ));
+    }
+    if !is_hex64_lower(&a.password_sha256) {
+        return Err(invalid(
+            "approval.password_sha256 must be 64 lowercase hex characters",
+        ));
+    }
+    if !valid_base_url(&a.public_base_url) {
+        return Err(invalid(
+            "approval.public_base_url must be an http(s) URL without userinfo, query or fragment",
+        ));
+    }
+    let realm_ok = !a.realm.is_empty()
+        && a.realm.len() <= 64
+        && a.realm
+            .bytes()
+            .all(|b| (b == b' ' || b.is_ascii_graphic()) && b != b'"' && b != b'\\');
+    if !realm_ok {
+        return Err(invalid(
+            "approval.realm must be 1..=64 printable ASCII bytes without quote or backslash",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_notify(n: &Notify) -> Result<(), ConfigError> {
+    if !valid_base_url(&n.base_url) {
+        return Err(invalid(
+            "notify.base_url must be an http(s) URL without userinfo, query or fragment",
+        ));
+    }
+    for (field, path) in [
+        ("topic_file", Some(&n.topic_file)),
+        ("token_file", n.token_file.as_ref()),
+    ] {
+        if let Some(p) = path {
+            if !p.starts_with('/') || p.len() > 1024 || p.bytes().any(|b| b == 0) {
+                return Err(invalid(format!("notify.{field} must be an absolute path")));
+            }
         }
     }
     Ok(())
@@ -484,6 +698,10 @@ impl Config {
         }
 
         let mut route_hosts: HashMap<&str, &str> = HashMap::new();
+        // The upstream resource is `https://{host}:{port}{path}`, not the route name, so two
+        // passthrough routes on one authority would let the caller pick the route name that
+        // carries the weaker verdict. Refused outright.
+        let mut passthrough_authorities: HashMap<(String, u16), &str> = HashMap::new();
         for r in &self.routes {
             if !valid_slug(&r.name, 32) {
                 return Err(invalid(format!(
@@ -543,6 +761,14 @@ impl Config {
                     }
                 }
                 RouteMode::Passthrough => {
+                    let authority = (r.host.trim_end_matches('.').to_ascii_lowercase(), r.port);
+                    if let Some(first) = passthrough_authorities.insert(authority, r.name.as_str())
+                    {
+                        return Err(invalid(format!(
+                            "passthrough routes {first:?} and {:?} share one host and port; a held resource must have one route",
+                            r.name
+                        )));
+                    }
                     if r.name == "ap" {
                         return Err(invalid(format!(
                             "passthrough route name {:?} is reserved",
@@ -602,6 +828,17 @@ impl Config {
         if self.probe.enabled && passthrough_routes.is_empty() {
             return Err(invalid("[probe] needs a passthrough deployment"));
         }
+        if passthrough_routes.is_empty() && (self.approval.is_some() || self.notify.is_some()) {
+            return Err(invalid(
+                "[approval] and [notify] need a passthrough deployment",
+            ));
+        }
+        if let Some(a) = &self.approval {
+            validate_approval(a, self.listen.proxy)?;
+        }
+        if let Some(n) = &self.notify {
+            validate_notify(n)?;
+        }
 
         let mut credential_ids = HashSet::new();
         let mut credential_routes: HashMap<&str, HashSet<&str>> = HashMap::new();
@@ -654,6 +891,36 @@ impl Config {
         if self.grants.len() > MAX_GRANTS {
             return Err(invalid(format!("at most {MAX_GRANTS} grants are allowed")));
         }
+        // A hold pattern must not share a request with an allow grant of the same identity,
+        // route and method. Hold wins when both match, but a spelling of the held resource that
+        // the pattern does not claim (a trailing `/`, a path parameter) would still reach the
+        // allow grant, so the overlap is refused instead of relied on.
+        for h in self.grants.iter().filter(|g| g.decision == Decision::Hold) {
+            for a in self.grants.iter().filter(|g| {
+                g.decision == Decision::Allow
+                    && g.identity == h.identity
+                    && g.route == h.route
+                    && g.methods.iter().any(|m| h.methods.contains(m))
+            }) {
+                for hp in &h.path_patterns {
+                    let clash = a
+                        .paths
+                        .iter()
+                        .find(|p| crate::policy::prefix_overlaps_pattern(p, hp))
+                        .or_else(|| {
+                            a.path_patterns
+                                .iter()
+                                .find(|p| crate::policy::patterns_overlap(p, hp))
+                        });
+                    if let Some(ap) = clash {
+                        return Err(invalid(format!(
+                            "grant for identity {:?} on route {:?}: allow path {:?} overlaps hold pattern {:?} for the same method; an allow grant must not cover a held resource",
+                            a.identity, a.route, ap, hp
+                        )));
+                    }
+                }
+            }
+        }
         for g in &self.grants {
             if !identity_names.contains(g.identity.as_str()) {
                 return Err(invalid(format!(
@@ -675,10 +942,15 @@ impl Config {
                         g.route
                     )));
                 }
-                if g.decision != Decision::Allow {
-                    return Err(invalid(
-                        "grant decision \"hold\" is not supported yet (stage 1 allows or denies)",
-                    ));
+                if g.decision == Decision::Hold {
+                    if g.path_patterns.is_empty() {
+                        return Err(invalid("grant decision \"hold\" needs path_patterns"));
+                    }
+                    if !g.paths.is_empty() {
+                        return Err(invalid(
+                            "grant decision \"hold\" must not use prefix paths, only path_patterns",
+                        ));
+                    }
                 }
             } else {
                 let routes = credential_routes
@@ -697,7 +969,12 @@ impl Config {
                 }
                 if g.decision != Decision::Allow {
                     return Err(invalid(
-                        "grant decision \"hold\" is not supported yet (stage 1 allows or denies)",
+                        "grant decision \"hold\" is only valid on passthrough routes",
+                    ));
+                }
+                if !g.path_patterns.is_empty() {
+                    return Err(invalid(
+                        "grant path_patterns are only valid on passthrough routes",
                     ));
                 }
             }
@@ -716,8 +993,15 @@ impl Config {
                     )));
                 }
             }
-            if g.paths.is_empty() {
+            if g.paths.is_empty() && g.path_patterns.is_empty() {
                 return Err(invalid("grant paths must not be empty"));
+            }
+            if g.path_patterns.len() > 64 {
+                return Err(invalid("grant has too many path_patterns"));
+            }
+            for p in &g.path_patterns {
+                valid_path_pattern(p)
+                    .map_err(|why| invalid(format!("grant path_pattern {p:?}: {why}")))?;
             }
             for p in &g.paths {
                 let checked = if on_passthrough {
@@ -1443,11 +1727,213 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
 
     #[test]
     fn rejects_hold_decision_in_stage_1() {
+        // Hold on prefix paths is refused: a hold grant needs path_patterns.
         let text = pt_base().replace(
             "methods = [\"GET\"]",
             "decision = \"hold\"\nmethods = [\"GET\"]",
         );
-        expect_invalid(&text, "not supported yet");
+        expect_invalid(&text, "needs path_patterns");
+        // Hold on a swap route is refused.
+        let swap = base().replace(
+            "methods = [",
+            "decision = \"hold\"\npath_patterns = [\"/a\"]\nmethods = [",
+        );
+        expect_invalid(&swap, "only valid on passthrough routes");
+    }
+
+    fn hold_text() -> String {
+        pt_base().replace(
+            "methods = [\"GET\"]\npaths = [\"/api/v10/channels/\", \"/api/v10/users/@me\"]",
+            "decision = \"hold\"\nmethods = [\"POST\"]\npath_patterns = [\"/api/v10/channels/*/messages\"]",
+        )
+    }
+
+    #[test]
+    fn hold_grant_on_path_patterns_loads_with_defaults() {
+        let cfg = load(&hold_text()).unwrap();
+        assert_eq!(cfg.grants[0].decision, Decision::Hold);
+        assert!(cfg.grants[0].paths.is_empty());
+        let p = cfg.passthrough.unwrap();
+        assert_eq!(p.hold_secs, 120);
+        assert_eq!(p.held_body_max_bytes, 1024 * 1024);
+        assert_eq!(p.max_held_total, 32);
+        assert_eq!(p.max_held_per_identity, 4);
+        assert_eq!(p.cooldown_secs, 60);
+        assert!(cfg.approval.is_none() && cfg.notify.is_none());
+    }
+
+    fn second_route(host: &str, port: Option<u16>) -> String {
+        let port = port.map_or(String::new(), |p| format!("port = {p}\n"));
+        format!(
+            "{}\n[[route]]\nname = \"discord2\"\nhost = \"{host}\"\n{port}mode = \"passthrough\"\n\n[[grant]]\nidentity = \"muse-pilot\"\nroute = \"discord2\"\nmethods = [\"POST\"]\npaths = [\"/\"]\n",
+            hold_text()
+        )
+    }
+
+    #[test]
+    fn two_passthrough_routes_on_one_host_and_port_are_refused() {
+        // The reproduced bypass: `discord2` shares the authority and allows POST on `/`.
+        expect_invalid(
+            &second_route("discord.com", None),
+            "share one host and port",
+        );
+        // The default port spelled out is the same authority.
+        expect_invalid(
+            &second_route("discord.com", Some(443)),
+            "share one host and port",
+        );
+    }
+
+    #[test]
+    fn host_spellings_of_one_authority_are_still_refused() {
+        // Uppercase and a trailing dot never reach the authority check: the host rule refuses
+        // them first. Either way the config does not load.
+        for host in ["DISCORD.com", "discord.com."] {
+            assert!(load(&second_route(host, None)).is_err(), "{host}");
+        }
+    }
+
+    #[test]
+    fn passthrough_routes_on_different_ports_or_hosts_load() {
+        assert!(load(&second_route("discord.com", Some(8443))).is_ok());
+        assert!(load(&second_route("other.example.test", None)).is_ok());
+    }
+
+    #[test]
+    fn hold_grant_rejects_prefix_paths_alongside_patterns() {
+        let text = hold_text().replace("path_patterns =", "paths = [\"/api/\"]\npath_patterns =");
+        expect_invalid(&text, "must not use prefix paths");
+    }
+
+    #[test]
+    fn rejects_bad_path_patterns() {
+        for bad in [
+            "channels/*",
+            "/a//b",
+            "/a/",
+            "/",
+            "/a/b*",
+            "/a/*x",
+            "/a/../b",
+            "/a/./b",
+            "/a/%2f",
+            "/a b",
+        ] {
+            let text = hold_text().replace("/api/v10/channels/*/messages", bad);
+            expect_invalid(&text, "path_pattern");
+        }
+    }
+
+    #[test]
+    fn allow_grant_may_use_path_patterns_and_swap_may_not() {
+        let text = pt_base().replace(
+            "paths = [\"/api/v10/channels/\", \"/api/v10/users/@me\"]",
+            "path_patterns = [\"/api/v10/users/*\"]",
+        );
+        assert!(load(&text).is_ok());
+        let swap = base().replace(
+            "paths = [\"/\"]",
+            "paths = [\"/\"]\npath_patterns = [\"/a\"]",
+        );
+        expect_invalid(&swap, "only valid on passthrough routes");
+    }
+
+    #[test]
+    fn rejects_grant_without_paths_or_patterns() {
+        let text = pt_base().replace(
+            "paths = [\"/api/v10/channels/\", \"/api/v10/users/@me\"]",
+            "",
+        );
+        expect_invalid(&text, "paths must not be empty");
+    }
+
+    #[test]
+    fn rejects_hold_limits_out_of_range() {
+        for (k, v) in [
+            ("hold_secs", "4"),
+            ("hold_secs", "601"),
+            ("held_body_max_bytes", "0"),
+            ("held_body_max_bytes", "8388609"),
+            ("max_held_total", "0"),
+            ("max_held_total", "1025"),
+            ("max_held_per_identity", "0"),
+            ("max_held_per_identity", "33"),
+            ("cooldown_secs", "3601"),
+        ] {
+            let text = hold_text().replace(
+                "public_authority = \"gate.example.test\"",
+                &format!("public_authority = \"gate.example.test\"\n{k} = {v}"),
+            );
+            expect_invalid(&text, k);
+        }
+        let ok = hold_text().replace(
+            "public_authority = \"gate.example.test\"",
+            "public_authority = \"gate.example.test\"\nhold_secs = 5\ncooldown_secs = 0",
+        );
+        assert!(load(&ok).is_ok());
+    }
+
+    fn approval_block() -> String {
+        format!(
+            "\n[approval]\nlisten = \"127.0.0.1:8444\"\nuser = \"owner\"\npassword_sha256 = \"{H64}\"\npublic_base_url = \"https://approve.example.test\"\n\n[notify]\nkind = \"ntfy\"\nbase_url = \"https://ntfy.example.test\"\ntopic_file = \"/etc/ap/topic\"\ntoken_file = \"/etc/ap/token\"\n"
+        )
+    }
+
+    #[test]
+    fn approval_and_notify_load() {
+        let cfg = load(&(hold_text() + &approval_block())).unwrap();
+        let a = cfg.approval.unwrap();
+        assert_eq!(a.realm, "auth-proxy approval");
+        assert_eq!(cfg.notify.unwrap().kind, NotifyKind::Ntfy);
+    }
+
+    #[test]
+    fn rejects_bad_approval_and_notify() {
+        for (from, to, needle) in [
+            (
+                "127.0.0.1:8444",
+                "127.0.0.1:8443",
+                "other than listen.proxy",
+            ),
+            ("127.0.0.1:8444", "0.0.0.0:8444", "loopback"),
+            ("user = \"owner\"", "user = \"a:b\"", "approval.user"),
+            (H64, "ABC", "password_sha256"),
+            (
+                "https://approve.example.test",
+                "https://u:p@x.test",
+                "public_base_url",
+            ),
+            (
+                "https://approve.example.test",
+                "https://x.test/?q=1",
+                "public_base_url",
+            ),
+            (
+                "https://approve.example.test",
+                "ftp://x.test",
+                "public_base_url",
+            ),
+            (
+                "https://ntfy.example.test",
+                "ntfy.example.test",
+                "notify.base_url",
+            ),
+            ("/etc/ap/topic", "topic", "topic_file"),
+            ("/etc/ap/token", "token", "token_file"),
+        ] {
+            let text = hold_text() + &approval_block().replacen(from, to, 1);
+            expect_invalid(&text, needle);
+        }
+        let text = hold_text() + &approval_block() + "extra = 1\n";
+        expect_parse_error(&text);
+    }
+
+    #[test]
+    fn approval_needs_a_passthrough_deployment() {
+        expect_invalid(
+            &(base() + &approval_block()),
+            "need a passthrough deployment",
+        );
     }
 
     #[test]

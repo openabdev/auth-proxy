@@ -1,7 +1,7 @@
 //! Test-only upstream overrides for the black-box matrix. Compiled only with the `matrix-upstream`
 //! feature, which is off by default and is never enabled in a release build.
 //!
-//! The matrix runs the proxy against throwaway CAs and mock upstreams on loopback. Two environment
+//! The matrix runs the proxy against throwaway CAs and mock upstreams on loopback. Three environment
 //! variables make that possible. Nothing in this module reads the config file, and a binary built
 //! without the feature contains none of this code.
 
@@ -14,6 +14,18 @@ pub const ENV_CA: &str = "AP_TEST_UPSTREAM_CA";
 
 /// Comma-separated `host=ip` pairs. Each host resolves to that address. The port comes from the URL.
 pub const ENV_RESOLVE: &str = "AP_TEST_RESOLVE";
+
+/// Milliseconds to pause between the `Approved` transition and the upstream send, so the matrix can
+/// kill the process inside that window. Absent or unparsable means no pause.
+pub const ENV_HOLD_PAUSE_MS: &str = "AP_TEST_HOLD_PAUSE_MS";
+
+/// The configured pause, in milliseconds.
+pub fn hold_pause_ms() -> u64 {
+    std::env::var(ENV_HOLD_PAUSE_MS)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
 
 /// A request path that makes a passthrough handler panic, to exercise the panic hook.
 pub const PANIC_PATH: &str = "/__ap_test_panic";

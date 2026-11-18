@@ -33,20 +33,31 @@ pub const DECISION_HEADER: &str = "x-ap-decision";
 pub fn passthrough_outcome(code: Code) -> (u16, Decision) {
     match code {
         Code::CallerRejected => (401, Decision::Rejected),
-        Code::RouteUnknown | Code::NoGrant => (423, Decision::Denied),
+        Code::RouteUnknown | Code::NoGrant | Code::HumanDenied => (423, Decision::Denied),
+        Code::Expired => (410, Decision::Expired),
         Code::AbsoluteForm
         | Code::HostRejected
         | Code::PathAmbiguous
         | Code::FramingRefused
         | Code::AuthorizationDuplicate
         | Code::ProbeParams
-        | Code::CallerKeyAmbiguous => (400, Decision::Denied),
+        | Code::CallerKeyAmbiguous
+        | Code::ContentType
+        | Code::ContentEncoding
+        | Code::CredentialMissing => (400, Decision::Denied),
         Code::ConnectRefused => (405, Decision::Denied),
         Code::WebsocketUnsupported => (501, Decision::Denied),
         Code::BodyTooLarge => (413, Decision::Denied),
-        Code::PolicyUnavailable | Code::BodyReadTimeout | Code::ConnectFailed => {
-            (503, Decision::Unavailable)
-        }
+        Code::PolicyUnavailable
+        | Code::BodyReadTimeout
+        | Code::ConnectFailed
+        | Code::TableFull
+        | Code::IdentityCap
+        | Code::Cooldown
+        | Code::Superseded
+        | Code::Shutdown
+        | Code::DroppedOnReload
+        | Code::AuditUnavailable => (503, Decision::Unavailable),
         // Not produced by the passthrough pipeline. Fail closed with a generic refusal.
         _ => (503, Decision::Unavailable),
     }
@@ -70,7 +81,7 @@ mod tests {
     use crate::error::render;
 
     #[test]
-    fn stage1_rows_of_the_outcome_table() {
+    fn rows_of_the_outcome_table() {
         let rows = [
             (Code::NoGrant, 423, "denied", "no_grant"),
             (Code::RouteUnknown, 423, "denied", "route_unknown"),
@@ -112,6 +123,28 @@ mod tests {
                 400,
                 "denied",
                 "caller_key_ambiguous",
+            ),
+            (Code::HumanDenied, 423, "denied", "human_denied"),
+            (Code::Expired, 410, "expired", "expired"),
+            (Code::ContentType, 400, "denied", "content_type"),
+            (Code::ContentEncoding, 400, "denied", "content_encoding"),
+            (Code::CredentialMissing, 400, "denied", "credential_missing"),
+            (Code::TableFull, 503, "unavailable", "table_full"),
+            (Code::IdentityCap, 503, "unavailable", "identity_cap"),
+            (Code::Cooldown, 503, "unavailable", "cooldown"),
+            (Code::Superseded, 503, "unavailable", "superseded"),
+            (Code::Shutdown, 503, "unavailable", "shutdown"),
+            (
+                Code::DroppedOnReload,
+                503,
+                "unavailable",
+                "dropped_on_reload",
+            ),
+            (
+                Code::AuditUnavailable,
+                503,
+                "unavailable",
+                "audit_unavailable",
             ),
         ];
         for (code, status, decision, name) in rows {

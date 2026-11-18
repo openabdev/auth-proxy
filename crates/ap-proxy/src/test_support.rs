@@ -326,13 +326,14 @@ impl Fixture {
         std::fs::write(secret_dir.join("api_key"), format!("{CREDENTIAL}\n")).expect("secret");
         std::fs::create_dir_all(root.join("tokens")).expect("token dir");
 
-        let cfg = ap_core::config::load(&std::fs::read_to_string(&policy_path).expect("read"))
-            .expect("fixture config is valid");
+        let text = std::fs::read_to_string(&policy_path).expect("read");
+        let cfg = ap_core::config::load(&text).expect("fixture config is valid");
         let broker: Arc<dyn Broker> = Arc::new(FileStore::new(root.join("secrets")));
         let (sink, audit) = buffer_sink();
         let app = App::new(
             policy_path.clone(),
             cfg,
+            &text,
             root.join("tokens"),
             ap_broker::expiry::file_in(&root.join("tokens")),
             broker,

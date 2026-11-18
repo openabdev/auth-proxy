@@ -16,9 +16,12 @@ path = "src/main.rs"
 ap-core = { workspace = true }
 ap-broker = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.22"
 bytes = "1"
 ed25519-dalek = "2"
 futures-util = "0.3"
+getrandom = "0.2"
+hmac = "0.12"
 http = "1"
 libc = "0.2"
 hyper = { version = "1", features = ["server", "http1"] }
@@ -26,8 +29,9 @@ hyper-util = { version = "0.1", features = ["tokio", "service"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 subtle = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
 
 [features]
 default = []
@@ -48,11 +52,10 @@ path = "tests/matrix_passthrough.rs"
 required-features = ["matrix-upstream"]
 
 [dev-dependencies]
-base64 = "0.22"
 h2 = "0.4"
-getrandom = "0.2"
 http-body-util = "0.1"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio = { version = "1", features = ["test-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5", features = ["util"] }

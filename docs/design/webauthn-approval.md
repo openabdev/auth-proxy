@@ -1,6 +1,6 @@
 # WebAuthn approval bound to the held request
 
-Status: design note, no code. Revision 2 answers the review verdicts at 96c10923 (section 16). Draft for the standing design review; not final. Issue:
+Status: design note, no code. Revision 3 answers the review verdicts at 96c10923 (section 16) and the re-review at 62e4364 (section 17). Draft for the standing design review; not final. Issue:
 [#37](https://github.com/openabdev/auth-proxy/issues/37). Based on `origin/main` at `3878421`.
 Builds on `docs/design/muse-gated-passthrough.md` (sections 3.4 to 3.9, 5.2, open question 7) and on the
 stage 2 implementation in draft PR [#29](https://github.com/openabdev/auth-proxy/pull/29), which is **in
@@ -164,6 +164,19 @@ the front's logs or a `Referer`. The page script reads it and puts it in a POST 
 `enrol/` directory when `POST /enroll/begin` arrives (a bounded read: at most 4 files; a fifth is refused, section 4.1 Cleanup). `begin` spends the token
 under the enrolment mutex, once (Spend, below). No control socket is added to the proxy. The token never goes through ntfy.
 
+**Endpoint authentication (normative).** Every enrolment route sits behind the approval plane's Basic gate, which the router runs before the route handler, as it does for the rest of the plane. The ceremony capabilities do not change: the enrolment token for `begin`, the attempt id for `finish` and `confirm`, and the one-use challenges. Basic is an added requirement, not a replacement for them.
+
+| Route | Basic | Ceremony capability | Refusal without valid Basic |
+|---|---|---|---|
+| `GET /enroll` | required | none. The page is served, and the token stays in the fragment | `401` |
+| `POST /enroll/begin` | required | enrolment token (body) | `401` |
+| `POST /enroll/finish` | required | attempt id (body) and the registration challenge | `401` |
+| `POST /enroll/confirm` | required | attempt id (body) and the confirmation challenge | `401` |
+
+- A request without valid Basic gets `401` with `WWW-Authenticate` and takes the 250 ms delay that the Basic gate already uses. The router does not parse the body, read the token file, change any attempt, or count the request toward the enrolment cap.
+- Basic does not replace the token. A correct Basic credential with a wrong token refuses `token_invalid`.
+- Basic does not break the ceremony. The page and its `fetch` calls are same-origin, so the browser sends the cached Basic credential with them [A]. Stage 0 checks this on the phone. If it fails, `begin` returns `401` and no ceremony starts, and the question goes back to the owner. The `navigator.credentials` calls need no HTTP authentication.
+
 **Browser side.** `navigator.credentials.create` with:
 
 | Option | Value | Why |
@@ -230,7 +243,7 @@ If the browser cancels `create()` after `begin`, the attempt is never finished a
 
 1. The attempt is in state `begun` and its deadline has not passed. The request carries the attempt id that `begin` returned, and it matches the attempt held in memory. Its registration challenge is live. A missing, foreign or expired attempt refuses `attempt_unknown` or `attempt_expired`. Any other state refuses `attempt_state`.
 2. The registration challenge is the one issued by `begin` for this attempt: 32 bytes from the OS RNG, single
-   use, 120 s, in memory.
+   use, at most 120 s from issue and never past the attempt deadline, in memory.
 3. `clientDataJSON`: `type` is `webauthn.create`, `challenge` matches, `origin` equals the configured
    origin, `crossOrigin` is absent or false, `topOrigin` is absent.
 4. `attestationObject` parses under the strict CBOR subset of section 5.2: `fmt` is `none`, `attStmt` is an
@@ -242,8 +255,8 @@ If the browser cancels `create()` after `begin`, the attempt is never finished a
    browser, so the server checks the store itself.
 6. The credential public key is a COSE EC2 key with `alg` -7, `crv` 1 (P-256), and 32-byte `x` and `y`.
 7. **Confirmation, two endpoints.** `POST /enroll/finish` does not write the credential. It holds the parsed
-   credential in memory, one per attempt for 120 s, and returns confirmation options: a fresh 32-byte challenge
-   from the OS RNG, single use, and `allowCredentials` set to the new credential id. The page calls `get()` over
+   credential in memory, one per attempt until `confirm` succeeds or the attempt ends, and returns confirmation options: a fresh 32-byte challenge
+   from the OS RNG, single use, at most 120 s from issue and never past the attempt deadline, and `allowCredentials` set to the new credential id. The page calls `get()` over
    that challenge and posts the assertion to `POST /enroll/confirm` (section 7.1). The gate verifies it with the
    same code as section 4.2. This proves the key can sign, that UV works on this device, and that the point is
    valid, since the verifier rejects a point that is not on the curve at verification time. The confirm checks, the BE and BS rules and the write are set out in the paragraphs below this list.
@@ -252,10 +265,10 @@ If the browser cancels `create()` after `begin`, the attempt is never finished a
 
 **BE and BS at enrolment.** The registration `authData` is the only source of the candidate flags. Its BE is the baseline for the credential's life. At confirm the assertion's BE must equal that baseline, else `flags_changed`. The assertion's BS is the initial stored `backup_state`. The rule BS set with BE clear is `flags_invalid` on both authenticator data sets: at finish for the registration, and at confirm for the assertion. The gate reads these flags only from `authData`, never from a client-supplied summary or from extension output. Stage 4 has vectors for each combination (section 13).
 
-**Enrolment refusals.** Every refusal carries a code from the enrolment list in section 12. On the wire, `token_unknown`, `token_spent` and `token_expired` are all returned as `token_invalid`, so the unauthenticated endpoint is not a validity oracle. The audit line keeps the precise code, and every other code is returned as itself. A refusal before `begin` changes nothing. A `begin` that fails with `store_unavailable` issues nothing. Any refusal after `begin`, in `finish` or in `confirm`, moves the attempt to `failed`, discards its held credential and challenge, and leaves the token spent. The operator then mints a new token. Refusals are capped at 20 per minute across the enrolment endpoints. Above the cap the gate answers `429 enrol_rate_limited` with `Retry-After: 60` without evaluating the request, and it writes one summary line per minute with the count suppressed. Every refusal also takes the 250 ms delay that PR #29 uses for a failed Basic check.
+**Enrolment refusals.** Every refusal carries a code from the enrolment list in section 12. On the wire, `token_unknown`, `token_spent` and `token_expired` are all returned as `token_invalid`, to every caller that passes Basic. A Basic holder therefore cannot tell an unknown token from a spent or expired one. The audit line keeps the precise code, and every other code is returned as itself. A refusal before `begin` changes nothing. A `begin` that fails with `store_unavailable` issues nothing. Any refusal after `begin`, in `finish` or in `confirm`, moves the attempt to `failed`, discards its held credential and challenge, and leaves the token spent. The operator then mints a new token. Refusals are capped at 20 per minute across the enrolment endpoints. Requests refused by Basic are not counted. Above the cap the gate answers `429 enrol_rate_limited` with `Retry-After: 60` without evaluating the request, and it writes one summary line per minute with the count suppressed. Every refusal also takes the 250 ms delay that PR #29 uses for a failed Basic check.
 
 **What is stored** (and nothing else): credential id, public key, signature counter (the value from the
-confirmation assertion), a label the operator typed on the console, and the creation time. Two more fields
+confirmation assertion), a label the operator typed on the console, the creation time, and an `instance` value (section 8.1). Two more fields
 are stored: the backup-eligible (BE) flag, fixed at enrolment, and the backup-state (BS) flag, which section 4.2
 check 8 updates. BE is fixed at enrolment, and BS starts at the value of the confirmation assertion. Both are written to the `approver_enrolled` record (section 12). Check 8 compares BE on every approval
 and BS on device-bound credentials. A changed BE is refused. A changed BS on a synced credential is accepted and
@@ -337,13 +350,12 @@ table lock held (PR #29: approve_if)
      origin == configured origin; crossOrigin absent or false; topOrigin absent
   6. credential id is in the step 0 snapshot (a revoked credential is refused here)
   7. authenticatorData: rpIdHash == sha256(rp_id); UP set; UV set; ED clear
-  8. BE flag equals the stored BE flag, and BS may not be set while BE is clear. BS may change only on a synced
-     credential (BE set): a changed BS is accepted and `backup_state` is updated in memory in the critical section, and written after it, together with
-     the counter. On a device-bound credential (BE clear) BS must equal the stored value, which is 0.
-  9. counter policy (below)
- 10. ECDSA P-256 / SHA-256 signature over authData || sha256(clientDataJSON) verifies
- 11. finish(Approved) and delete the challenge record; the handler is told to forward
+  8. BE flag equals the stored BE flag of this instance, and BS may not be set while BE is clear. The stored values are read from the in-memory record of this instance under the set mutex; a missing record refuses `credential_unknown`. The proposed BS is the presented BS on a synced credential (BE set), which may change, and the stored value on a device-bound one (BE clear), which must be 0. Checks 8 and 9 compute proposed values only and store nothing.
+  9. counter policy (below), computed as a proposed counter only
+ 10. ECDSA P-256 / SHA-256 signature over authData || sha256(clientDataJSON) verifies. Until this check passes, nothing is written, in memory or on disk.
+ 11. Commit, all inside this section: set the in-memory counter and BS of this instance to the proposed values; if BS changed, stage one immutable `credential_state_changed` event with the next ordering value (section 8.1); finish(Approved) and delete the challenge record; tell the handler to forward.
 table lock released
+after the lock: write the staged events through the ordered sink (section 8.1), then run the write-back (section 8.1). No audit or file I/O happens inside the table lock.
 ```
 
 **Revocation and the critical section.** The set that check 6 reads is the snapshot from step 0, which is taken under the store lock (section 8.1). That refresh is the authorization point of a verification. A revocation takes effect for every verification whose refresh acquires the store lock after the console's rename has returned. A verification whose refresh came earlier can still finish, if it is in flight. Its write-back then finds the id absent and writes nothing, so the revocation still holds for every later verification. The revoke command's output states this rule, so the owner does not expect an in-flight approval to be stopped.
@@ -369,8 +381,7 @@ when either value is non-zero [read webauthn-rs-core `core.rs` around line 1175]
 | s > 0 | n > s | accept, store n |
 | s > 0 | n <= s (including 0) | refuse `counter_regression`: possible clone or replay |
 
-The stored counter is updated in memory in the critical section and written to disk after the section ends
-(no file I/O under the table lock), and written to disk after the section ends, as a merge (section 8.1). A write failure is specified in section 8.1 and does not undo the approval. If the process dies between, the on-disk value lags by one. That cannot
+The counter and BS are committed in memory at check 11, under the table lock, and written to disk after the lock is released, as a merge (section 8.1). No file or audit I/O happens under the table lock. A write failure is specified in section 8.1 and does not undo the approval. If the process dies between, the on-disk value lags by one. That cannot
 help a replay, because replay is stopped by the challenge, which does not survive a restart either.
 
 **Replay refusal.** An assertion is useful only against one live challenge record. After success the entry
@@ -480,7 +491,7 @@ adds friction without protecting anything. Deny has a cost, since it starts the 
 [read muse-gated-passthrough.md section 3.4], so it is not open to anyone. It keeps the Basic credential
 plus the per-page CSRF token, which is exactly what PR #29 does. So **Basic stays in every mode as the
 low-privilege credential: it can open the plane, view and deny, and in `webauthn` mode it can no longer
-approve.** An open question (section 13, 1) covers dropping Basic for viewing.
+approve.** An open question (section 14, question 1) covers dropping Basic for viewing. On the enrolment routes Basic is also required (section 4.1, endpoint authentication).
 
 ### 6.3 Sessions
 
@@ -528,6 +539,8 @@ having an approve action in the notification.
 | `POST /enroll/finish` | Body `{"attempt": ..., "attestation": {...}}`, capped at 4 KiB, unknown fields refused. Verifies the registration, holds the credential in memory and returns the confirmation options, section 4.1 check 7. |
 | `POST /enroll/confirm` | Body `{"attempt": ..., "assertion": {...}}`, capped at 4 KiB, unknown fields refused. Verifies the confirmation assertion with the section 4.2 code. On success it writes the credential to `approvers.json`, records `approver_enrolled` (section 12) and answers `{"result": "enrolled"}`. On failure it answers `{"result": "refused", "code": ...}` writes nothing, ends the attempt (section 4.1, Enrolment refusals), and leaves the token spent. |
 
+All four enrolment routes require Basic, as the endpoint authentication matrix in section 4.1 defines.
+
 ### 7.2 A CLI or native client
 
 The JSON forms are the browser's `PublicKeyCredentialRequestOptionsJSON` and the assertion JSON, so any
@@ -555,13 +568,13 @@ the content.
   mode 0600. The proxy refuses to start in `webauthn` mode if the file is group or other
   accessible, matching how stage 2 treats secret files [read runbook section 3: notify files must be 0600,
   "anything else refuses to start"].
-- **Shape.** `{"version": 1, "generation": <integer>, "credentials": [{"label", "id" (base64url), "pubkey" (standard base64 of the 65-byte uncompressed point, as the runtime public key is stored in standard base64 [read session-plane.md]), "counter", "created", "backup_eligible", "backup_state"}]}`. `generation` is 1 at creation and is incremented by every writer on every change. `backup_eligible` is fixed at enrolment. `backup_state` is the BS value of the most recent accepted assertion (section 4.2 check 8). `cred_fp` is derived from the id at load and is not stored. A load fails on a duplicate `cred_fp` or a duplicate label.
+- **Shape.** `{"version": 1, "generation": <integer>, "credentials": [{"label", "id" (base64url), "pubkey" (standard base64 of the 65-byte uncompressed point, as the runtime public key is stored in standard base64 [read session-plane.md]), "counter", "created", "backup_eligible", "backup_state", "instance"}]}`. `generation` is 1 at creation and is incremented by every writer on every change. `backup_eligible` is fixed at enrolment. `backup_state` is the BS value of the most recent accepted assertion (section 4.2 check 8). `cred_fp` is derived from the id at load and is not stored. `instance` is 16 random bytes from the OS RNG, written once at confirm, never changed, never logged. A load fails on a duplicate `cred_fp` or a duplicate label.
 - **Store lock.** Every writer holds the store lock for its whole read, check, modify and rename. The lock is an in-process mutex plus an advisory `flock` on `approvers.lock` in the state directory, which the console command also takes. The wait is bounded at 2 s; on timeout the operation refuses `store_unavailable` and changes nothing. The writers are enrolment confirm (add), the approval write-back (counter and BS) and console revoke (remove). Each writer re-reads the file under the lock and applies its change to what it read, never to a cached copy. It then bumps `generation`, writes a temp file in the same directory (mode 0600), fsyncs it, renames it over the target and fsyncs the directory. **Lock order:** the table lock is never held while the store lock is taken. The store lock may take the in-memory set mutex, and the table lock may take it too. That mutex guards only memory and does no I/O.
 - **Revocation linearization point.** A revocation takes effect at the rename that installs the new generation without the credential, which happens inside the store lock. A verification's authorization is its refresh (4.2 step 0), which reads the file under the same lock. So a revocation is visible to every verification whose refresh acquires the lock after that rename, and it is not visible to one that refreshed earlier. Enrolment and revocation of the same id are ordered by the same lock.
-- **Refresh.** Before each challenge issue and before each verification's table lock, the proxy takes the store lock, reads the whole file, validates it and releases the lock. There is no stat-based cache, so a same-size rewrite is seen. Validation: the file parses as version 1, ids are unique, `cred_fp` values and labels are unique, the file is mode 0600 and owned by the proxy user, and the directory is mode 0700. On success the state is `Ready`, with the file's generation and set. For ids still present, the in-memory values merge as `counter = max(file, memory)` and `backup_state` from memory, because memory is updated first. Ids absent from the file are removed from memory. On any failure the state is `Unavailable(reason)`, which has an empty effective set: challenge issue and verification refuse `store_unavailable`, and holds keep their expiry. The next refresh that reads a valid file restores `Ready`. At startup in `webauthn` mode the same failures refuse to start, as an invalid policy does (runbook section 1).
+- **Refresh.** Before each challenge issue and before each verification's table lock, the proxy takes the store lock, reads the whole file, validates it and releases the lock. There is no stat-based cache, so a same-size rewrite is seen. Validation: the file parses as version 1, ids are unique, `cred_fp` values and labels are unique, the file is mode 0600 and owned by the proxy user, and the directory is mode 0700. On success the state is `Ready`, with the file's generation and set. For an id present in both, memory is kept only when its `instance` equals the file's: then `counter = max(file, memory)` and `backup_state` comes from memory. For an id that is in the file but not in memory (startup, or a credential confirmed by this process), or whose `instance` differs (the id was revoked and enrolled again), the values come from the file and any memory values of the old instance are discarded. Ids absent from the file are removed from memory, with their dirty values. On any failure the state is `Unavailable(reason)`, which has an empty effective set: challenge issue and verification refuse `store_unavailable`, and holds keep their expiry. The next refresh that reads a valid file restores `Ready`. At startup in `webauthn` mode the same failures refuse to start, as an invalid policy does (runbook section 1).
 - **Logging the set.** A refresh that finds a changed id set or changed labels, a return to `Ready`, or a generation lower than the last logged one writes `credential_set_loaded` (section 12). A lower generation has `reason = "generation_decreased"`, which means an older file was put back. Counter and BS changes are not logged here. The console's revoke prints the generation it wrote, so the owner can match it with the next `credential_set_loaded` line.
-- **Write-back of counter and BS.** After the approval's table lock is released (4.2), the proxy takes the store lock, refreshes, and then handles the approved id. If the id is absent from the file, it writes nothing. Otherwise it sets `counter = max(file.counter, memory.counter)` and `backup_state = memory.backup_state`, and writes with a bumped generation. The values are read from memory at write time, not captured at approval time, so write-backs in any order converge. A write that changes nothing is skipped. A `credential_state_changed` record (section 12) is written once per BS change, when memory changes under the table lock.
-- **Write failures.** Enrolment confirm: a failed write refuses `store_unavailable`, writes nothing, ends the attempt and leaves the token spent. Console revoke: a failed write leaves the file unchanged, and the console exits non-zero and says the credential is still valid. Counter or BS write-back: the approval stands, because the table critical section already decided it and `forward_started` is still the fail-closed record (section 12). The in-memory value is kept, `store_write_failed` is written once with the `cred_fp` and the field, and a later successful write-back converges. If the failure persists, the next refresh fails too and the gate fails closed. A failed audit write for `credential_state_changed` does not block the approval, because the state change is already stored; the failure goes to stderr.
+- **Write-back of counter and BS.** After the approval's table lock is released (4.2), the proxy takes the store lock, refreshes, and then handles the approved id. If the id is absent from the file, or the file's `instance` differs from the instance in memory, it writes nothing. Otherwise it sets `counter = max(file.counter, memory.counter)` and `backup_state = memory.backup_state`, and writes with a bumped generation. The values are read from memory at write time, not captured at approval time, so write-backs in any order converge. A write that changes nothing is skipped. **Audit of BS changes.** When check 11 changes BS, it stages one immutable `credential_state_changed` event (section 12) with an ordering value from a counter in the in-memory set, assigned under the table lock. After the lock is released, a single ordered emitter writes the staged events in ordering-value order, and it waits for an earlier value that is still staged. Two opposite BS changes therefore reach the sink in the order they were committed. No audit I/O happens while the table lock is held.
+- **Write failures.** Enrolment confirm: a failed write refuses `store_unavailable`, writes nothing, ends the attempt and leaves the token spent. Console revoke: a failed write leaves the file unchanged, and the console exits non-zero and says the credential is still valid. Counter or BS write-back: the approval stands, because the table critical section already decided it and `forward_started` is still the fail-closed record (section 12). The in-memory value is kept, `store_write_failed` is written once with the `cred_fp` and the field, and a later successful write-back converges. If the failure persists, the next refresh fails too and the gate fails closed. A failed audit write for `credential_state_changed` does not block the approval, because the state change is already stored in memory; the failure goes to stderr.
 - **Backup.** `approvers.json` is the only state file. No `approvers.json.bak` is kept, so a proxy write never leaves a revoked credential behind in a file of its own (section 8.3 covers restoring a backup). Back up the state directory as a whole. The file is small and holds only public data, so a copy is not secret, but its integrity matters (8.4).
 
 ### 8.2 Revocation and multiple credentials
@@ -617,7 +630,7 @@ Basic plus CSRF stays selectable. Modes:
 Notes:
 
 - The approval path is the assertion only. In `webauthn` mode the Basic password never approves, and there is no fallback from `webauthn` to `basic` or to a Basic approval. A second enrolled credential is the fallback for an unavailable biometric (section 8.3). With zero usable credentials the gate refuses with `no_credential_enrolled`.
-- **Mode source.** `mode` comes from configuration only. The store never changes it, so revoking or losing the last credential cannot move a `webauthn` gate to Basic approval. There is no runtime switch between modes. `basic` is the stage 2 behaviour kept as an explicit legacy setting, and it is the only mode in which Basic approves (section 14, question 13). A second enrolled credential is the fallback for an unavailable biometric (section 8.3).
+- **Mode source.** `mode` comes from configuration only. The store never changes it, so revoking or losing the last credential cannot move a `webauthn` gate to Basic approval. There is no runtime switch between modes. `basic` is the stage 2 behaviour kept as an explicit legacy setting, and it is the only mode in which Basic approves (section 14, question 13).
 - **Default**: without the `[approval.webauthn]` section, the gate is the stage 2 gate, which is `basic`. With the section present, `mode` is required and has no default. The owner enrols two credentials, makes a successful real approval, then sets `mode = "webauthn"` and restarts. A `webauthn` config with no credentials is accepted, warns, and refuses each approval with `no_credential_enrolled`, so the runbook enrols first and sets `webauthn` after.
 - The `webauthn` approve path refuses a Basic-only POST with a distinct code (`webauthn_required`), so a
   client that does not know about WebAuthn gets a clear answer.
@@ -643,6 +656,7 @@ Notes:
 | Biometric or passcode unavailable, no second credential enrolled | Approval fails closed. The hold expires (`expired`, 410). Basic cannot approve. | no |
 | Revoked credential used with a live challenge | Step 6 refuses `credential_unknown`. | no |
 | Revocation races an approval | A verification whose refresh came before the revoke's rename can finish (4.2, "Revocation and the critical section"). Its write-back skips the absent id, so the credential is not restored. Every later verification refuses `credential_unknown`. | only the in-flight one |
+| Revoke and re-enrol of the same id, with no refresh in between | The next refresh sees a new `instance` and takes the file's counter and BS. The revoked instance's dirty values are discarded, and a write-back for the old instance writes nothing (section 8.1, test T-B). | no |
 | Two write-backs for one credential in any order | Each merges with the memory values read at write time (counter max, BS latest). The file converges to the highest counter. | no change |
 | Counter or BS write fails | The approval stands: the critical section already decided it, and `forward_started` is still fail closed. The in-memory value is kept, `store_write_failed` is logged once, and the next successful write-back converges. A restart can lag the counter by one, which does not enable replay (4.2). | the decided approval only |
 | Revoke write fails | The file is unchanged. The console exits non-zero and says the credential is still valid. | no |
@@ -678,15 +692,16 @@ New records (extending the audit sink PR #29 already feeds [read muse-gated-pass
 | `approver_enrol_refused` | any enrolment refusal (one summary line a minute above the cap) | enrolment code (list below), and the suppressed count on a summary line |
 | `credential_set_loaded` | startup, a change of the id set or labels, a return to `Ready`, or `generation_decreased` | generation, reason, count, the list of `cred_fp` and labels |
 | `approver_revoked` | a credential is removed from the set | label, `cred_fp`, generation |
-| `credential_state_changed` | an accepted BS change on a synced credential (BE set) | `cred_fp`, `field = "bs"`, old value, new value, the entry id that carried the change |
+| `credential_state_changed` | an accepted BS change on a synced credential (BE set) | `cred_fp`, `field = "bs"`, old value, new value, the entry id that carried the change, `seq` (ordering value) |
 | `store_write_failed` | a counter, BS, enrolment or revocation write fails | `cred_fp` where known, `field` (`counter`, `backup_state`, `enrol`, `revoke`), code `store_unavailable` |
 | `assertion_verified` | step 11 reached | entry id, decision, timestamps, `auth`, `cred_fp` |
 | `assertion_refused` | any step 3 to 10 failure | entry id, decision (`refused`), timestamps, `auth`, code, `cred_fp` if the credential id was in the set |
 
-`approved` (existing) gains `auth = "webauthn"` or `"basic"`, and `cred_fp` when `auth` is `webauthn`.
-`approved` (existing) gains `auth = "webauthn"` or `"basic"`, and `cred_fp` when `auth` is `webauthn`. `forward_started` (existing) carries the same `auth` and `cred_fp`. Per-approval records (`approved`, `forward_started`, `assertion_verified`, `assertion_refused`) add only `auth` and `cred_fp` to the fields that muse-gated-passthrough.md section 3.9 already requires, plus the refusal code on a refusal. The label is not on any per-approval record. An approval is attributed by `cred_fp`, and an auditor joins `cred_fp` to the label in the enrolment, set-load and revocation records. Refusal records are capped per entry (the first 20, then a count) so a flood cannot flood the log. Challenge issuance is not logged.
+`approved` (existing) gains `auth = "webauthn"` or `"basic"`, and `cred_fp` when `auth` is `webauthn`. `forward_started` (existing) carries the same `auth` and `cred_fp`. On per-approval records (`approved`, `forward_started`, `assertion_verified`, `assertion_refused`) the WebAuthn-specific additions are exactly `auth` and `cred_fp`, plus the refusal code on `assertion_refused`. Every other field is the section 3.9 base field that the record already carries (below). Refusal records are capped per entry (the first 20, then a count) so a flood cannot flood the log. Challenge issuance is not logged.
 
 **Reconciliation with section 3.9 (Q4).** Q4 limits what this work adds to a per-approval record: `auth` and `cred_fp`. It does not remove the fields that section 3.9 already requires on every transition record: request id, identity, route, method, the redacted route-relative path, the digest, and the approver identity on decisions. For a WebAuthn decision the approver identity is `cred_fp`, with `auth = "webauthn"`. Nothing else is added: no label, BE, BS, signature, header, query or unredacted path. This keeps `held` as the record that joins an entry id to `forward_started`. Reading Q4 as also removing the 3.9 fields would change PR #29's records (section 14, question 12).
+
+**Base fields of the two assertion records (section 3.9).** `assertion_verified` (step 11) carries request id (the entry id), identity, route, method, redacted route-relative path, digest, decision (`approve`), timestamps, approver identity, `auth = "webauthn"` and `cred_fp`. The approver identity on a decision is the same `cred_fp` value, not a second field. `assertion_refused` (steps 3 to 10) carries request id, identity, route, method, redacted route-relative path, digest, decision (`refused`), timestamps, `auth = "webauthn"` and the refusal code. It carries `cred_fp` and the approver identity only when the credential id was found in the set. Otherwise it has neither.
 
 **Approval refusal codes:** `challenge_unknown`, `challenge_expired`, `challenge_mismatch`, `origin_mismatch`, `rp_id_mismatch`, `type_mismatch`, `cross_origin`, `uv_missing`, `up_missing`, `flags_changed`, `flags_invalid`, `credential_unknown`, `signature_invalid`, `counter_regression`, `malformed`, `webauthn_required`, `no_credential_enrolled`, `store_unavailable`, `body_too_large`. PR #29's results (`already_decided`, `expired`, `superseded`, `gone`, `policy_changed`) keep their names and statuses.
 
@@ -695,13 +710,13 @@ New records (extending the audit sink PR #29 already feeds [read muse-gated-pass
 **Fail-closed write.** `forward_started` is written before anything is sent upstream. If that write fails, the
 proxy returns 503 `audit_unavailable` and forwards nothing (PR #29 section 3.9). Because `forward_started`
 carries `auth` and `cred_fp`, a forward never happens without a record that names the credential that approved
-it. Nothing new is written inside the table critical section.
+it. No non-event write (file or audit) happens inside the table critical section. The `credential_state_changed` event is the only thing staged there, in memory, and it is written after the lock is released (section 8.1).
 
-**Allow-list.** Fields that may appear: entry id, decision, timestamps, `auth`, `cred_fp` (the first 16 hex characters of `sha256(credential id)`, 64 bits, section 16 finding 9a), the refusal code, the label (enrolment, set-load and revocation records only), BE on the enrolment record, BS on the enrolment record and on `credential_state_changed` (old and new value), `generation`, `reason`, `field`, the credential count, and the mode name. The section 3.9 fields stay on the transition records they already belong to. No record carries a request header, a query, or an unredacted path.
+**Allow-list.** Fields that may appear: entry id, decision, timestamps, `auth`, `cred_fp` (the first 16 hex characters of `sha256(credential id)`, 64 bits, section 16 finding 9a), the refusal code, the label (enrolment, set-load and revocation records only), BE on the enrolment record, BS on the enrolment record and on `credential_state_changed` (old and new value), `generation`, `reason`, `field`, `seq`, the credential count, and the mode name. The section 3.9 fields stay on the transition records they already belong to. No record carries a request header, a query, or an unredacted path.
 
 **Never logged, shown in a page other than the one the approver is using, or sent in a notification:** the
 signature, `authenticatorData`, `clientDataJSON`, the challenge, the nonce, the credential id in full, the
-public key, the attestation object, the enrolment token, the CSRF token, the Basic password. This matches
+public key, the attestation object, the enrolment token, the attempt id, the `instance` value, the CSRF token, the Basic password. This matches
 how the hello proof is handled ("never carries the proof, the nonce or the token" [read session-plane.md]).
 Debug output of the verifier, store and challenge types prints no value, as PR #29's types do [read
 `approval/csrf.rs` `Debug`].
@@ -713,7 +728,7 @@ Debug output of the verifier, store and challenge types prints no value, as PR #
 A throwaway page on the real front with the real rp id and port, run by the owner on their iPhone. Records:
 secure-context availability and the passkey sheet for the `ts.net` name with a port in the origin; the
 `fmt` returned for `attestation: none` and for `direct`; the flags (UP, UV, BE, BS); the counter on three
-consecutive assertions; whether `userVerification: required` is honoured; whether `allowCredentials` shows
+consecutive assertions; whether `userVerification: required` is honoured; whether the browser sends the cached Basic credential on the same-origin `fetch` POSTs to `/enroll/*` (section 4.1, endpoint authentication); whether `allowCredentials` shows
 only the enrolled credential; and whether `getPublicKey()` and `getAuthenticatorData()` exist (not needed,
 but they tell us what the client can send). Output: a sample set of **public** registration and assertion
 bytes stored as test vectors. **Gate: do not start stage 1 if the secure-context or rp id assumption fails.**
@@ -737,6 +752,11 @@ Challenge store (one per entry, TTL, failure retirement), credential store (atom
 check), enrolment tokens, console commands (enrol, list, revoke). Tests: crash-safety of the atomic write
 (kill between temp write and rename leaves the old file valid), mode checks, token single use and expiry,
 bounds (32 challenges maximum), revocation visible on the next verification. Store tests (section 8.1): revoke during a write-back (the id stays absent); confirm during a revoke, in both orders (the later generation wins); two write-backs out of order (counter ends at the maximum, BS at the last in-memory value); a same-size rewrite by hand (seen at the next refresh); malformed JSON, missing file, unreadable file and wrong mode (each gives `store_unavailable`, and a valid file restores `Ready`); a simulated write failure (`store_write_failed` once, approval stands); a lock wait over 2 s (`store_unavailable`, nothing changed). Enrolment tests: two concurrent `begin` calls for one token; a restart between the spend write and the response (the token stays spent); a fifth token file refused.
+
+Written test cases for the review revision (sol findings 1 and 5). Each is a store-level test with the file, the in-memory set and the audit sink observable.
+
+- **T-A, an invalid signature leaves no trace (section 4.2, checks 8 to 11).** Given an entry in `Pending` with a live challenge, and a stored credential X with BE=1, counter 5 and BS 0. When an assertion for X arrives with a valid challenge, UV set, presented counter 9, presented BS 1, and a signature that does not verify, then the response is `signature_invalid` and the entry stays `Pending`. The in-memory counter is still 5 and BS still 0, the credential file is byte-identical to before the request, no write-back runs, no `credential_state_changed` event is staged or emitted, and the audit sink receives only the `assertion_refused` record. Then a valid assertion for X with counter 6 and BS 1 is accepted. The in-memory counter becomes 6 and BS 1, the write-back writes the file once with generation +1, and exactly one `credential_state_changed` (0 to 1) is emitted after the lock is released.
+- **T-B, revoke and re-enrol the same id without a refresh (section 8.1, refresh).** Given credential X enrolled as instance I1, with counter 5 and BS 1 in memory and its approval write-back not yet run. When the operator runs `approver revoke X`, then enrols X again as instance I2 with confirmation counter 2 and BS 0, and no refresh runs in between. Then the next refresh sees id X with instance I2 and takes counter 2 and BS 0 from the file. The I1 values (5 and BS 1) appear nowhere, the I1 write-back that runs afterwards finds instance I2 and writes nothing, and no `credential_state_changed` is emitted for X. A refresh of an unchanged instance still keeps `counter = max(file, memory)` and BS from memory.
 
 ### Stage 3: wiring after PR #29 merges
 
@@ -831,8 +851,7 @@ approval" from Defer to the section of this note.
     execution, and file I/O under the table lock is avoided. `approved` carries the method and `cred_fp`.
 11. **Biometric per approval.** Decided: every approval requires user verification. A biometric or the device
     passcode satisfies it. Check 7 (section 4.2) refuses an assertion without the UV flag.
-12. **Audit fields.** Decided (reconciled with muse-gated-passthrough.md section 3.9 in section 12: the 3.9 fields stay, and the owner should confirm this reading): per-approval records carry only entry id, decision, timestamps, `auth` and
-    `cred_fp`. The label appears only in the enrolment, set-load and revocation records (section 12).
+12. **Audit fields.** Decided (reconciled with muse-gated-passthrough.md section 3.9 in section 12: the 3.9 fields stay, and the owner should confirm this reading): per-approval records add only `auth` and `cred_fp`, plus the refusal code on a refusal. Their section 3.9 base fields stay (listed per record in section 12). Read this way, the owner's list is the set of WebAuthn-specific additions, not the complete record. The label appears only in the enrolment, set-load and revocation records (section 12).
 
 13. **Remove the `basic` mode in the WebAuthn build?** Recommend **yes**. Once `webauthn` is enrolled, `basic` is the only mode in which a Basic password approves, and its only purpose is a legacy setting. Without it, no configuration can approve by Basic. The owner decides. Until then section 9 keeps `basic` as an explicit setting that is never a fallback.
 
@@ -875,3 +894,20 @@ Reviews: `.agents/tasks/muse-webauthn-review/opus.md` and `sol.md`, both REQUEST
 | 9d. Counter and store write failures (opus L4) | Specified for each writer. Enrolment confirm fails closed. A revoke that fails leaves the file unchanged. A counter or BS write failure keeps the decided approval, keeps the in-memory value, logs `store_write_failed` once, and converges on the next successful write. | 8.1 (write failures), 10 |
 
 Q1 to Q4 are kept as decided. Q1 (user verification on every approval) is in 2.2, 4.2 and 14 (Q11). Q2 (synced passkeys accepted, no `require_device_bound` key) is in 2.3, 8.5 and 14 (Q3). Q3 (second credential, otherwise fail closed and the hold expires) is in 8.3, 9 and 14 (Q5). Q4 (per-approval audit fields, label recorded once) is in 12 and 14 (Q12).
+
+## 17. Response to the re-review at 62e4364
+
+Reviews: `.agents/tasks/muse-webauthn-review2/sol.md` (CHANGES_REQUESTED, five MEDIUM findings) and `opus.md` (LGTM, five LOW text defects). Q1 to Q4 are kept as decided.
+
+| Finding | Response | Section |
+|---|---|---|
+| 1. Checks 8 to 10 could change memory before the signature check | Checks 8 and 9 compute proposed values only. Check 10 verifies. Check 11 commits the counter, BS, staged event and `Approved` in one table critical section. Test T-A (invalid signature leaves no trace). | 4.2, 13 stage 2 |
+| 2. `credential_state_changed` emission contradicted the lock rule | The event is staged under the lock with an ordering value and written by one ordered emitter after release. No audit or file I/O happens under the table lock. The "nothing new is written" sentence now covers non-event writes only. | 8.1, 12, 4.2 |
+| 3. Q4 field rule had two readings | The WebAuthn additions to per-approval records are exactly `auth` and `cred_fp` (plus the refusal code). Base fields of `assertion_verified` and `assertion_refused` are listed. Q4 decision kept. | 12, 14 (Q12) |
+| 4. Enrolment authentication not explicit | Normative matrix: Basic is required on `GET /enroll`, `/enroll/begin`, `/enroll/finish` and `/enroll/confirm`, before the handler. Token and attempt id remain the ceremony capabilities. The token-oracle text no longer calls the endpoint unauthenticated. Stage 0 checks that the cached Basic credential reaches the `fetch` POSTs. | 4.1, 6.2, 7.1, 13 stage 0 |
+| 5. Dirty BS and counter applied to any same-id entry | Each stored credential has an immutable `instance` value written at confirm. Memory values merge only for the same instance. An id that is new to memory, or whose instance changed, takes the file's values. Test T-B (revoke and re-enrol the same id without a refresh). | 8.1, 4.2 check 8, 10, 13 stage 2 |
+| LOW: duplicated sentences | Removed from the 4.2 counter paragraph, section 9 notes and section 12. | 4.2, 9, 12 |
+| LOW: held-credential TTL | Now "at most 120 s from issue and never past the attempt deadline", in 4.1 checks 2 and 7 and the confirmation challenge. | 4.1 |
+| LOW: BS merge rule | Covered by finding 5. | 8.1 |
+| LOW: whether `/enroll` needs Basic | Covered by finding 4. | 4.1, 7.1 |
+| LOW: "already stored" on audit failure | Now "already stored in memory". | 8.1 |

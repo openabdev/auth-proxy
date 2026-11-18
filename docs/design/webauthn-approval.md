@@ -53,7 +53,7 @@ three gaps.
 
 **Problem.** PR #29 holds a write until the owner approves it. The notification channel (a self-hosted ntfy
 server) is one way: it wakes the phone and opens a link [read issue #37]. The approval itself is a Basic
-credential plus a CSRF token. There is no biometric step, and nothing ties the credential's use to the
+credential plus a CSRF token. There is no user-verification step, and nothing ties the credential's use to the
 specific request. The design already accepted that for the pilot and named WebAuthn as the later
 replacement [read muse-gated-passthrough.md section 3.6 and open question 7].
 
@@ -82,13 +82,15 @@ The notification stays a doorbell: a fixed sentence and a link to the page [read
 
 ### 2.2 What WebAuthn adds
 
-- **User verification, enforced by the server.** The assertion carries the UV flag. The gate refuses an
-  assertion without it. The option `userVerification: "required"` is a request to the browser, so it is not
+- **User verification, enforced by the server.** The assertion carries the UV flag. Every approval requires
+  user verification: the gate refuses an assertion whose UV flag is clear. A device passcode counts as user
+  verification, so a biometric is not the only way to pass it. The option `userVerification: "required"` is a request to the browser, so it is not
   relied on: Apple reports that some Safari-adjacent paths ignore it
   ([Apple developer forum 813784](https://developer.apple.com/forums/thread/813784)), and the spec makes
   the flag the only thing the server can check [I].
-- **A private key that does not travel.** The password cannot be typed, replayed or autofilled into another
-  tool. See 2.3 for the limit of this on Apple's synced passkeys.
+- **A private key that stays in the authenticator.** The key is never sent to the server and cannot be typed or
+  autofilled. A synced passkey does leave one device, since iCloud Keychain copies it to the owner's other
+  devices. Section 2.3 covers the consequence.
 - **Origin binding.** The browser signs over the origin it is on, so a lookalike page cannot collect a
   usable assertion [I, W3C WebAuthn model].
 - **Request binding.** The challenge is derived from the entry id, the canonical request digest, the
@@ -97,23 +99,32 @@ The notification stays a doorbell: a fixed sentence and a link to the page [read
 
 ### 2.3 What WebAuthn does NOT add
 
-- **An unlocked approver device in someone else's hands.** Face ID is skipped when the phone is unlocked and
-  the attacker passes the biometric or the passcode fallback. Out of scope.
+- **An unlocked approver device in someone else's hands.** When the phone is unlocked, the approval sheet asks
+  for a biometric or the device passcode. Either one passes user verification, so whoever has the passcode or
+  can pass the biometric can approve. Out of scope.
 - **A compromised gate host.** The gate holds the real upstream credential and the hold table, and it
   verifies the assertion. Whoever controls the process can approve anything [read muse-gated-passthrough.md
   section 4.3].
 - **Malware on the phone.** Software that can drive Safari can show a different page than the one the
   server sent. WebAuthn proves the key was used with user verification. It does not prove the user read the
   page [I].
-- **"Hardware-bound" on Apple devices.** Passkeys in iCloud Keychain are synced across the owner's devices
-  and recoverable ([Apple, About the security of passkeys](https://support.apple.com/en-in/HT213305)). The
-  backup-eligible flag is set for them [A, from the WebAuthn flags definition]. So the key is not tied to
-  one device. A security key (roaming, BE=0) is device-bound. The gate records the flag and the owner picks
-  a policy (open question 3).
+- **Device-bound approver keys.** Passkeys in iCloud Keychain are synced across the owner's devices
+  and recoverable ([Apple, About the security of passkeys](https://support.apple.com/en-in/HT213305)). Their
+  backup-eligible (BE) flag is set [A, from the WebAuthn flags definition]. So the approver key may exist on
+  more than one of the owner's devices, and the design does not prove that the approving device is
+  hardware-bound. Attestation is `none` (section 4.1), so BE is the authenticator's own claim and the gate
+  cannot check it. A flag that cannot be checked cannot carry a security boundary. A security key (roaming,
+  BE=0) is device-bound in practice, but the gate cannot verify that either.
 - **Exactly-once.** Unchanged from muse-gated-passthrough.md section 5.1.
 - **A malicious server showing different content from what it binds.** The page and the challenge come from
   the same gate, which is trusted. A client that computes the challenge itself from what it displays
   (section 7.4) closes that for non-browser clients only.
+
+The gate accepts synced passkeys (iCloud Keychain, BE=1) and device-bound credentials (BE=0) alike: it records
+each credential's BE and BS flags at enrolment, prints them on the console and in the audit line, refuses any
+later assertion whose flags differ from the enrolled ones, and offers no configuration switch to require
+device-bound credentials, because with attestation `none` the flag is self-reported and cannot carry a
+security boundary. An owner who wants hardware keys only enrols only hardware keys.
 
 ## 3. Placement and configuration
 
@@ -182,7 +193,8 @@ passkey and would add formats to verify (`packed`, and Apple's own anonymous att
 and others]. What attestation would buy, proof of which authenticator model made the key, is not a goal for
 a single-owner gate. Issue #37 says Apple authenticators use `none` or `packed`. From the sources above the
 formats are `none` and `apple`, not `packed`, and with `none` requested only `none` is returned [A]; stage 0
-records what a real phone returns.
+records what a real phone returns. Because `none` carries no proof of the authenticator, the BE flag cannot be
+verified either (section 2.3).
 
 **Server side, `POST /enroll/finish`.** All of these, in order, first failure refuses with a code:
 
@@ -203,12 +215,17 @@ records what a real phone returns.
    rejects a point that is not on the curve at verification time. Only then is the credential written.
 
 **What is stored** (and nothing else): credential id, public key, signature counter (the value from the
-confirmation assertion), a label the operator typed on the console, and the creation time. One more field
-is proposed: the backup-eligible flag, because the policy in open question 3 needs it and because a change
-of it later is a signal (section 4.2, check 9). No attestation object, no `authData`, no user handle, no
+confirmation assertion), a label the operator typed on the console, and the creation time. Two more fields
+are stored: the backup-eligible (BE) and backup-state (BS) flags, recorded for the console and the audit line.
+Check 8 (section 4.2) compares them on every approval, because a change of them later is a signal. BE is
+self-reported (section 2.3), so the check protects stability, not device binding. No attestation object, no `authData`, no user handle, no
 transports.
 
 ### 4.2 Authentication ceremony (one per held entry)
+
+Every approval requires user verification. Check 7 refuses any assertion whose UV flag is clear, whichever
+method the user passed (biometric or device passcode). The approval plane fails closed: a missing, failed or
+expired approval never forwards the held request. What the assertion does not prove is listed in section 2.3.
 
 **Challenge issuance, `POST /pending/<id>/challenge`.** The gate checks the id is 32 lowercase hex and the
 entry is `Pending`, then returns request options and a **binding** block:
@@ -274,7 +291,7 @@ table lock held (PR #29: approve_if)
      origin == configured origin; crossOrigin absent or false; topOrigin absent
   6. credential id is in the CURRENT credential set (a revoked one is refused here)
   7. authenticatorData: rpIdHash == sha256(rp_id); UP set; UV set; ED clear
-  8. BE flag equals the stored BE flag; BS may not be set while BE is clear
+  8. BE flag equals the stored BE flag, BS flag equals the stored BS flag, and BS may not be set while BE is clear
   9. counter policy (below)
  10. ECDSA P-256 / SHA-256 signature over authData || sha256(clientDataJSON) verifies
  11. finish(Approved) and delete the challenge record; the handler is told to forward
@@ -297,7 +314,7 @@ when either value is non-zero [read webauthn-rs-core `core.rs` around line 1175]
 
 | Stored | Presented | Result |
 |---|---|---|
-| 0 | 0 | accept, audit `counter_zero = true`. Clone detection is unavailable for this credential; the single-use derived challenge is the replay defence. |
+| 0 | 0 | accept. Clone detection is unavailable for this credential; the single-use derived challenge is the replay defence. |
 | 0 | n > 0 | accept, store n |
 | s > 0 | n > s | accept, store n |
 | s > 0 | n <= s (including 0) | refuse `counter_regression`: possible clone or replay |
@@ -400,14 +417,14 @@ page, **never from the phone's clock**), and a small "what you are signing" bloc
 
 | Event | What happens |
 |---|---|
-| Approve tapped | The page calls `get()`. Safari shows the passkey sheet and Face ID or Touch ID. |
-| Biometric cancelled, times out, or the user backs out (`NotAllowedError` in the browser) | Nothing is sent to the server. The page says "Cancelled", re-enables Approve, and keeps the same live challenge. The entry stays pending. |
-| No enrolled credential on this device (`allowCredentials` finds none) | The sheet offers another device or a security key, or fails. The page shows "No enrolled credential here". |
+| Approve tapped | The page calls `get()`. Safari shows the passkey sheet and asks for a biometric or the device passcode. |
+| Biometric or passcode prompt cancelled, times out, or the user backs out (`NotAllowedError` in the browser) | Nothing is sent to the server. The page says "Cancelled", re-enables Approve, and keeps the same live challenge. The entry stays pending. |
+| No enrolled credential on this device (`allowCredentials` finds none) | The sheet offers another device or a security key, or fails. The owner's second credential is the fallback for an unavailable biometric (section 8.3). With no second credential, the approval fails closed and the hold expires. The page shows "No enrolled credential here". |
 | Server refuses the assertion | The page shows the refusal code and the entry state. The entry stays `Pending` unless the code says otherwise (`expired`, `superseded`, `already_decided`, `gone`, `policy_changed`). The owner can retry while the hold lives. |
 | Verified | The server approves, the handler forwards, the page shows the result string (`success`, `approved_but_abandoned`, ...) from PR #29's result table. |
 | Entry expires while the sheet is open | The assertion arrives and is refused `expired`. Nothing is forwarded. |
 
-**Deny does not need biometrics.** Recommendation: deny stays cheap, with the existing credential. The
+**Deny does not need user verification.** Recommendation: deny stays cheap, with the existing credential. The
 reasoning: deny is the safe direction, it must work from a tired phone in a hurry, and a biometric on it
 adds friction without protecting anything. Deny has a cost, since it starts the identity's cooldown
 [read muse-gated-passthrough.md section 3.4], so it is not open to anyone. It keeps the Basic credential
@@ -443,8 +460,8 @@ PR #29 serves pages with **no script** and `default-src 'none'` [read `approval/
 Tapping the notification on a locked phone makes iOS unlock first [A]. The link opens in Safari. A GET changes
 no state (the CSRF token it mints is the only side effect, and it is bounded [read `csrf.rs`]). The page
 does **not** call `get()` on load: it needs a tap, and Safari requires a user gesture for it [A]. So the
-sequence is unlock (Face ID), the Basic prompt or autofill, read the page, tap Approve, Face ID again. There
-is no path from the lock screen to an approval. The cost is two biometric prompts, which is the price of not
+sequence is unlock (Face ID), the Basic prompt or autofill, read the page, tap Approve, then a biometric or device passcode again. There
+is no path from the lock screen to an approval. The cost is two user-verification prompts, which is the price of not
 having an approve action in the notification.
 
 ## 7. Approval API stays client-agnostic
@@ -455,7 +472,7 @@ having an approve action in the notification.
 |---|---|
 | `GET /pending`, `GET /pending/<id>` | As in PR #29. The JSON view gains `approval.methods` and the `binding` block. |
 | `POST /pending/<id>/challenge` | Returns request options plus `binding`. Idempotent per entry. |
-| `POST /pending/<id>/approve` | Body `{"csrf": ...}` (Basic path, where the mode allows) or `{"webauthn": {...}}`. Answers `{"result": ...}` with the same result names and statuses as PR #29. |
+| `POST /pending/<id>/approve` | Body `{"csrf": ...}` (Basic path, `basic` mode only) or `{"webauthn": {...}}`. Answers `{"result": ...}` with the same result names and statuses as PR #29. |
 | `POST /pending/<id>/deny` | Unchanged. |
 | `GET /enroll`, `POST /enroll/begin`, `POST /enroll/finish` | Enrolment, section 4.1. |
 
@@ -483,7 +500,7 @@ the content.
 ### 8.1 Credential store
 
 - **Where.** `approvers.json` in a state directory owned by the proxy user, directory mode 0700 and file
-  mode 0600. The proxy refuses to start in `webauthn` or `either` mode if the file is group or other
+  mode 0600. The proxy refuses to start in `webauthn` mode if the file is group or other
   accessible, matching how stage 2 treats secret files [read runbook section 3: notify files must be 0600,
   "anything else refuses to start"].
 - **Shape.** `{"version": 1, "credentials": [{"label", "id" (base64url), "pubkey" (standard base64 of the
@@ -501,7 +518,9 @@ the content.
 
 ### 8.2 Revocation and multiple credentials
 
-- More than one credential is supported (a phone and a spare security key). `allowCredentials` lists all.
+- More than one credential is supported (a phone and a spare security key). `allowCredentials` lists all. The
+  second credential is the owner's fallback when the biometric or passcode on the first is unavailable
+  (section 8.3).
 - **Revoke** from the host console: remove the entry (`auth-proxy approver revoke <label>`), which rewrites
   the file atomically. The proxy sees the change on the next challenge or verification. Verification looks
   the credential up in the *current* set, so an assertion from a revoked credential is refused even if its
@@ -512,11 +531,15 @@ the content.
 
 ### 8.3 Recovery
 
-If the only device is lost: create a new enrolment token on the host console and enrol the new device, then
-revoke the lost one. This needs host console access, which is the root of trust for the approver, the same
-as setting the Basic password hash in the config today. While there is no credential, `either` mode lets
-the Basic path approve; `webauthn` mode cannot approve until the new enrolment is done. That choice is open
-question 5.
+Fallback when the biometric or passcode is unavailable (for example, Face ID fails): the owner
+registers a second credential, a second device or a security key, before it is needed. Approvals then use
+either enrolled credential. When no second credential exists, the approval fails closed and the hold expires.
+Basic never approves, so it is not a fallback.
+
+If the only device is lost and no second credential is enrolled, create a new enrolment token on the host
+console (section 4.1) and enrol the new device, then revoke the lost one. This needs host console access,
+which is the root of trust for the approver, the same as setting the Basic password hash in the config today.
+Until that enrolment is done, holds expire without a forward.
 
 ### 8.4 What an attacker with write access to the store can do
 
@@ -530,11 +553,12 @@ so an added credential shows up in the log, and the owner's enrolment console ou
 
 ### 8.5 Configuration keys (proposed)
 
-`[approval.webauthn]`: `mode` (`basic`, `webauthn`, `either`), `rp_id`, `origin`, `state_dir`,
+`[approval.webauthn]`: `mode` (`basic`, `webauthn`), `rp_id`, `origin`, `state_dir`,
 `enrol_ttl_secs` (default 600, max 900), `challenge_ttl_secs` (default 60), `counter_policy`
-(`strict`, default), `require_device_bound` (default false). `rp_id` and `origin` are validated at load:
-`origin` must be `https`, no path, no query, and its host must equal `rp_id`. A `webauthn` or `either`
-config with no credentials starts, warns, and cannot approve until one is enrolled.
+(`strict`, default). `rp_id` and `origin` are validated at load:
+`origin` must be `https`, no path, no query, and its host must equal `rp_id`. A `webauthn` config
+with no credentials starts, warns, and cannot approve until one is enrolled. There is no switch that
+restricts enrolment to device-bound keys (section 2.3).
 
 ## 9. Fallback and migration
 
@@ -543,17 +567,16 @@ Basic plus CSRF stays selectable. Modes:
 | Mode | Reach the plane, view, deny | Approve | What it guarantees |
 |---|---|---|---|
 | `basic` (PR #29 behaviour) | Basic | Basic + per-page CSRF | Knowledge of a password. Nothing about presence, replay or the request. |
-| `webauthn` | Basic | **User-verified assertion bound to the request**. Basic alone is refused. | Presence, a non-replayable signature, binding to the entry. A leaked password can view and deny but not approve. |
-| `either` | Basic | Assertion **or** Basic + CSRF | The guarantee of `basic`: the weakest accepted path sets it. For migration and as an emergency fallback only. |
+| `webauthn` | Basic | **User-verified assertion bound to the request**. Basic alone is refused. | User verification (biometric or device passcode) on an enrolled key, which may be synced, plus a non-replayable signature and binding to the entry. A leaked password can view and deny but not approve. |
 
 Notes:
 
-- "Both required" is what `webauthn` already is, since Basic gates the plane and the assertion gates
-  approval. There is no fourth mode.
+- The approval path is the assertion only. The Basic password never approves, in any mode, so no mode falls back
+  to a Basic approval. A second enrolled credential is the fallback for an unavailable biometric (section 8.3).
 - **Default**: `basic` when no credential is enrolled, so a gate upgraded from stage 2 behaves as before.
-  The owner moves to `webauthn` after enrolling and a successful real approval, and `either` is a
-  temporary step in between. A config with `mode = "webauthn"` and no credentials is accepted but cannot
-  approve, so the runbook sets `either` first.
+  The owner enrols two credentials, makes a successful real approval, and then sets `webauthn`. A config with
+  `mode = "webauthn"` and no credentials is accepted but cannot approve, so the runbook enrols first and sets
+  `webauthn` after.
 - The `webauthn` approve path refuses a Basic-only POST with a distinct code (`webauthn_required`), so a
   client that does not know about WebAuthn gets a clear answer.
 - **Client-agnostic API** (section 7): the same endpoints serve the browser, a CLI and a native client; the
@@ -570,11 +593,12 @@ Notes:
 | Crash after the forward began | As PR #29 says: possibly executed once, a retry is a new prompt. | possibly once |
 | Clock skew (phone vs gate) | No phone time is used anywhere. The challenge TTL and the hold expiry are on the gate's monotonic clock. The wall-clock expiry in the challenge is frozen at admission and only displayed. A step of the gate's wall clock changes nothing it enforces. A wrong phone clock can only break TLS. | n/a |
 | A stolen link | The link is the entry id only. It needs reach to the plane, the Basic credential, and an enrolled credential to approve. It shows the request content to anyone who passes Basic. | no |
-| A stolen Basic password | In `webauthn` mode: can view and deny (and so start a cooldown), cannot approve. In `either` or `basic`: can approve. | depends on mode |
+| A stolen Basic password | In `webauthn` mode: can view and deny (and so start a cooldown), cannot approve. In `basic` mode: can approve. | depends on mode |
 | Challenge flood from outside the owner's devices | Issue is O(1) and idempotent. One record per entry. Invalid or non-pending ids are refused before allocation. Bounded by `max_held_total`. Per-connection limits already exist (16 connections, 10 s header read, 1 KiB body in PR #29; this note raises the body limit to 4 KiB for the assertion route only). | n/a |
 | Assertion-spam to burn CPU | One ECDSA verify per request, at most 5 per challenge before it is retired, the connection cap, and the fixed 250 ms delay PR #29 uses for failed authentication, which here applies to the Basic gate. A per-source rate limit is not added (the plane is private). | n/a |
 | Page opened after the entry is decided | Buttons disabled, as in PR #29. | n/a |
-| Credential store unreadable | Last good set stays in use. At startup the proxy refuses to start in `webauthn` and `either` modes. | no |
+| Credential store unreadable | Last good set stays in use. At startup the proxy refuses to start in `webauthn` mode. | no |
+| Biometric or passcode unavailable, no second credential enrolled | Approval fails closed. The hold expires (`expired`, 410). Basic cannot approve. | no |
 | Revoked credential used with a live challenge | Step 6 refuses `credential_unknown`. | no |
 
 ## 11. Changes this design needs from PR #29
@@ -600,20 +624,33 @@ New records (extending the audit sink PR #29 already feeds [read muse-gated-pass
 
 | Record | When | Fields |
 |---|---|---|
-| `approver_enrolled` | confirmation assertion verified, credential stored | label, `cred_fp`, `backup_eligible` |
+| `approver_enrolled` | confirmation assertion verified, credential stored | label, `cred_fp`, BE, BS |
 | `approver_enrol_refused` | any enrolment step fails | code |
 | `credential_set_loaded` | startup, reload, or change detected | count, the list of `cred_fp` and labels |
-| `assertion_verified` | step 11 reached | entry id, identity, label, `cred_fp`, `counter_zero` |
-| `assertion_refused` | any step 3 to 10 failure | entry id, code, `cred_fp` if the credential id was in the set |
+| `approver_revoked` | a credential is removed from the set | label, `cred_fp` |
+| `assertion_verified` | step 11 reached | entry id, decision, timestamps, `auth`, `cred_fp` |
+| `assertion_refused` | any step 3 to 10 failure | entry id, decision (`refused`), timestamps, `auth`, code, `cred_fp` if the credential id was in the set |
 
-`approved` (existing) gains `auth = "webauthn"` or `"basic"`. Refusal records are capped per entry (the
-first 20, then a count) so a flood cannot flood the log. Challenge issuance is not logged. Refusal codes:
+`approved` (existing) gains `auth = "webauthn"` or `"basic"`, and `cred_fp` when `auth` is `webauthn`.
+`forward_started` (existing) carries the same `auth` and `cred_fp`. Per-approval records (`approved`,
+`forward_started`, `assertion_verified`, `assertion_refused`) hold only entry id, decision, timestamps, `auth`
+and `cred_fp`, plus the refusal code on a refusal. The label is not on any per-approval record. An approval is
+attributed by `cred_fp`, and an auditor joins `cred_fp` to the label in the enrolment, set-load and revocation
+records. Refusal records are capped per entry (the first 20, then a count) so a flood cannot flood the log.
+Challenge issuance is not logged. Refusal codes:
 `challenge_unknown`, `challenge_expired`, `challenge_mismatch`, `origin_mismatch`, `rp_id_mismatch`,
 `type_mismatch`, `cross_origin`, `uv_missing`, `up_missing`, `flags_changed`, `credential_unknown`,
 `signature_invalid`, `counter_regression`, `malformed`, `webauthn_required`, `body_too_large`.
 
-**Allow-list.** Fields that may appear: entry id, identity, label, `cred_fp` (the first 8 hex characters of
-`sha256(credential id)`), the refusal code, booleans (`counter_zero`, `backup_eligible`), the mode name.
+**Fail-closed write.** `forward_started` is written before anything is sent upstream. If that write fails, the
+proxy returns 503 `audit_unavailable` and forwards nothing (PR #29 section 3.9). Because `forward_started`
+carries `auth` and `cred_fp`, a forward never happens without a record that names the credential that approved
+it. Nothing new is written inside the table critical section.
+
+**Allow-list.** Fields that may appear: entry id, decision, timestamps, `auth`, `cred_fp` (the first 8 hex
+characters of `sha256(credential id)`), the refusal code (refusal records), the label (enrolment, set-load and
+revocation records only), BE and BS (enrolment records only), the credential count, and the mode name. No
+record carries a request header, a query, or an unredacted path.
 
 **Never logged, shown in a page other than the one the approver is using, or sent in a notification:** the
 signature, `authenticatorData`, `clientDataJSON`, the challenge, the nonce, the credential id in full, the
@@ -681,7 +718,7 @@ enrol, hold a request, approve, observe exactly one forward. **Negative tests, e
 | Challenge reuse | after five refusals retire a challenge, post an assertion signed over it | `challenge_unknown` (a fresh fetch gives a new nonce, so the old assertion is also a `challenge_mismatch` on the new one) |
 | Expired challenge | advance the gate's test clock past `challenge_ttl_secs` | `challenge_expired` |
 | Counter regression | stored 5, present 5 and 3; stored 5, present 0 | `counter_regression` |
-| Counter zero | stored 0, present 0 | accepted, `counter_zero = true` in the audit |
+| Counter zero | stored 0, present 0 | accepted; the `approved` record carries `cred_fp` |
 | Tampered `clientDataJSON` | flip a byte of the challenge, and of the origin | `challenge_mismatch`, `origin_mismatch` or `signature_invalid` |
 | Tampered `authenticatorData` | flip a flag bit | `signature_invalid` |
 | Unknown or revoked credential | revoke between issue and verify | `credential_unknown` |
@@ -698,8 +735,10 @@ controlled. Real-phone acceptance (the owner) comes after: enrol, approve once, 
 
 ### Stage 5: rollout and runbook
 
-Runbook for enrolment, revocation and recovery, mode migration (`basic` to `either` to `webauthn`), and the
-rule that the notification stays a doorbell. Update `docs/design/muse-gated-passthrough.md` row "WebAuthn
+Runbook for enrolment, revocation and recovery, mode migration (`basic` to `webauthn`, after two credentials are
+enrolled), and the rule that the notification stays a doorbell. The runbook also says that a synced passkey is
+recoverable from the owner's Apple account; anyone who controls that account and one of its devices, has the
+Basic credential, and can reach the approval port can approve. Update `docs/design/muse-gated-passthrough.md` row "WebAuthn
 approval" from Defer to the section of this note.
 
 ## 14. Open questions for the owner, with a recommended answer
@@ -709,15 +748,15 @@ approval" from Defer to the section of this note.
    the entry id the only gate for viewing a request body.
 2. **Library: B (in-tree, `ring`) or A (`webauthn-rs`)?** Recommend **B**, with the stage 1 differential
    test against A as the safety net (section 5.3).
-3. **Accept synced passkeys (iCloud Keychain, BE=1), or require a device-bound key?** Recommend **accept
-   synced passkeys for the pilot** and record the flag, because the point is biometric presence and request
-   binding, and an iPhone is the stated approver. Offer `require_device_bound = true` for owners who add a
-   security key. Say in the runbook that a synced passkey is recoverable from the owner's iCloud account.
+3. **Accept synced passkeys (iCloud Keychain, BE=1), or require a device-bound key?** Decided: accept synced
+   passkeys and device-bound credentials alike, with no `require_device_bound` key. Section 2.3 gives the
+   reason: attestation is `none`, so BE is self-reported. The runbook says that a synced passkey is recoverable
+   from the owner's iCloud account.
 4. **Attestation `none` only?** Recommend **yes**. Revisit only if a device-bound key with a known model is
    required.
-5. **While no credential is enrolled or after losing the only device: may `either` mode approve with
-   Basic?** Recommend **yes, temporarily and by configuration**, with the audit line `auth = "basic"`, and
-   a runbook step to return to `webauthn` once re-enrolled.
+5. **While no credential is enrolled, or after losing the only device: may Basic approve?** Decided: no. The
+   fallback for an unavailable biometric is a second enrolled credential. With no second credential the
+   approval fails closed and the hold expires (section 8.3).
 6. **A native approver client later, with associated domains?** Recommend **defer**. Keep the JSON
    endpoints as in section 7 so it needs no server change.
 7. **Counter policy.** Recommend **strict** (refuse a regression, accept 0 to 0) as in 4.2.
@@ -726,7 +765,11 @@ approval" from Defer to the section of this note.
    `ts.net` name and the formats Apple returns are assumptions today.
 10. **Should the assertion verification add a fail-closed audit write like `held` and `forward_started`?**
     Recommend **no**. The existing fail-closed `forward_started` record already stops an unrecorded
-    execution, and file I/O under the table lock is avoided. `approved` carries the method.
+    execution, and file I/O under the table lock is avoided. `approved` carries the method and `cred_fp`.
+11. **Biometric per approval.** Decided: every approval requires user verification. A biometric or the device
+    passcode satisfies it. Check 7 (section 4.2) refuses an assertion without the UV flag.
+12. **Audit fields.** Decided: per-approval records carry only entry id, decision, timestamps, `auth` and
+    `cred_fp`. The label appears only in the enrolment, set-load and revocation records (section 12).
 
 ## 15. Evidence and method
 

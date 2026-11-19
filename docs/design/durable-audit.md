@@ -22,7 +22,7 @@ connect and the first request byte, which PR #29 must move to; section 1.2), not
 
 Decisions are marked in section 11 as **DECIDED** (settled in review, change only with a new review) or
 **OWNER APPROVED DEFAULT (2026-11-19)** (the owner approved these values; any one can still be replaced).
-Where the text depends on a pending default it says so.
+Where the text depends on an approved default, it says so.
 
 ## 0. Revision 3: resolved blockers, chosen direction, and what is not guaranteed
 
@@ -150,8 +150,7 @@ action**, and refuses the action when it cannot be made durable. It makes PR #29
 of a general rule and adds the durability that rule lacks. The default stays as it is.
 
 The first implementation is deliberately small: **durable fail-closed for held writes** (section 10,
-stage 1). Gating every forwarded request is designed here but not part of the first stage (open
-question 1, proposed default).
+stage 1). Gating every forwarded request is designed here but not part of the first stage (open question 1, OWNER APPROVED DEFAULT (2026-11-19)).
 
 The requirement behind it is the outer-layer item "every step is audited before it runs, and if the
 record cannot be written the step does not run" (openab issue 1606, definition of done, item 7, as
@@ -199,11 +198,11 @@ mode = "best_effort"            # default. "fail_closed" is the opt-in
 sink = "stdout"                 # "stdout" (default) or "file"
 dir = "/var/lib/auth-proxy/audit"   # required when sink = "file": a directory, not a file
 fsync = "per_record"            # fail_closed only: "per_record". No "none". ("group_commit": later stage)
-write_timeout_ms = 2000         # fail_closed only: bound on one durable append (PROPOSED DEFAULT)
-retry_ms = 250                  # fail_closed only: recovery attempt interval (PROPOSED DEFAULT)
-channel_capacity = 1024         # fail_closed only (PROPOSED DEFAULT)
+write_timeout_ms = 2000         # fail_closed only: bound on one durable append (OWNER APPROVED DEFAULT (2026-11-19))
+retry_ms = 250                  # fail_closed only: recovery attempt interval (OWNER APPROVED DEFAULT (2026-11-19))
+channel_capacity = 1024         # fail_closed only (OWNER APPROVED DEFAULT (2026-11-19))
 max_record_bytes = 4096         # fail_closed only: size cap of one serialized line (section 4A)
-max_total_bytes = 1073741824    # fail_closed only: quota over all segments in `dir` (section 4A, owner decides)
+max_total_bytes = 1073741824    # fail_closed only: quota over all segments in `dir` (section 4A, OWNER APPROVED DEFAULT (2026-11-19))
 shutdown_grace_ms = 5000        # fail_closed only: bound on draining the writer at exit (section 4.3)
 ```
 
@@ -282,7 +281,7 @@ section 11 item 20).
 | `decision` (allow), `outcome` | sidecar, passthrough read | **stage 3 only**, if open question 1 is accepted: `decision` before the credential swap and before the request is handed to the client; `outcome` when the body ends | `decision` yes, `outcome` no | refuse 503 `audit_unavailable` / counted |
 | `deny` | both | at the refusal | no, the refusal is the outcome | refusal stands, counted. Rate bounded (4A) |
 | `netfilter` | sidecar | state change, and each `netfilter_unverified` refusal | no | counted |
-| `session` (create, renew), `admin revoke-all`, revoke | sidecar | after the operation | **no.** Revoke and revoke-all are **never** gated. Create and renew gating is deferred (open question 5, proposed default) | counted |
+| `session` (create, renew), `admin revoke-all`, revoke | sidecar | after the operation | **no.** Revoke and revoke-all are **never** gated. Create and renew gating is deferred (open question 5, OWNER APPROVED DEFAULT (2026-11-19)) | counted |
 | `probe`, evidence | stage 1 measurement only | as today | no | counted |
 | `start` | both | once at startup, durable, before the listener accepts | yes (a failure is a startup error) | exit 2 |
 | `gap` | both | first record after a recovery from a failed durable write (4.4). Has its own `seq` | yes, it is the first record of the new segment | the sink stays unhealthy |
@@ -324,7 +323,7 @@ read it back, including a changed size [I]. When a segment is **created** the co
 also synced (`fsync` on the directory descriptor) before the first record is relied on.
 
 **Supported storage.** "Durable" is claimed only for a **local Linux filesystem on persistent block
-storage** whose `fdatasync` reaches the device: ext4 and XFS [A, owner decides, open question 12].
+storage** whose `fdatasync` reaches the device: ext4 and XFS [A, OWNER APPROVED DEFAULT (2026-11-19), open question 12].
 Everywhere else a successful `sync_data` proves nothing:
 
 | Storage | Why it is not supported |
@@ -412,7 +411,7 @@ So Rust's `sync_data` on macOS is the slow call of section 4.6, not the fast one
 - **One writer thread** (`std::thread`), not a `spawn_blocking` task, owns the file descriptor. A
   blocked `sync_data` cannot then exhaust the runtime's blocking pool or a tokio worker, and the single
   writer gives the ordering of section 3.3 [A, design]. Requests send `(line bytes, ack channel,
-  cancel flag)` through a bounded channel (`channel_capacity`, proposed default 1024) and `await` the
+  cancel flag)` through a bounded channel (`channel_capacity`, OWNER APPROVED DEFAULT (2026-11-19) 1024) and `await` the
   ack with `tokio::time::timeout(write_timeout_ms)`. A full channel is an immediate refusal, which is
   the "no queueing of requests while the sink is down" rule of #32: the channel holds records of
   requests that are *waiting for an ack*, not requests parked for later.
@@ -524,7 +523,7 @@ the old descriptor" is therefore impossible in that state. What the design does 
   written whatever happens to the request; there is no way to withdraw it.
 
 **Shutdown.** On SIGTERM the proxy stops accepting, closes the hold table (4.2), then asks the writer to
-drain what is queued. The wait is bounded by `shutdown_grace_ms` (proposed default 5000). At the deadline
+drain what is queued. The wait is bounded by `shutdown_grace_ms` (OWNER APPROVED DEFAULT (2026-11-19) 5000). At the deadline
 the process exits without joining the writer, so a stuck `sync_data` cannot block termination. Records
 still queued then are lost and not counted (the process is gone); readers apply the 7.2 rules.
 
@@ -532,7 +531,7 @@ still queued then are lost and not counted (the process is gone); readers apply 
 a failing sink cannot add a wait to a refusal, and a flood of refusals cannot hold request tasks.
 
 **What a request sees on a slow sink.** The first gating requests wait up to `write_timeout_ms`
-(proposed default 2000 ms), then receive the refusal of section 9.1. After the first timeout the sink is
+(OWNER APPROVED DEFAULT (2026-11-19) 2000 ms), then receive the refusal of section 9.1. After the first timeout the sink is
 `Stuck`, and further requests fail at once. The bounded wait is also bounded in number by the hold
 table caps for held writes.
 
@@ -680,7 +679,7 @@ Bounds [A, design; the numbers are OWNER APPROVED DEFAULT (2026-11-19), section 
 3. **Total quota.** `max_total_bytes` over **all** `audit.*` files in the directory. The proxy scans the directory
    at startup, then keeps a running count of the bytes it appends in this boot. The count does not see
    deletions made by a shipper while the proxy runs, so the count only grows until restart. **In stage 1
-   the quota is fail-closed until restart, with no automatic recovery** [owner question 21]:
+   the quota is fail-closed until restart, with no automatic recovery** [OWNER APPROVED DEFAULT (2026-11-19), question 21]:
    - When the next record would exceed `max_total_bytes`, the record is not written and no `seq` is
      assigned. The writer latches the `Quota` state (4.3). It makes no further attempt in this process.
    - **What the operator sees.** (a) Every new held request and every approval that needs `forward_started` is
@@ -711,7 +710,7 @@ Bounds [A, design; the numbers are OWNER APPROVED DEFAULT (2026-11-19), section 
    writer's sync budget (about 250 per second at 4 ms); gating jobs of the held class are then dequeued
    first [A], and a full channel refuses everyone, so the cap of item 2 matters more.
 6. **Retention and shipping** belong to the deployment: a shipper that reads closed segments, confirms
-   delivery, then deletes them. Who runs it, and the retention period, are owner questions (section 11).
+   delivery, then deletes them. Who runs it, and the retention period, are named by the owner (section 11).
 
 Tests: hostile-load tests (section 10) prove bounded memory, bounded line size, prompt fail-fast and
 the quota refusal.
@@ -763,14 +762,14 @@ revision's sentence "no field is a free-form string from the request" was false.
 | `kind` | all | one of the kinds in 3.3 | proxy |
 | `request_id` | request kinds | random id, 5.1 | proxy |
 | `pipeline` | request kinds | `sidecar` or `passthrough` | proxy |
-| `identity` | request kinds | identity **name** from config | config. **Sensitive: names a principal. Owner approval, section 11** |
+| `identity` | request kinds | identity **name** from config | config. **Sensitive: names a principal. OWNER APPROVED DEFAULT (2026-11-19), section 11** |
 | `session`, `generation` | request kinds | session id and generation, as today | proxy |
 | `route`, `method` | request kinds | route name from config, HTTP method (a known method, else `other`) | config |
-| `path` | request kinds | **request-derived.** Route-relative, query and fragment dropped, `webhooks`/`interactions` token segments replaced by `<redacted>` (PR #29's `redact_path`, in review), truncated to 256 bytes with a marker. JSON-escaped by the serializer. **Sensitive: a path segment can still carry caller data.** Owner approval for the raw redacted form, section 11. The proposed default is the redacted, bounded form | request |
+| `path` | request kinds | **request-derived.** Route-relative, query and fragment dropped, `webhooks`/`interactions` token segments replaced by `<redacted>` (PR #29's `redact_path`, in review), truncated to 256 bytes with a marker. JSON-escaped by the serializer. **Sensitive: a path segment can still carry caller data.** OWNER APPROVED DEFAULT (2026-11-19), section 11. The redacted, bounded form is the default | request |
 | `aws_target` | request kinds | **the one reviewed header-value exception.** The `X-Amz-Target` value, as today, truncated to 128 bytes with a marker, JSON-escaped. It is a request header value; it is allowed because the AWS dialect needs it to identify the operation | request |
 | `decision`, `code`, `status`, `duration_ms`, `bytes_sent` | request kinds | as today | proxy |
-| `digest` | held kinds (PR #29) | **Sensitive.** Hex sha256 of the credential-blind outbound request digest, which includes a body-derived part. A full digest lets someone with the log test guesses against a low-entropy body offline. Proposed default: the first 12 hex characters only, or omitted if the owner prefers. Owner approval, section 11 | request-derived |
-| `approver` | `approved`, `denied` | approver identity name | config / approval plane. **Sensitive: names a principal. Owner approval, section 11** |
+| `digest` | held kinds (PR #29) | **Sensitive.** Hex sha256 of the credential-blind outbound request digest, which includes a body-derived part. A full digest lets someone with the log test guesses against a low-entropy body offline. OWNER APPROVED DEFAULT (2026-11-19), section 11: the first 12 hex characters only, or omitted if the owner prefers | request-derived |
+| `approver` | `approved`, `denied` | approver identity name | config / approval plane. **Sensitive: names a principal. OWNER APPROVED DEFAULT (2026-11-19), section 11** |
 | `auth_present` | held kinds | boolean | proxy |
 | `reason`, `errno` | `gap`, health | fixed enum and numeric errno; no error text | proxy |
 | `trunc` | request kinds | boolean, true when a request-derived field was cut | proxy |
@@ -987,7 +986,7 @@ refusal** and adds nothing to it:
 | Sidecar request (swap) | never refused for audit | unchanged, not covered | refused before swap and before the request is handed to the client when `decision` is not durable |
 | Passthrough read | never refused for audit | unchanged, not covered | refused when `decision` is not durable (open question 1) |
 | Refusals | audited, never changed | held-route refusals audited on the non-waiting path, other refusals on stdout as today. Never changed, and a refusal is not turned into `audit_unavailable` because its record failed | same |
-| Session create, renew | audited after, best effort | same. Not gated. Gating deferred (open question 5, proposed default) | same |
+| Session create, renew | audited after, best effort | same. Not gated. Gating deferred (open question 5, OWNER APPROVED DEFAULT (2026-11-19)) | same |
 | Revoke, revoke-all | audited after, best effort | same. **Never gated** | same |
 | Netfilter gate state | audited after | same | same |
 | Response streams already forwarded | untouched | untouched. A failing outcome record does not abort the stream | same |
@@ -1176,7 +1175,7 @@ already uses it. The owner can still replace any one without changing the rest o
 7. **Fast-fail instead of "every request tries".** **DECIDED:** fast fail, one recovery attempt per
    `retry_ms`, defined as "writer free" (4.3). It refuses more, never less. It supersedes #32's wording.
 8. **Rotation ownership.** **DECIDED:** built-in segments only, no external reopen and no `copytruncate`
-   (4.5). Retention is an owner question below.
+   (4.5). Retention is covered by OWNER APPROVED DEFAULT (2026-11-19) below.
 9. **File sink in `best_effort`.** **DECIDED:** no, not in v1. It adds a mode without helping the
    guarantee.
 11. **Reads without a second write-ahead record.** **DECIDED:** no second record. For the sidecar and for
@@ -1201,7 +1200,7 @@ already uses it. The owner can still replace any one without changing the rest o
     persistent local ext4 or XFS volume**; **refuse tmpfs, ramfs, NFS, CIFS, FUSE and container overlay**
     (4.1). `flock` and `O_NOFOLLOW` are used; a read-only root with a volume is supported.
 14. **Total disk cap and behaviour at the cap.** **OWNER APPROVED DEFAULT (2026-11-19):**
-    `max_total_bytes` = 1 GiB per directory (a placeholder: the owner sets the value), **fail closed at
+    `max_total_bytes` = 1 GiB per directory (the owner-approved default), **fail closed at
     the cap, never delete unshipped records silently** (4A). In stage 1 the latch holds until restart (item 21).
     Alternative: delete the oldest segment, which destroys evidence and is not proposed.
 15. **Retention and shipping ownership.** **OWNER APPROVED DEFAULT (2026-11-19):** the deployment
@@ -1238,8 +1237,8 @@ already uses it. The owner can still replace any one without changing the rest o
 22. **Directory and volume ownership.** **OWNER APPROVED DEFAULT (2026-11-19):** the proxy creates a missing
     audit directory with mode `0700` and uses an existing one as found (4.2). The file checks of 4.2 apply to
     every segment. On `emptyDir` the directory is not protected from other UIDs that mount it, so the deployment
-    mounts it in the proxy container only. The owner chooses between an init container that creates and chowns
-    the directory (for a PVC with `fsGroup` or a different owner) and the proxy's own `mkdirat`.
+    mounts it in the proxy container only. A PVC with `fsGroup` or a different owner may instead use an init
+    container that creates and chowns the directory in place of the proxy's own `mkdirat`.
 
 ## 12. Evidence and method
 

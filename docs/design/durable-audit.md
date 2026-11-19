@@ -1156,7 +1156,7 @@ Only on the owner's request.
 | latency measurement on a stated disk | 1 (per_record), 2 (group_commit) |
 | `phase1.md` row and README updated | with the code, not in this note |
 
-## 11. Open questions
+## 11. Decisions and deployment choices
 
 **DECIDED** means settled in review. **OWNER APPROVED DEFAULT (2026-11-19)** means the owner approved the value and the text above
 already uses it. The owner can still replace any one without changing the rest of the design except where noted.

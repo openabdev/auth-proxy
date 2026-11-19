@@ -21,7 +21,7 @@ before a write is forwarded, and a `forward_started` record that must be durable
 connect and the first request byte, which PR #29 must move to; section 1.2), not on names, signatures or line numbers.
 
 Decisions are marked in section 11 as **DECIDED** (settled in review, change only with a new review) or
-**PROPOSED DEFAULT, owner approval pending** (the owner accepts them in one answer, or replaces them).
+**OWNER APPROVED DEFAULT (2026-11-19)** (the owner approved these values; any one can still be replaced).
 Where the text depends on a pending default it says so.
 
 ## 0. Revision 3: resolved blockers, chosen direction, and what is not guaranteed
@@ -660,7 +660,7 @@ and 1000 requests per second that is about 1.1 GB per hour [I, arithmetic]. With
 fills, every gating write then fails, and everything in scope is refused with `audit_unavailable`; on
 node-local disk a full volume can also trigger the node's ephemeral-storage eviction [I].
 
-Bounds [A, design; the numbers are PROPOSED DEFAULT, owner approval pending, section 11]:
+Bounds [A, design; the numbers are OWNER APPROVED DEFAULT (2026-11-19), section 11]:
 
 1. **Per-record cap.** `max_record_bytes` (4096). Request-derived fields are truncated when serialized:
    `path` to 256 bytes, `aws_target` to 128 bytes, each with a trailing marker and `"trunc":true` on the
@@ -1159,9 +1159,8 @@ Only on the owner's request.
 
 ## 11. Open questions
 
-**DECIDED** means settled in review. **PROPOSED DEFAULT, owner approval pending** means the text above
-already uses the value, the owner can accept all of them in one answer ("accept the proposed defaults"),
-and any one can be replaced without changing the rest of the design except where noted.
+**DECIDED** means settled in review. **OWNER APPROVED DEFAULT (2026-11-19)** means the owner approved the value and the text above
+already uses it. The owner can still replace any one without changing the rest of the design except where noted.
 
 ### Decided
 
@@ -1186,57 +1185,57 @@ and any one can be replaced without changing the rest of the design except where
 13. **Torn tail.** **DECIDED:** moot with a new segment per boot. Never write into a previous boot's
     file; the new `start` record carries `prev_tail` (4.5).
 
-### Proposed defaults, owner approval pending
+### Owner-approved defaults (2026-11-19)
 
-1. **Gate scope.** **PROPOSED DEFAULT, owner approval pending:** in v1, **held writes only**. Reads and the
+1. **Gate scope.** **OWNER APPROVED DEFAULT (2026-11-19):** in v1, **held writes only**. Reads and the
    sidecar are unchanged and not covered by the guarantee. Alternative: gate every forwarded request from
    the start, as #32 specifies (stage 3 would then move into stage 1, at the cost of availability when the
    disk is down and a shared writer).
-5. **Session create, renew and revoke.** **PROPOSED DEFAULT, owner approval pending:** **never gate revoke
+5. **Session create, renew and revoke.** **OWNER APPROVED DEFAULT (2026-11-19):** **never gate revoke
    or revoke-all.** Gating of create and renew is deferred (creating a session grants authority and could
    be gated later; it is not in stage 1).
-10. **Timing defaults.** **PROPOSED DEFAULT, owner approval pending:** `write_timeout_ms = 2000`,
+10. **Timing defaults.** **OWNER APPROVED DEFAULT (2026-11-19):** `write_timeout_ms = 2000`,
     `retry_ms = 250`, `channel_capacity = 1024`, `shutdown_grace_ms = 5000`; heartbeat 30 if built later.
     Provisional until the Linux measurement and the hostile-load tests inform them.
-12. **Storage requirement.** **PROPOSED DEFAULT, owner approval pending:** require a **dedicated
+12. **Storage requirement.** **OWNER APPROVED DEFAULT (2026-11-19):** require a **dedicated
     persistent local ext4 or XFS volume**; **refuse tmpfs, ramfs, NFS, CIFS, FUSE and container overlay**
     (4.1). `flock` and `O_NOFOLLOW` are used; a read-only root with a volume is supported.
-14. **Total disk cap and behaviour at the cap.** **PROPOSED DEFAULT, owner approval pending:**
+14. **Total disk cap and behaviour at the cap.** **OWNER APPROVED DEFAULT (2026-11-19):**
     `max_total_bytes` = 1 GiB per directory (a placeholder: the owner sets the value), **fail closed at
     the cap, never delete unshipped records silently** (4A). In stage 1 the latch holds until restart (item 21).
     Alternative: delete the oldest segment, which destroys evidence and is not proposed.
-15. **Retention and shipping ownership.** **PROPOSED DEFAULT, owner approval pending:** the deployment
+15. **Retention and shipping ownership.** **OWNER APPROVED DEFAULT (2026-11-19):** the deployment
     ships closed segments and deletes them after delivery; the proxy deletes nothing. The owner names who
     runs the shipper and the retention period.
-16. **Is `emptyDir` acceptable?** **PROPOSED DEFAULT, owner approval pending:** only if the records are also
+16. **Is `emptyDir` acceptable?** **OWNER APPROVED DEFAULT (2026-11-19):** only if the records are also
     **shipped off the pod**, because `emptyDir` is deleted with the pod (4.1). Otherwise a persistent
     volume. On `emptyDir` the directory's mode and owner are not checked (4.2), so the file checks carry the
     weight and item 22 applies.
-17. **Retention of sensitive fields.** **PROPOSED DEFAULT, owner approval pending:** `path` and `digest`
+17. **Retention of sensitive fields.** **OWNER APPROVED DEFAULT (2026-11-19):** `path` and `digest`
     only in redacted, bounded form (path redacted by PR #29's rule and truncated to 256 bytes; digest as a
     12-hex-character prefix or omitted). `identity` and `approver` names are kept, because binding the
     approver to the action is the purpose of the record. The owner may drop any of them.
-18. **Who may read the audit files.** **PROPOSED DEFAULT, owner approval pending:** only the proxy's UID
+18. **Who may read the audit files.** **OWNER APPROVED DEFAULT (2026-11-19):** only the proxy's UID
     and the shipper's. The file is created `0600` and is checked (4.2). The directory mode is no longer
     enforced (4.2), so the agent must not mount the volume; the owner names the shipper's identity (it must
     run as the proxy's UID, or with a reviewed ACL or group, because the file is `0600`) and any human readers.
-19. **Deny rate bound.** **PROPOSED DEFAULT, owner approval pending:** a token bucket of 200 denies per
+19. **Deny rate bound.** **OWNER APPROVED DEFAULT (2026-11-19):** a token bucket of 200 denies per
     second with a per-second summary record (4A), accepting that individual deny records are lost under a
     flood. In stage 1 it covers held-route denies only (4A item 2).
-20. **Where non-held records go in stage 1.** **PROPOSED DEFAULT, owner approval pending:** the file sink
+20. **Where non-held records go in stage 1.** **OWNER APPROVED DEFAULT (2026-11-19):** the file sink
     carries held-route records only. Reads, sidecar traffic, other refusals, `netfilter`, `session` and
     `probe` stay on stdout as today, in both modes (3.3). Reason: read volume must not fill the file and latch
     the held-write quota. Alternative: all records to the file, with a rate bound on reads, and a quota that
     reads can reach. Owner accepts that the audit trail is then split across two sinks, and that a reader needs
     both.
-21. **Quota recovery in stage 1.** **PROPOSED DEFAULT, owner approval pending:** the quota is fail-closed until
+21. **Quota recovery in stage 1.** **OWNER APPROVED DEFAULT (2026-11-19):** the quota is fail-closed until
     the process restarts, with no automatic recovery, and the operator's procedure is the one in 4A item 3:
     stop, ship and remove closed segments, start. Owner accepts the operator signals of 4A item 3 (503s, one
     stderr line, the exit-2 crash loop when the cap is still reached), and that a passthrough pod stays Ready
     while the quota is latched because stage 1 has no passthrough readiness gate. Alternative for later: segment
     rollover inside a boot (`max_segment_bytes`, section 10 stage 2), which lets the proxy continue without a
     restart.
-22. **Directory and volume ownership.** **PROPOSED DEFAULT, owner approval pending:** the proxy creates a missing
+22. **Directory and volume ownership.** **OWNER APPROVED DEFAULT (2026-11-19):** the proxy creates a missing
     audit directory with mode `0700` and uses an existing one as found (4.2). The file checks of 4.2 apply to
     every segment. On `emptyDir` the directory is not protected from other UIDs that mount it, so the deployment
     mounts it in the proxy container only. The owner chooses between an init container that creates and chowns

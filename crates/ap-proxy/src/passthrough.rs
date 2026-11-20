@@ -15,6 +15,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ap_broker::clock::{Clock, SystemClock};
 use ap_broker::registry::sha256_hex;
 use ap_core::audit::{path_only, AuditRec};
 use ap_core::canon;
@@ -69,6 +70,8 @@ pub struct PtApp {
     /// `[approval].public_base_url` without a trailing slash: the notification link is
     /// `{approval_base}/pending/{id}`.
     pub(crate) approval_base: Option<String>,
+    /// Source of "now" for the option B pilot expiry (design 4.5). Tests replace it.
+    pub(crate) clock: Arc<dyn Clock + Send + Sync>,
     #[cfg(any(test, feature = "matrix-upstream"))]
     pub(crate) pause: pause::Pause,
 }
@@ -120,6 +123,15 @@ impl PtApp {
         inner.approval_base = Some(base.trim_end_matches('/').to_string());
     }
 
+    /// Replace the clock that the option B pilot expiry reads. Called right after construction,
+    /// while this is the only handle.
+    #[cfg(test)]
+    pub(crate) fn set_clock(app: &mut Arc<PtApp>, clock: Arc<dyn Clock + Send + Sync>) {
+        Arc::get_mut(app)
+            .expect("clock is set before the app is shared")
+            .clock = clock;
+    }
+
     /// One step of the policy-reload watch (design 3.9), run about once a second. The policy is
     /// re-read if its file changed. A file that is gone or no longer valid drops every pending
     /// hold; a valid file drops every hold the new policy no longer yields `hold` for (identity,
@@ -164,6 +176,7 @@ impl PtApp {
             hold: Arc::new(hold::Table::new(limits)),
             notifier: None,
             approval_base: None,
+            clock: Arc::new(SystemClock),
             #[cfg(any(test, feature = "matrix-upstream"))]
             pause: pause::Pause::new(),
         })
@@ -350,6 +363,43 @@ fn caller_identity<'a>(cfg: &'a Config, caller_key: &str) -> Option<&'a Identity
     found
 }
 
+/// Option B (design 4.5): the token identity that a request with no caller key presents. The
+/// `Authorization` value must be the single one and hash to the token bound to this route, the
+/// day must be inside the pilot window, and the policy must give `hold` for that identity on this
+/// request. Anything else is `caller_rejected`, the answer a missing caller key gets.
+fn pilot_identity(
+    cfg: &Config,
+    snap: &Snapshot,
+    path: &str,
+    method: &Method,
+    headers: &http::HeaderMap,
+    now: u64,
+) -> Result<String, Code> {
+    let (route, rel) = canon::parse_route_path(path).map_err(|_| Code::CallerRejected)?;
+    let token = cfg
+        .token_identities
+        .iter()
+        .find(|t| t.route == route)
+        .ok_or(Code::CallerRejected)?;
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = match (values.next(), values.next()) {
+        (Some(v), None) => v.to_str().map_err(|_| Code::CallerRejected)?,
+        _ => return Err(Code::CallerRejected),
+    };
+    let presented = sha256_hex(value);
+    let same: bool = presented
+        .as_bytes()
+        .ct_eq(token.token_sha256.as_bytes())
+        .into();
+    if !same || token.expired_at(now) {
+        return Err(Code::CallerRejected);
+    }
+    match snap.evaluate_verdict(&token.name, route, method.as_str(), &rel) {
+        Ok(Verdict::Hold) => Ok(token.name.clone()),
+        _ => Err(Code::CallerRejected),
+    }
+}
+
 /// What the stream audit writes when the response ends.
 enum End {
     /// An allowed request: the single `allow` line.
@@ -476,45 +526,62 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
     if header_present && path_form {
         return Ok(refuse(&app, &trail, Code::CallerKeyAmbiguous));
     }
-    let (key, eff_path) = if path_form {
-        // `parse_ap_path` validates the prefix. Whatever follows the key, byte for byte, is the
-        // path the rest of the pipeline sees.
-        let path = parts.uri.path();
-        let key = match canon::parse_ap_path(path) {
-            Ok(ap) => ap.caller_key,
-            // The key is well formed but the route segment is empty: authenticate the key
-            // first, so an unknown key is still 401; `/` then names no route.
-            Err(Code::RouteUnknown) => path
-                .strip_prefix("/ap/")
-                .and_then(|r| r.split('/').next())
-                .unwrap_or_default(),
-            Err(code) => return Ok(refuse(&app, &trail, code)),
-        };
-        (
-            key.to_string(),
-            path["/ap/".len() + key.len()..].to_string(),
-        )
-    } else {
-        match canon::caller_key_from_header(&parts.headers, &pt.caller_key_header) {
-            Ok(k) => (k, parts.uri.path().to_string()),
+    // Option B (design 4.5): a request with no caller key at all may authenticate by the token
+    // bound to its route, and only for a hold. Every other keyless request is refused as before.
+    let pilot = !path_form && !header_present;
+    let (identity_name, eff_path, key_echoed) = if pilot {
+        match pilot_identity(
+            &policy.cfg,
+            &policy.snap,
+            parts.uri.path(),
+            &parts.method,
+            &parts.headers,
+            app.clock.now(),
+        ) {
+            Ok(name) => (name, parts.uri.path().to_string(), false),
             Err(code) => return Ok(refuse(&app, &trail, code)),
         }
+    } else {
+        let (key, eff_path) = if path_form {
+            // `parse_ap_path` validates the prefix. Whatever follows the key, byte for byte, is the
+            // path the rest of the pipeline sees.
+            let path = parts.uri.path();
+            let key = match canon::parse_ap_path(path) {
+                Ok(ap) => ap.caller_key,
+                // The key is well formed but the route segment is empty: authenticate the key
+                // first, so an unknown key is still 401; `/` then names no route.
+                Err(Code::RouteUnknown) => path
+                    .strip_prefix("/ap/")
+                    .and_then(|r| r.split('/').next())
+                    .unwrap_or_default(),
+                Err(code) => return Ok(refuse(&app, &trail, code)),
+            };
+            (
+                key.to_string(),
+                path["/ap/".len() + key.len()..].to_string(),
+            )
+        } else {
+            match canon::caller_key_from_header(&parts.headers, &pt.caller_key_header) {
+                Ok(k) => (k, parts.uri.path().to_string()),
+                Err(code) => return Ok(refuse(&app, &trail, code)),
+            }
+        };
+        let Some(identity) = caller_identity(&policy.cfg, &key) else {
+            return Ok(refuse(&app, &trail, Code::CallerRejected));
+        };
+        // The key authenticates the request and goes no further. A route-relative path or query
+        // that carries it again, in any percent-encoded spelling, would be matched, held, shown to
+        // the approver, audited and sent upstream: refused here, before the Trail has a path.
+        let key_echoed = canon::echoes_caller_key(&eff_path, &key)
+            || parts
+                .uri
+                .query()
+                .is_some_and(|q| canon::echoes_caller_key(q, &key));
+        (identity.name.clone(), eff_path, key_echoed)
     };
-    let Some(identity) = caller_identity(&policy.cfg, &key) else {
-        return Ok(refuse(&app, &trail, Code::CallerRejected));
-    };
-    // The key authenticates the request and goes no further. A route-relative path or query that
-    // carries it again, in any percent-encoded spelling, would be matched, held, shown to the
-    // approver, audited and sent upstream: refused here, before the Trail has a path.
-    let key_echoed = canon::echoes_caller_key(&eff_path, &key)
-        || parts
-            .uri
-            .query()
-            .is_some_and(|q| canon::echoes_caller_key(q, &key));
-    drop(key);
-    trail.identity.clone_from(&identity.name);
+    trail.identity.clone_from(&identity_name);
     trail.evidence = Some(Evidence::collect(
-        &identity.name,
+        &identity_name,
         parts.method.as_str(),
         parts.version,
         &parts.headers,
@@ -566,7 +633,7 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
     let verdict =
         match policy
             .snap
-            .evaluate_verdict(&identity.name, &route.name, parts.method.as_str(), &rel)
+            .evaluate_verdict(&identity_name, &route.name, parts.method.as_str(), &rel)
         {
             Ok(v) => v,
             Err(_) => return Ok(refuse_unread(&app, &trail, Code::NoGrant, body, &drain).await),
@@ -581,7 +648,7 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
             route,
             generation: policy.generation,
             rel: &rel,
-            identity: &identity.name,
+            identity: &identity_name,
             drain,
         })
         .await;

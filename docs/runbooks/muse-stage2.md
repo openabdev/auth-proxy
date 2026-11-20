@@ -42,6 +42,14 @@ path or query that repeats the caller's own key, in any spelling, is refused as 
 `user`, `password_sha256`, `public_base_url` (http or https, no userinfo or query; it only builds the
 notification link) and an optional `realm`.
 
+`[[token_identity]]` (option B pilot, design 4.5; optional): `name`, `route` (a passthrough route),
+`token_sha256` (sha256 of the exact `Authorization` value, for example `Bot <token>`) and `expires`
+(`YYYY-MM-DD`, UTC; refused from the next day). It lets a keyless request on that route authenticate, and only
+for a `hold` grant of that identity. One per route. Pilot value: `expires = "2026-12-20"`. Without the table
+(the default), every request needs a caller key.
+
+`[approval]` (required when any grant holds): `listen` (loopback only, a port other than `listen.proxy`),
+
 `[notify]` (optional; without it holds just wait and expire): `kind = "ntfy"`, `base_url`, `topic_file`,
 and an optional `token_file`.
 

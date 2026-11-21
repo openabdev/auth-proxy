@@ -52,6 +52,10 @@ pub struct Config {
     pub limits: Limits,
     #[serde(default, rename = "identity")]
     pub identities: Vec<Identity>,
+    /// Option B pilot (design 4.5): identities that authenticate by an `Authorization` token
+    /// instead of a caller key. Each is bound to one passthrough route.
+    #[serde(default, rename = "token_identity")]
+    pub token_identities: Vec<TokenIdentity>,
     #[serde(default, rename = "route")]
     pub routes: Vec<Route>,
     #[serde(default, rename = "credential")]
@@ -298,6 +302,76 @@ pub struct Identity {
     /// hello for this identity is refused with 403 `runtime_key_missing`.
     #[serde(default)]
     pub runtime_pubkey: Option<String>,
+}
+
+/// Option B pilot (design 4.5). A request with no caller key authenticates as this identity when
+/// its `Authorization` header hashes to `token_sha256` on `route`, and only for a `hold` verdict.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TokenIdentity {
+    /// Audit name and grant identity label. Not a secret.
+    pub name: String,
+    /// The passthrough route this token may reach. Nothing else.
+    pub route: String,
+    /// Lowercase hex sha256 of the exact `Authorization` header value, `Bot <token>` for Discord.
+    /// The token itself never enters the config.
+    pub token_sha256: String,
+    /// Last UTC day the token is accepted, `YYYY-MM-DD`. Refused from the next day on.
+    pub expires: String,
+}
+
+impl TokenIdentity {
+    /// True when `now` (Unix seconds) is at or past the first second after `expires`. A malformed
+    /// date counts as expired.
+    pub fn expired_at(&self, now: u64) -> bool {
+        match day_after_secs(&self.expires) {
+            Some(cut) => now >= cut,
+            None => true,
+        }
+    }
+}
+
+/// The Unix second at which the UTC day after `date` (`YYYY-MM-DD`) begins. `None` when `date` is
+/// not a real calendar date.
+pub fn day_after_secs(date: &str) -> Option<u64> {
+    if date.len() != 10 || date.as_bytes()[4] != b'-' || date.as_bytes()[7] != b'-' {
+        return None;
+    }
+    let digits = |r: std::ops::Range<usize>| -> Option<i64> {
+        let s = date.get(r)?;
+        if s.bytes().all(|c| c.is_ascii_digit()) {
+            s.parse().ok()
+        } else {
+            None
+        }
+    };
+    let y = digits(0..4)?;
+    let m = u32::try_from(digits(5..7)?).ok()?;
+    let d = u32::try_from(digits(8..10)?).ok()?;
+    if !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m) {
+        return None;
+    }
+    u64::try_from((days_from_civil(y, m, d) + 1) * 86_400).ok()
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        _ => 28,
+    }
+}
+
+/// Days from 1970-01-01 to the given proleptic Gregorian date.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = i64::from((m + 9) % 12);
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -890,6 +964,67 @@ impl Config {
 
         if self.grants.len() > MAX_GRANTS {
             return Err(invalid(format!("at most {MAX_GRANTS} grants are allowed")));
+        }
+        // Option B token identities (design 4.5). Their names share the audit namespace with the
+        // keyed identities, each token is bound to one passthrough route, and each needs a hold
+        // grant there, since a keyless request is only ever a hold.
+        let mut token_hashes = HashSet::new();
+        // Single caller (design 4.5): one token identity in the whole policy, on one route.
+        if self.token_identities.len() > 1 {
+            return Err(invalid(
+                "the pilot allows one token identity in total, on one route; remove the extra [[token_identity]]"
+                    .to_string(),
+            ));
+        }
+        for t in &self.token_identities {
+            if !valid_identity_name(&t.name) || !identity_names.insert(t.name.as_str()) {
+                return Err(invalid(format!(
+                    "token identity name {:?} is invalid or already used",
+                    t.name
+                )));
+            }
+            if !is_hex64_lower(&t.token_sha256) || !token_hashes.insert(t.token_sha256.as_str()) {
+                return Err(invalid(format!(
+                    "token identity {:?}: token_sha256 must be 64 lowercase hex characters, unique",
+                    t.name
+                )));
+            }
+            if day_after_secs(&t.expires).is_none() {
+                return Err(invalid(format!(
+                    "token identity {:?}: expires must be a YYYY-MM-DD calendar date",
+                    t.name
+                )));
+            }
+            if !self
+                .routes
+                .iter()
+                .any(|r| r.name == t.route && r.mode == RouteMode::Passthrough)
+            {
+                return Err(invalid(format!(
+                    "token identity {:?}: route {:?} is not a passthrough route",
+                    t.name, t.route
+                )));
+            }
+            if !self
+                .grants
+                .iter()
+                .any(|g| g.identity == t.name && g.route == t.route && g.decision == Decision::Hold)
+            {
+                return Err(invalid(format!(
+                    "token identity {:?} needs a hold grant on route {:?}",
+                    t.name, t.route
+                )));
+            }
+            // A keyless request is only ever a hold (design 4.5), so any other grant for this
+            // identity could never authorize a request. Refused here instead of ignored at runtime.
+            if let Some(g) = self.grants.iter().find(|g| {
+                g.identity == t.name && (g.route != t.route || g.decision != Decision::Hold)
+            }) {
+                return Err(invalid(format!(
+                    "token identity {:?} may hold only: grant on route {:?} with decision {:?} is not a hold on route {:?}",
+                    t.name, g.route, g.decision, t.route
+                )));
+            }
         }
         // A hold pattern must not share a request with an allow grant of the same identity,
         // route and method. Hold wins when both match, but a spelling of the held resource that
@@ -1691,6 +1826,131 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
         assert_eq!(cfg.grants[0].decision, Decision::Allow);
         assert!(cfg.grants[0].credential.is_empty());
         assert!(!cfg.probe.enabled);
+    }
+
+    /// `pt_base()` plus a pilot token bound to `discord` with a hold grant.
+    fn pilot_text() -> String {
+        format!(
+            "{}\n[[token_identity]]\nname = \"pilot-b\"\nroute = \"discord\"\ntoken_sha256 = \"{}\"\nexpires = \"2026-12-20\"\n\n[[grant]]\nidentity = \"pilot-b\"\nroute = \"discord\"\nmethods = [\"POST\"]\ndecision = \"hold\"\npath_patterns = [\"/api/v10/channels/*/messages\"]\n",
+            pt_base(),
+            "ab".repeat(32)
+        )
+    }
+
+    #[test]
+    fn token_identity_loads_with_its_hold_grant() {
+        let cfg = load(&pilot_text()).expect("valid");
+        assert_eq!(cfg.token_identities.len(), 1);
+        assert_eq!(cfg.token_identities[0].name, "pilot-b");
+        assert_eq!(cfg.token_identities[0].route, "discord");
+    }
+
+    #[test]
+    fn token_identity_expiry_must_be_a_calendar_date() {
+        for bad in [
+            "2026-02-30",
+            "2026-13-01",
+            "2026-00-10",
+            "2025-02-29",
+            "2026-1-01",
+            "20261220",
+        ] {
+            let text =
+                pilot_text().replace("expires = \"2026-12-20\"", &format!("expires = \"{bad}\""));
+            expect_invalid(&text, "expires must be a YYYY-MM-DD calendar date");
+        }
+        let leap = pilot_text().replace("2026-12-20", "2028-02-29");
+        assert!(load(&leap).is_ok());
+    }
+
+    #[test]
+    fn token_identity_needs_a_passthrough_route() {
+        let text = pilot_text().replace(
+            "route = \"discord\"\ntoken_sha256",
+            "route = \"nowhere\"\ntoken_sha256",
+        );
+        expect_invalid(&text, "is not a passthrough route");
+    }
+
+    #[test]
+    fn token_identity_needs_a_hold_grant_on_its_route() {
+        let text = pilot_text().replace("decision = \"hold\"", "decision = \"allow\"");
+        expect_invalid(&text, "needs a hold grant");
+    }
+
+    #[test]
+    fn token_identity_may_hold_only_on_its_bound_route() {
+        // An allow grant for the token identity on its own route: never reached, since a keyless
+        // request is only ever a hold.
+        let allow = format!(
+            "{}\n[[grant]]\nidentity = \"pilot-b\"\nroute = \"discord\"\nmethods = [\"GET\"]\ndecision = \"allow\"\npath_patterns = [\"/api/v10/users/*\"]\n",
+            pilot_text()
+        );
+        expect_invalid(&allow, "may hold only");
+        // A hold grant for the token identity on another passthrough route: also never reached.
+        let other_route = format!(
+            "{}\n[[route]]\nname = \"other\"\nhost = \"example.com\"\nmode = \"passthrough\"\n\n[[grant]]\nidentity = \"pilot-b\"\nroute = \"other\"\nmethods = [\"POST\"]\ndecision = \"hold\"\npath_patterns = [\"/x/*\"]\n",
+            pilot_text()
+        );
+        expect_invalid(&other_route, "may hold only");
+        // The hold grant on the bound route alone still loads.
+        assert!(load(&pilot_text()).is_ok());
+    }
+
+    #[test]
+    fn token_identity_name_cannot_reuse_a_name() {
+        let text = pilot_text().replace("name = \"pilot-b\"", "name = \"muse-pilot\"");
+        expect_invalid(&text, "already used");
+    }
+
+    #[test]
+    fn token_sha256_must_be_64_lowercase_hex() {
+        let text = pilot_text().replace(&"ab".repeat(32), "AB");
+        expect_invalid(&text, "token_sha256 must be 64 lowercase hex");
+    }
+
+    #[test]
+    fn pilot_allows_one_token_identity_in_total() {
+        let same_route = format!(
+            "{}\n[[token_identity]]\nname = \"pilot-c\"\nroute = \"discord\"\ntoken_sha256 = \"{}\"\nexpires = \"2026-12-20\"\n",
+            pilot_text(),
+            "cd".repeat(32)
+        );
+        expect_invalid(&same_route, "one token identity");
+        // A second route is refused too: the pilot has one caller on one route.
+        let other_route = format!(
+            "{}\n[[route]]\nname = \"other\"\nhost = \"example.com\"\nmode = \"passthrough\"\n\n[[token_identity]]\nname = \"pilot-c\"\nroute = \"other\"\ntoken_sha256 = \"{}\"\nexpires = \"2026-12-20\"\n\n[[grant]]\nidentity = \"pilot-c\"\nroute = \"other\"\nmethods = [\"POST\"]\ndecision = \"hold\"\npath_patterns = [\"/x/*\"]\n",
+            pilot_text(),
+            "cd".repeat(32)
+        );
+        expect_invalid(&other_route, "one token identity");
+    }
+
+    #[test]
+    fn day_after_secs_follows_the_utc_calendar() {
+        assert_eq!(day_after_secs("1970-01-01"), Some(86_400));
+        assert_eq!(day_after_secs("2000-02-29"), Some(951_868_800));
+        assert_eq!(day_after_secs("2026-12-20"), Some(1_797_811_200));
+        for bad in ["2026-02-29", "2026-04-31", "2026-12-00", "2026-12-20T"] {
+            assert_eq!(day_after_secs(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn token_identity_expires_from_the_first_second_of_the_next_day() {
+        let t = TokenIdentity {
+            name: "pilot-b".into(),
+            route: "discord".into(),
+            token_sha256: "ab".repeat(32),
+            expires: "2026-12-20".into(),
+        };
+        assert!(!t.expired_at(1_797_811_199));
+        assert!(t.expired_at(1_797_811_200));
+        let malformed = TokenIdentity {
+            expires: "2026-02-30".into(),
+            ..t
+        };
+        assert!(malformed.expired_at(0));
     }
 
     #[test]

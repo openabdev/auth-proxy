@@ -51,6 +51,8 @@ pub(super) struct Request<'a> {
     pub rel: &'a str,
     pub identity: &'a str,
     pub drain: Drain,
+    /// Whether the pilot token path admitted the request (`pilot_identity`).
+    pub token_admitted: bool,
 }
 
 /// What the audit records of one held request share. No header value, no body, no query.
@@ -429,6 +431,7 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
         rel,
         identity,
         drain,
+        token_admitted,
     } = r;
 
     // 1-3. Refusals before the body is read.
@@ -479,6 +482,7 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
             .map(|(n, v)| (n.as_str().to_string(), v.as_bytes().to_vec()))
             .collect(),
         body: bytes.clone(),
+        token_admitted,
     });
     let ctx = Ctx {
         identity: identity.to_string(),

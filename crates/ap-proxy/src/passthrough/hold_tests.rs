@@ -30,6 +30,7 @@ use crate::notify::{MockNotifier, TEXT};
 use crate::test_support::{
     buffer_sink, caller_key, client_for, tls_server_config, Scratch, Upstream, HOST,
 };
+use ap_broker::clock::ManualClock;
 use ap_broker::registry::sha256_hex;
 
 const NOTIFY_BASE: &str = "https://approve.example.test/";
@@ -2676,4 +2677,364 @@ async fn caller_key_repeated_in_the_path_or_query_is_refused_before_anything_is_
     let (parts, _) = ok.await.unwrap().unwrap();
     assert_eq!(parts.status, 200);
     assert_eq!(mock.recorded()[0].uri, "/hold/ok");
+}
+
+// ---------------------------------------------------------------- option B (design 4.5)
+
+const PILOT_NAME: &str = "muse-pilot-b";
+const PILOT_TOKEN: &str = "SENTINEL-PILOT-TOKEN-0003";
+const PILOT_AUTH: &str = "Bot SENTINEL-PILOT-TOKEN-0003";
+const PILOT_ROTATED_AUTH: &str = "Bot SENTINEL-PILOT-TOKEN-0004";
+const PILOT_KEYED_CALLER: &str = "SENTINEL-PILOT-KEYED-CALLER-0005";
+const PILOT_WRITE: &str = "/discord/hold/ok/messages";
+/// 2026-12-20T00:00:00Z, the first second of the last valid day.
+const PILOT_LAST_DAY: u64 = 1_797_724_800;
+/// 2026-12-21T00:00:00Z, the first refused second.
+const PILOT_REFUSED: u64 = 1_797_811_200;
+
+/// The pilot token, bound to `discord`, and its hold grant, appended to the fixture policy.
+fn pilot_tail(expires: &str) -> String {
+    format!(
+        "\n[[token_identity]]\nname = \"{PILOT_NAME}\"\nroute = \"discord\"\n\
+         token_sha256 = \"{}\"\nexpires = \"{expires}\"\n\n\
+         [[grant]]\nidentity = \"{PILOT_NAME}\"\nroute = \"discord\"\nmethods = [\"POST\"]\n\
+         decision = \"hold\"\npath_patterns = [\"/hold/*/messages\"]\n",
+        sha256_hex(PILOT_AUTH)
+    )
+}
+
+/// The fixture with the pilot token. The clock reads `now` and the returned handle moves it.
+async fn pilot_ht(tag: &str, up: &Upstream, expires: &str, now: u64) -> (Ht, ManualClock) {
+    let o = Opts {
+        tail: pilot_tail(expires),
+        ..Opts::default()
+    };
+    let mut t = Ht::with(tag, up, o).await;
+    let clock = ManualClock::new(now);
+    PtApp::set_clock(&mut t.app, Arc::new(clock.clone()));
+    (t, clock)
+}
+
+/// A request with no caller key header and no `/ap/` prefix. `auth` is the Authorization value.
+fn keyless(method: &str, path: &str, auth: Option<&str>) -> Request<Body> {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", AUTH);
+    if let Some(a) = auth {
+        b = b.header("authorization", a);
+    }
+    let body = if method == "POST" {
+        r#"{"content":"hi"}"#
+    } else {
+        ""
+    };
+    b.header("content-type", "application/json")
+        .header("content-length", body.len())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn assert_caller_rejected(p: &http::response::Parts, b: &Bytes) {
+    assert_eq!(p.status, 401, "{}", String::from_utf8_lossy(b));
+    assert_eq!(decision(p), "rejected");
+    assert_eq!(code(b), "caller_rejected");
+}
+
+#[tokio::test]
+async fn pilot_write_without_caller_key_is_held_and_sent_only_after_approval() {
+    let mock = Mock::start().await;
+    let (t, _clock) = pilot_ht("pilot-held", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(mock.hits(), 0, "nothing is sent before the approval");
+    assert_eq!(t.app.hold.state(&id), Some(State::Pending));
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Success
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 200);
+    assert_eq!(&b[..], b"ok");
+    let recs = mock.recorded();
+    assert_eq!(recs.len(), 1);
+    assert!(header_values(&recs[0], "x-ap-caller-key").is_empty());
+    assert_eq!(
+        header_values(&recs[0], "authorization"),
+        [PILOT_AUTH.as_bytes()]
+    );
+    let held = t
+        .lines()
+        .into_iter()
+        .find(|v| v["transition"] == "held")
+        .unwrap();
+    assert_eq!(held["identity"], PILOT_NAME);
+    assert_eq!(
+        t.transitions(),
+        ["held", "approved", "forward_started", "completed"]
+    );
+    t.assert_clean();
+}
+
+#[tokio::test]
+async fn pilot_wrong_or_missing_token_is_refused_before_any_hold() {
+    let mock = Mock::start().await;
+    let (t, _clock) = pilot_ht("pilot-wrong", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    // Another token, the bare token without its `Bot ` prefix, and no Authorization at all.
+    for auth in [
+        Some("Bot SENTINEL-PILOT-TOKEN-9999"),
+        Some(PILOT_TOKEN),
+        None,
+    ] {
+        let (p, b) = t.send(keyless("POST", PILOT_WRITE, auth)).await.unwrap();
+        assert_caller_rejected(&p, &b);
+    }
+    assert_eq!(t.count("held"), 0);
+    assert_eq!(mock.hits(), 0, "the upstream saw a request");
+    t.assert_clean();
+}
+
+#[tokio::test]
+async fn pilot_refuses_from_the_day_after_expiry_and_sends_nothing() {
+    let mock = Mock::start().await;
+    let (t, clock) = pilot_ht("pilot-expiry", &mock.up, "2026-12-20", PILOT_REFUSED - 1).await;
+    // The last second of the last valid day: the write is held and approved as usual.
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Success
+    );
+    assert_eq!(h.await.unwrap().unwrap().0.status, 200);
+    assert_eq!(mock.hits(), 1);
+    // One second later the same request is refused: no hold, nothing forwarded.
+    clock.set(PILOT_REFUSED);
+    let (p, b) = t
+        .send(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)))
+        .await
+        .unwrap();
+    assert_caller_rejected(&p, &b);
+    assert_eq!(t.count("held"), 1, "a hold was recorded after expiry");
+    assert_eq!(mock.hits(), 1, "the upstream saw a request after expiry");
+}
+
+#[tokio::test]
+async fn pilot_expiry_is_read_from_the_policy_file() {
+    let mock = Mock::start().await;
+    // The same day that the 2026-12-20 policy refuses is still inside this policy's window.
+    let (t, _clock) = pilot_ht("pilot-config-expiry", &mock.up, "2027-01-31", PILOT_REFUSED).await;
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Success
+    );
+    assert_eq!(h.await.unwrap().unwrap().0.status, 200);
+}
+
+#[tokio::test]
+async fn non_pilot_requests_still_need_the_caller_key() {
+    let mock = Mock::start().await;
+    let (t, _clock) = pilot_ht("pilot-keyed", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    // Positive control: a keyed read on the same route is still forwarded.
+    let keyed = t
+        .builder(&t.key, "GET", "/discord/api/x")
+        .body(Body::empty())
+        .unwrap();
+    let (p, _) = t.send(keyed).await.unwrap();
+    assert_eq!(p.status, 200);
+    // Keyless requests that the pilot does not cover: a read, a write to another path, a PUT to
+    // the held path, and a held write with no token. Each is refused as a missing caller key.
+    let refused = [
+        ("GET", "/discord/api/x", Some(PILOT_AUTH)),
+        ("POST", "/discord/hold/ok", Some(PILOT_AUTH)),
+        ("PUT", PILOT_WRITE, Some(PILOT_AUTH)),
+        ("POST", PILOT_WRITE, None),
+    ];
+    for (method, path, auth) in refused {
+        let (p, b) = t.send(keyless(method, path, auth)).await.unwrap();
+        assert_caller_rejected(&p, &b);
+    }
+    assert_eq!(mock.hits(), 1, "only the keyed read may reach the upstream");
+    assert_eq!(t.count("held"), 0);
+}
+
+#[tokio::test]
+async fn the_pilot_token_and_its_hash_reach_no_audit_record_or_error_body() {
+    let mock = Mock::start().await;
+    let (t, clock) = pilot_ht("pilot-leak", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    let hash = sha256_hex(PILOT_AUTH);
+    let mut bodies = Vec::new();
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::Success
+    );
+    h.await.unwrap().unwrap();
+    for auth in [
+        Some("Bot SENTINEL-PILOT-TOKEN-9999"),
+        Some(PILOT_TOKEN),
+        None,
+    ] {
+        let (_, b) = t.send(keyless("POST", PILOT_WRITE, auth)).await.unwrap();
+        bodies.push(b);
+    }
+    clock.set(PILOT_REFUSED);
+    let (_, b) = t
+        .send(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)))
+        .await
+        .unwrap();
+    bodies.push(b);
+    let audit = t.text();
+    for needle in [PILOT_AUTH, PILOT_TOKEN, hash.as_str(), &hash[..16]] {
+        assert!(!audit.contains(needle), "{needle} reached the audit stream");
+        for b in &bodies {
+            let body = String::from_utf8_lossy(b);
+            assert!(!body.contains(needle), "{needle} reached an error body");
+        }
+    }
+}
+
+#[tokio::test]
+async fn pilot_admitted_before_the_cutoff_is_not_forwarded_after_it() {
+    let mock = Mock::start().await;
+    let (t, clock) = pilot_ht("pilot-cross", &mock.up, "2026-12-20", PILOT_REFUSED - 1).await;
+    // Admitted one second before the cutoff, so it is held as usual.
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    // The cutoff passes while the request waits, and the approval lands after it.
+    clock.set(PILOT_REFUSED);
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::PolicyChanged
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 503, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(code(&b), "dropped_on_reload");
+    assert_eq!(t.count("forward_started"), 0);
+    assert_eq!(t.count("dropped_on_reload"), 1);
+    // The connection may have opened before the claim refused; no request reached the upstream.
+    assert!(
+        mock.recorded().is_empty(),
+        "the upstream saw a request after the cutoff"
+    );
+}
+
+#[tokio::test]
+async fn pilot_hold_admitted_before_a_token_rotation_is_not_forwarded_after_it() {
+    let mock = Mock::start().await;
+    let (t, _clock) = pilot_ht("pilot-rotate", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    // Admitted with the old token, which the policy binds by `token_sha256`.
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    // The operator rotates the hash only: the name, the route and the grant stay as they were.
+    t.rewrite(|s| s.replacen(&sha256_hex(PILOT_AUTH), &sha256_hex(PILOT_ROTATED_AUTH), 1));
+    assert_eq!(
+        t.approve_checked(&id).await,
+        ApproveResult::PolicyChanged,
+        "the held Authorization no longer matches the token in force"
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 503, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(code(&b), "dropped_on_reload");
+    assert_eq!(t.count("forward_started"), 0);
+    assert_eq!(t.count("dropped_on_reload"), 1);
+    // `hits` counts accepted connections, which can open before the claim refuses. A request
+    // is what reaches the upstream, so the recorded requests are the check.
+    assert!(
+        mock.recorded().is_empty(),
+        "the upstream received a request after the rotation"
+    );
+}
+
+#[tokio::test]
+async fn pilot_hold_admitted_with_a_token_is_not_forwarded_once_a_keyed_identity_takes_its_name() {
+    let mock = Mock::start().await;
+    let (t, _clock) = pilot_ht("pilot-mode", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    // Admitted with the token, so the held entry is a token-admitted hold.
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    // The token identity is replaced by a keyed identity of the same name. The route and the
+    // hold grant stay as they were.
+    t.rewrite(|s| {
+        s.replacen(
+            &format!(
+                "[[token_identity]]\nname = \"{PILOT_NAME}\"\nroute = \"discord\"\n\
+                 token_sha256 = \"{}\"\nexpires = \"2026-12-20\"",
+                sha256_hex(PILOT_AUTH)
+            ),
+            &format!(
+                "[[identity]]\nname = \"{PILOT_NAME}\"\ncaller_key_sha256 = \"{}\"",
+                sha256_hex(PILOT_KEYED_CALLER)
+            ),
+            1,
+        )
+    });
+    assert_eq!(
+        t.approve_checked(&id).await,
+        ApproveResult::PolicyChanged,
+        "a token-admitted hold must not survive its token identity being replaced"
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 503, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(code(&b), "dropped_on_reload");
+    assert_eq!(t.count("forward_started"), 0);
+    assert_eq!(t.count("dropped_on_reload"), 1);
+    assert!(
+        mock.recorded().is_empty(),
+        "the upstream received a request after the token identity was replaced"
+    );
+}
+
+/// `s` with every byte percent-encoded.
+fn pct_all(s: &str) -> String {
+    s.bytes().map(|b| format!("%{b:02X}")).collect()
+}
+
+#[tokio::test]
+async fn pilot_token_echoed_in_the_path_or_query_is_refused_before_any_hold() {
+    let mock = Mock::start().await;
+    let (t, _clock) = pilot_ht("pilot-echo", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    let encoded = pct_all(PILOT_TOKEN);
+    // Each spelling with the code it is refused with. An unreserved percent-escape in the path is
+    // refused as ambiguous before the pilot is considered; the query is not subject to that rule.
+    let cases = [
+        (
+            format!("/discord/hold/{PILOT_TOKEN}/messages"),
+            "caller_key_ambiguous",
+        ),
+        (
+            format!("/discord/hold/{encoded}/messages"),
+            "path_ambiguous",
+        ),
+        (
+            format!("/discord/hold/ok/messages?t={PILOT_TOKEN}"),
+            "caller_key_ambiguous",
+        ),
+        (
+            format!("/discord/hold/ok/messages?t={encoded}"),
+            "caller_key_ambiguous",
+        ),
+        (
+            format!("/discord/hold/ok/messages?t={}", pct_all(&encoded)),
+            "caller_key_ambiguous",
+        ),
+    ];
+    for (path, expected) in &cases {
+        let (p, b) = t
+            .send(keyless("POST", path, Some(PILOT_AUTH)))
+            .await
+            .unwrap();
+        assert_eq!(p.status, 400, "{path}: {}", String::from_utf8_lossy(&b));
+        assert_eq!(code(&b), *expected, "{path}");
+    }
+    assert_eq!(t.count("held"), 0, "a hold was built from a token echo");
+    assert!(t.held_ids().is_empty(), "the approval page would list one");
+    assert!(mock.recorded().is_empty(), "the upstream saw a token echo");
+    let audit = t.text();
+    for needle in [PILOT_TOKEN, encoded.as_str()] {
+        assert!(!audit.contains(needle), "{needle} reached the audit stream");
+    }
 }

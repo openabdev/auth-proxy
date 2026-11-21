@@ -641,6 +641,95 @@ the gate for the PoC (open question 11).
 In Phase 1 the same boundary is enforced by the network (per-UID iptables, loopback only) [I README,
 Deployment models]. This mode has no equivalent, because Muse is not inside our network.
 
+### 4.5 Option B: token-identity pilot (time-boxed, single caller)
+
+**Status.** Approved by the owner on 2026-11-20 as a time-boxed pilot. It replaces the two-surrogate
+request shape for one route. The reason: a Muse request that carried a caller key (in the path or the
+header) and the Discord token (in `Authorization`) was refused by the egress swap layer with
+`credential_ambiguity` before it reached the gate. A request on the B route carries only the token, so the
+swap layer sees one surrogate. The pilot ends on **2026-12-20** (see the expiry rule below).
+
+**Scope.** One caller (the Muse connector for the `discord` route), one route, and one write:
+`POST /channels/*/messages` as a `hold`. Reads and every other write keep the caller key, as in 3.2 and 3.3.
+
+**Mechanism.** A `[[token_identity]]` entry binds one passthrough route:
+
+```toml
+[[token_identity]]
+name = "muse-pilot-b"                 # audit label and grant identity; not a secret
+route = "discord"                     # the only route this token reaches
+token_sha256 = "<64 lowercase hex>"   # sha256 of the exact Authorization header value
+expires = "2026-12-20"                # last UTC day accepted; refused from the next day
+
+[[grant]]
+identity = "muse-pilot-b"
+route = "discord"
+methods = ["POST"]
+path_patterns = ["/api/v10/channels/*/messages"]
+decision = "hold"
+```
+
+1. A request with no caller key header and no `/ap/` prefix authenticates as the token identity only when
+   all of these hold: the route is the one the token is bound to; there is exactly one `Authorization`
+   value; its sha256 equals `token_sha256` (compared in constant time); the day is inside `expires`; and
+   the policy gives `hold` for that identity on that method and route-relative path. Any other failure is
+   `caller_rejected` (401, `X-AP-Decision: rejected`), the answer a missing caller key already gets. A
+   keyless read, a keyless write to another path, or a keyless write with a wrong or missing token is
+   refused the same way and never reaches the policy as an identity.
+2. A request that carries a caller key (header or path) is authenticated as before. The token is never a
+   caller key, and a keyed request is never resolved by token.
+3. Accepted B requests take the normal hold path: the body is buffered, the request waits for the phone
+   approval within `hold_secs`, and nothing is sent to Discord before the approval. The forwarded
+   `Authorization` is the token value Muse sent, unchanged, as in 3.1.
+
+**Expiry.** `expires` is a policy value, not a constant. The token is accepted through the last second of
+`expires` (UTC) and refused from `expires` + 1 day, 00:00:00 UTC, with `caller_rejected`. A malformed date
+fails closed at load. The pilot policy sets `expires = "2026-12-20"`, so B requests are refused from
+2026-12-21 UTC. Nothing is forwarded after that, and nothing is held. The expiry is checked again at the start
+claim, so a request held before the cutoff and approved after it is not forwarded. The start claim also
+checks that the held `Authorization` still hashes to the current `token_sha256`. If the operator rotates the
+hash, every hold admitted with the old token is refused at approval with `dropped_on_reload` (503), and
+nothing is forwarded. The same holds when the token identity is replaced by a keyed identity of the same
+name: a hold admitted with the token records that mode at admission and is refused the same way.
+
+**Identity rule.**
+
+- The identity lookup key is the sha256 of the exact `Authorization` header value, including any `Bot `
+  prefix. The hash is compared with `token_sha256`, which is the only form of the token the config holds.
+- The identity label used in grants, holds and audit records is the configured `name`. The hash is not the
+  label, so audit records carry no hash prefix. This section is the only place that rule is written down, and
+  it allows no hash in audit, logs, error bodies, notifications or the approval page.
+- The token, its hash, and any prefix of either never appear in an audit record or an error body. The tests in
+  `hold_tests.rs` check the audit stream and the error bodies on the held, approved, wrong-token,
+  missing-token and expired paths; the echoed-token test checks the audit stream only. No regression test
+  captures tracing output or notifier text, so this section makes no tested claim about those surfaces.
+- Config validation refuses a second token identity anywhere in the policy, whatever its route, so the
+  one-caller and one-route limit is enforced at load, not only by convention.
+
+**Compensating controls.** All of these are required for the pilot:
+
+1. **ACL to the Muse node.** Only the Muse tag reaches the public port (4.2 item 1). Nothing else reaches the
+   gate on that port.
+2. **Phone approval on every write.** Every B request is a `hold` in the same hold table, with the same
+   notification, the same `hold_secs` window (90 s for this pilot), the same audit records and the same
+   fail-closed rules as the keyed write route in 3.4 to 3.9. The approval plane is unchanged (3.6).
+3. **Single caller, one route.** One token identity in the whole policy, bound to one route. Config load
+   refuses a second `[[token_identity]]` whatever its route, so this limit is enforced by code.
+4. **Expiry.** The token stops working at the pilot end date, as above.
+5. **Mandatory re-review before any second caller.** A second token identity, a second route, or any
+   keyless caller other than the one above needs a new design review and a new decision. This section does
+   not approve any of them.
+
+**What B gives up.** The Discord token becomes the caller's only authenticator on the held route. Anyone who
+holds that token can submit writes to the gate, which still needs a phone approval for each one. Before, a
+leaked token alone gave no path through the gate. Under B, a leaked token gives a request the human still has
+to approve, and nothing more. The pilot accepts this for the time box. The reads and every other write keep
+the caller key.
+
+**Not changed by B.** The approval plane, the 90 s hold window, the audit record shape (the `identity` field
+holds the configured `name`), fail-closed behaviour, and the ACL assumptions in 4.2. Section 3.2 still governs
+every keyed route.
+
 ## 5. The connection is the state: failure analysis and comparison with #5
 
 ### 5.1 Failure analysis

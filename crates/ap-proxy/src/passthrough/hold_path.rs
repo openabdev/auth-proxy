@@ -34,7 +34,8 @@ use super::{
 };
 use super::{Code, Duration, Instant, Response, StreamAudit};
 use crate::forward::{self, BufferError};
-use crate::hold::{Admission, Confirm, ConfirmTx, Decision, HeldRequest, Upstream};
+use crate::hold::{Admission, CallbackAction, Confirm, ConfirmTx, Decision, HeldRequest, Upstream};
+use crate::notify::poll::callback_data;
 use ap_core::outcome::render_passthrough;
 use axum::body::Body;
 
@@ -101,18 +102,34 @@ impl Ctx {
 const NOTIFY_CAP: Duration = Duration::from_secs(15);
 
 /// Fire-and-forget notification for a new entry: one delivery, with at most one retry inside the
-/// notifier after any transport error. The link carries only the
-/// entry id; the text is the fixed sentence. Nothing here waits for the result.
-fn announce(app: &Arc<PtApp>, ctx: &Ctx, id: &str, digest: &str) {
+/// notifier after any transport error. The text is the fixed sentence. Option C links to the
+/// entry's page. Buttons mode links to the no-login one-time view and adds the approve and deny
+/// buttons, whose callback data carries the entry id and the hold's nonce. Nothing here waits for
+/// the result.
+fn announce(app: &Arc<PtApp>, ctx: &Ctx, held: &crate::hold::Held) {
     let (Some(notifier), Some(base)) = (app.notifier.clone(), app.approval_base.clone()) else {
         return;
     };
+    let view_base = app.view_base.clone();
     let app = Arc::clone(app);
-    let (ctx, id, digest) = (ctx.clone(), id.to_string(), digest.to_string());
+    let (ctx, id, digest) = (ctx.clone(), held.id.clone(), held.digest.clone());
+    let (nonce, token) = (held.nonce.clone(), held.view_token.clone());
     tokio::spawn(async move {
-        let url = format!("{base}/pending/{id}");
-        let sent =
-            tokio::time::timeout(NOTIFY_CAP, notifier.notify(&id, crate::notify::TEXT, &url)).await;
+        let (url, buttons) = match &view_base {
+            Some(view) => (
+                format!("{view}/view/{token}"),
+                Some(crate::notify::Buttons {
+                    approve: callback_data(CallbackAction::Approve, &id, &nonce),
+                    deny: callback_data(CallbackAction::Deny, &id, &nonce),
+                }),
+            ),
+            None => (format!("{base}/pending/{id}"), None),
+        };
+        let sent = tokio::time::timeout(
+            NOTIFY_CAP,
+            notifier.notify(&id, crate::notify::TEXT, &url, buttons.as_ref()),
+        )
+        .await;
         if !matches!(sent, Ok(Ok(()))) {
             app.audit.write_hold(&ctx.rec(
                 &id,
@@ -506,10 +523,12 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
         Admission::Refused(code) => return Ok(refuse(&app, &trail, code)),
         Admission::Held(h) => h,
     };
-    // A new entry is announced once; a supersede is not. The entry's state does not depend on
-    // the outcome, so a failure only leaves a `notify_failed` line.
-    if held.superseded.is_none() {
-        announce(&app, &ctx, &held.id, &held.digest);
+    // A new entry is announced once. A supersede is not announced in option C. In buttons mode
+    // the newest entry is announced, because the older message's buttons no longer decide
+    // anything. The entry's state does not depend on the outcome, so a failure only leaves a
+    // `notify_failed` line.
+    if held.superseded.is_none() || app.view_base.is_some() {
+        announce(&app, &ctx, &held);
     }
     let mut guard = Guard {
         app: Arc::clone(&app),

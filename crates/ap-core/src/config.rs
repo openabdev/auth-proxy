@@ -200,6 +200,16 @@ pub struct Notify {
     pub chat_id: String,
     /// Base URL the notification link is built from. Same rules as `public_base_url`.
     pub approval_url_base: String,
+    /// Telegram approve and deny buttons, with a no-login one-time view link (stage 2). When
+    /// false, the notification is the option C text and link only.
+    #[serde(default)]
+    pub buttons: bool,
+    /// Telegram user id allowed to press the buttons. Required with `buttons`. Not a secret.
+    #[serde(default)]
+    pub owner_chat_id: Option<i64>,
+    /// Base URL of the one-time view link (`{base}/view/<token>`). Required with `buttons`.
+    #[serde(default)]
+    pub view_base_url: Option<String>,
 }
 
 fn default_caller_key_header() -> String {
@@ -725,6 +735,23 @@ fn validate_notify(n: &Notify) -> Result<(), ConfigError> {
     let p = &n.token_file;
     if !p.starts_with('/') || p.len() > 1024 || p.bytes().any(|b| b == 0) {
         return Err(invalid("notify.token_file must be an absolute path"));
+    }
+    if n.buttons {
+        if !n.owner_chat_id.is_some_and(|id| id > 0) {
+            return Err(invalid(
+                "notify.owner_chat_id must be a positive id when notify.buttons is true",
+            ));
+        }
+        if !n.view_base_url.as_deref().is_some_and(valid_base_url) {
+            return Err(invalid(
+                "notify.view_base_url must be an http(s) URL without userinfo, query or fragment, \
+and is required when notify.buttons is true",
+            ));
+        }
+    } else if n.owner_chat_id.is_some() || n.view_base_url.is_some() {
+        return Err(invalid(
+            "notify.owner_chat_id and notify.view_base_url need notify.buttons = true",
+        ));
     }
     Ok(())
 }
@@ -2160,6 +2187,35 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
         assert_eq!(n.kind, NotifyKind::Telegram);
         assert_eq!(n.chat_id, "-1001234567890");
         assert_eq!(n.token_file, "/etc/ap/telegram-token");
+    }
+
+    #[test]
+    fn notify_buttons_need_owner_and_view_base_and_leftovers_are_refused() {
+        let base = hold_text() + &approval_block();
+        let with_buttons = base.replace(
+            "approval_url_base = \"https://approve.example.test\"\n",
+            "approval_url_base = \"https://approve.example.test\"\nbuttons = true\nowner_chat_id = 176096071\nview_base_url = \"https://view.example.test\"\n",
+        );
+        let n = load(&with_buttons).unwrap().notify.unwrap();
+        assert!(n.buttons);
+        assert_eq!(n.owner_chat_id, Some(176_096_071));
+        for (from, to) in [
+            ("owner_chat_id = 176096071\n", ""),
+            ("owner_chat_id = 176096071\n", "owner_chat_id = 0\n"),
+            ("view_base_url = \"https://view.example.test\"\n", ""),
+            (
+                "view_base_url = \"https://view.example.test\"\n",
+                "view_base_url = \"https://view.example.test/?q=1\"\n",
+            ),
+        ] {
+            let text = with_buttons.replace(from, to);
+            assert!(load(&text).is_err(), "accepted: {to:?}");
+        }
+        let leftover = base.replace(
+            "approval_url_base = \"https://approve.example.test\"\n",
+            "approval_url_base = \"https://approve.example.test\"\nowner_chat_id = 176096071\n",
+        );
+        assert!(load(&leftover).is_err(), "owner id without buttons");
     }
 
     #[test]

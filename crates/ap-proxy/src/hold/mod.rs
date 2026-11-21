@@ -28,8 +28,8 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 pub use entry::{
-    ApproveResult, Confirm, ConfirmTx, Decision, DenyResult, HeldRequest, State, Upstream, View,
-    ViewContent, ViewHeader,
+    ApproveResult, CallbackAction, CallbackRefusal, CallbackTransition, Confirm, ConfirmTx,
+    Decision, DenyResult, HeldRequest, State, Upstream, View, ViewContent, ViewHeader,
 };
 use entry::{Done, Entry};
 
@@ -72,7 +72,6 @@ pub enum Admission {
 }
 
 /// The handler's side of a new entry.
-#[derive(Debug)]
 pub struct Held {
     pub id: String,
     /// Credential-blind digest, as written to the `held` audit record.
@@ -80,6 +79,20 @@ pub struct Held {
     /// Resolves when a transition other than expiry or abandonment wins.
     pub decision: oneshot::Receiver<Decision>,
     pub superseded: Option<String>,
+    /// Secret that a Telegram callback must echo (24 hex). Never printed.
+    pub nonce: String,
+    /// Bearer of the one-time view link (32 hex). Never printed.
+    pub view_token: String,
+}
+
+impl fmt::Debug for Held {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Held")
+            .field("id", &self.id)
+            .field("digest", &self.digest)
+            .field("superseded", &self.superseded)
+            .finish_non_exhaustive()
+    }
 }
 
 struct Inner {
@@ -221,6 +234,8 @@ impl Table {
             }
         }
         let id = digest::random_hex(16);
+        let nonce = digest::random_hex(12);
+        let view_token = digest::random_hex(16);
         if persist(&id, &digest).is_err() {
             return Admission::Refused(Code::AuditUnavailable);
         }
@@ -249,6 +264,8 @@ impl Table {
                 digest: digest.clone(),
                 req,
                 tx: Some(tx),
+                nonce: nonce.clone(),
+                view_token: view_token.clone(),
             },
         );
         Admission::Held(Held {
@@ -256,6 +273,8 @@ impl Table {
             digest,
             decision: rx,
             superseded: duplicate,
+            nonce,
+            view_token,
         })
     }
 
@@ -306,6 +325,11 @@ impl Table {
                 None => return Self::approve_when_decided(&g, id),
             }
         };
+        Self::await_confirm(confirmed).await
+    }
+
+    /// Wait up to [`CONFIRM_TIMEOUT`] for the handler's answer to an approve that already won.
+    pub async fn await_confirm(confirmed: oneshot::Receiver<Confirm>) -> ApproveResult {
         match tokio::time::timeout(CONFIRM_TIMEOUT, confirmed).await {
             Ok(Ok(Confirm::Started)) => ApproveResult::Success,
             Ok(Ok(Confirm::Abandoned)) | Ok(Err(_)) => ApproveResult::ApprovedButAbandoned,
@@ -446,6 +470,95 @@ impl Table {
         Ok(true)
     }
 
+    /// A Telegram callback for `id`. Under one lock: the entry must be `Pending`, `nonce` must
+    /// match its nonce, and for an approve the policy must still hold it (`still_held`, read
+    /// inside the lock as in [`Table::approve_if`]). Any refusal changes nothing, except that a
+    /// failed policy check drops the entry, exactly as the approval page's approve does. A deny
+    /// starts the identity's cooldown, as [`Table::deny`] does.
+    pub fn transition_by_callback(
+        &self,
+        id: &str,
+        nonce: &str,
+        action: CallbackAction,
+        approver: &str,
+        still_held: impl FnOnce(&str, &HeldRequest) -> bool,
+    ) -> CallbackTransition {
+        let mut g = self.lock();
+        let keep = match g.pending.get(id) {
+            None => return CallbackTransition::Refused(CallbackRefusal::NoLiveEntry),
+            Some(e) => {
+                if !digest::ct_eq(&e.nonce, nonce) {
+                    return CallbackTransition::Refused(CallbackRefusal::NonceMismatch);
+                }
+                match action {
+                    CallbackAction::Deny => true,
+                    CallbackAction::Approve => still_held(&e.identity, &e.req),
+                }
+            }
+        };
+        if !keep {
+            if let Some(mut entry) = g.finish(id, State::Dropped, None) {
+                if let Some(tx) = entry.tx.take() {
+                    let _ = tx.send(Decision::Dropped);
+                }
+            }
+            return CallbackTransition::Refused(CallbackRefusal::PolicyChanged);
+        }
+        match action {
+            CallbackAction::Deny => {
+                let Some(mut entry) = g.finish(id, State::Denied, None) else {
+                    return CallbackTransition::Refused(CallbackRefusal::NoLiveEntry);
+                };
+                self.start_cooldown(&mut g, &entry.identity);
+                if let Some(tx) = entry.tx.take() {
+                    let _ = tx.send(Decision::Denied {
+                        approver: approver.to_string(),
+                    });
+                }
+                CallbackTransition::Denied
+            }
+            CallbackAction::Approve => {
+                let Some(mut entry) = g.finish(id, State::Approved, None) else {
+                    return CallbackTransition::Refused(CallbackRefusal::NoLiveEntry);
+                };
+                let (ctx, crx) = oneshot::channel();
+                let decision = Decision::Approved {
+                    approver: approver.to_string(),
+                    confirm: ConfirmTx(ctx),
+                };
+                match entry.tx.take().map(|tx| tx.send(decision)) {
+                    Some(Ok(())) => CallbackTransition::ApproveStarted(crx),
+                    // The handler is already gone, so nothing can be sent.
+                    _ => CallbackTransition::Refused(CallbackRefusal::NoLiveEntry),
+                }
+            }
+        }
+    }
+
+    /// The view of the `Pending` entry whose one-time view token is `token`. Every token is
+    /// compared in constant time and the scan does not stop at a match. An entry that left
+    /// `Pending` no longer holds its token, so an ended hold answers `None`.
+    pub fn view_by_token(&self, token: &str) -> Option<View> {
+        let g = self.lock();
+        let mut hit: Option<String> = None;
+        for (id, e) in &g.pending {
+            if digest::ct_eq(&e.view_token, token) {
+                hit = Some(id.clone());
+            }
+        }
+        let id = hit?;
+        view_in(&g, &id).filter(|v| v.state == State::Pending)
+    }
+
+    /// Test-only: the nonce and view token of a `Pending` entry.
+    #[cfg(test)]
+    pub(crate) fn test_secrets(&self, id: &str) -> Option<(String, String)> {
+        let g = self.lock();
+        g.pending
+            .get(id)
+            .map(|e| (e.nonce.clone(), e.view_token.clone()))
+    }
+
     /// The `Pending` entries in admission order, as the approval API may show them.
     pub fn list(&self) -> Vec<View> {
         let mut ids: Vec<(u64, String)> = {
@@ -462,56 +575,59 @@ impl Table {
     /// What the approval API may show about `id`. Credential header values are left out, and
     /// request content is present only while the entry is `Pending`.
     pub fn view(&self, id: &str) -> Option<View> {
-        let g = self.lock();
-        if let Some(e) = g.pending.get(id) {
-            let req = &e.req;
-            let content_type = req
-                .headers
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-                .map(|(_, v)| String::from_utf8_lossy(v).into_owned());
-            let body_text = String::from_utf8_lossy(&req.body);
-            let body_lossy = std::str::from_utf8(&req.body).is_err();
-            let headers = req
-                .headers
-                .iter()
-                .map(|(n, v)| ViewHeader {
-                    name: n.clone(),
-                    value: if HeldRequest::is_credential(n) {
-                        None
-                    } else {
-                        Some(String::from_utf8_lossy(v).into_owned())
-                    },
-                })
-                .collect();
-            return Some(View {
-                id: id.to_string(),
-                state: State::Pending,
-                identity: e.identity.clone(),
-                superseded_by: None,
-                content: Some(ViewContent {
-                    method: req.method.clone(),
-                    route: req.route.clone(),
-                    upstream: req.upstream.authority(),
-                    path: redact_path(&req.path),
-                    query: req.query.clone(),
-                    content_type,
-                    body_len: req.body.len(),
-                    body_text: body_text.into_owned(),
-                    body_lossy,
-                    digest: e.digest.clone(),
-                    headers,
-                }),
-            });
-        }
-        g.done.get(id).map(|d| View {
-            id: id.to_string(),
-            state: d.state,
-            identity: d.identity.clone(),
-            superseded_by: d.superseded_by.clone(),
-            content: None,
-        })
+        view_in(&self.lock(), id)
     }
+}
+
+fn view_in(g: &Inner, id: &str) -> Option<View> {
+    if let Some(e) = g.pending.get(id) {
+        let req = &e.req;
+        let content_type = req
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| String::from_utf8_lossy(v).into_owned());
+        let body_text = String::from_utf8_lossy(&req.body);
+        let body_lossy = std::str::from_utf8(&req.body).is_err();
+        let headers = req
+            .headers
+            .iter()
+            .map(|(n, v)| ViewHeader {
+                name: n.clone(),
+                value: if HeldRequest::is_credential(n) {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(v).into_owned())
+                },
+            })
+            .collect();
+        return Some(View {
+            id: id.to_string(),
+            state: State::Pending,
+            identity: e.identity.clone(),
+            superseded_by: None,
+            content: Some(ViewContent {
+                method: req.method.clone(),
+                route: req.route.clone(),
+                upstream: req.upstream.authority(),
+                path: redact_path(&req.path),
+                query: req.query.clone(),
+                content_type,
+                body_len: req.body.len(),
+                body_text: body_text.into_owned(),
+                body_lossy,
+                digest: e.digest.clone(),
+                headers,
+            }),
+        });
+    }
+    g.done.get(id).map(|d| View {
+        id: id.to_string(),
+        state: d.state,
+        identity: d.identity.clone(),
+        superseded_by: d.superseded_by.clone(),
+        content: None,
+    })
 }
 
 #[cfg(test)]

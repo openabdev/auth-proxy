@@ -341,6 +341,7 @@ a passthrough-only config has no per-UID rules"
     };
     let approval_cfg = cfg.approval.clone();
     let notify_cfg = cfg.notify.clone();
+    let buttons_on = notify_cfg.as_ref().is_some_and(|n| n.buttons);
     // A panic line carries the source location only, never the payload, which could hold a
     // header value.
     std::panic::set_hook(Box::new(|info| match info.location() {
@@ -355,6 +356,10 @@ a passthrough-only config has no per-UID rules"
         client,
         held_client,
     );
+    // Buttons mode polls Telegram for the owner's presses. The poller is built here and its task
+    // starts below, once the app is shared. Config validation has already required the owner id
+    // and the view base when buttons are on.
+    let mut poller: Option<notify::poll::TelegramPoller> = None;
     if let Some(n) = notify_cfg {
         if approval_cfg.is_none() {
             eprintln!("auth-proxy: [notify] needs an [approval] block to link to");
@@ -367,16 +372,35 @@ a passthrough-only config has no per-UID rules"
                 return 2;
             }
         };
+        let view_base = if n.buttons {
+            n.view_base_url.as_deref()
+        } else {
+            None
+        };
         match notify::TelegramNotifier::new(&token, &n.chat_id) {
-            Ok(nt) => {
-                passthrough::PtApp::set_notifier(&mut app, Arc::new(nt), &n.approval_url_base)
-            }
+            Ok(nt) => passthrough::PtApp::set_notifier(
+                &mut app,
+                Arc::new(nt),
+                &n.approval_url_base,
+                view_base,
+            ),
             Err(e) => {
                 eprintln!("auth-proxy: cannot build the notifier: {e}");
                 return 2;
             }
         }
+        if let Some(owner) = n.owner_chat_id.filter(|_| n.buttons) {
+            match notify::poll::TelegramPoller::new(&token, owner) {
+                Ok(p) => poller = Some(p),
+                Err(e) => {
+                    eprintln!("auth-proxy: cannot build the telegram poller: {e}");
+                    return 2;
+                }
+            }
+        }
     }
+    let poll_task =
+        poller.map(|p| approval::telegram::spawn(Arc::clone(&app.hold), app.policy_source(), p));
     let limits = listener::public::PublicLimits {
         max_connections: pt.max_connections,
         header_read: std::time::Duration::from_secs(pt.header_read_secs),
@@ -394,8 +418,12 @@ a passthrough-only config has no per-UID rules"
     let approval = async {
         match (approval_listener, approval_cfg) {
             (Some(l), Some(cfg)) => {
-                let state =
-                    approval::ApprovalApp::new(Arc::clone(&app.hold), &cfg, app.policy_source());
+                let state = approval::ApprovalApp::new_with_view_links(
+                    Arc::clone(&app.hold),
+                    &cfg,
+                    app.policy_source(),
+                    buttons_on,
+                );
                 listener::approval::serve_approval(l, state, Default::default()).await;
             }
             _ => std::future::pending::<()>().await,
@@ -437,6 +465,10 @@ a passthrough-only config has no per-UID rules"
     // requests already approved run to their end or to `request_deadline_secs`. A second signal
     // ends the wait.
     eprintln!("auth-proxy: shutting down");
+    // No more button presses are read. A press already running meets the closed table.
+    if let Some(task) = &poll_task {
+        task.abort();
+    }
     // The approval future is not polled again, so it accepts nothing more; an approval already
     // accepted meets the closed table at `claim_start`.
     let _ = shutdown.send(true);

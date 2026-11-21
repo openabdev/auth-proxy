@@ -38,15 +38,30 @@ impl fmt::Display for NotifyError {
 
 impl std::error::Error for NotifyError {}
 
+/// The two inline buttons of a notification. Each value is the `callback_data` the button sends
+/// back: a verb character, the request id and the hold's nonce (57 bytes, under Telegram's 64).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Buttons {
+    pub approve: String,
+    pub deny: String,
+}
+
+impl fmt::Debug for Buttons {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Buttons(..)")
+    }
+}
+
 /// Sends one notification about a new held request.
 pub trait Notifier: Send + Sync {
     /// One delivery, with at most one bounded retry inside the implementation. `text` is [`TEXT`];
-    /// `approval_url` points at the entry's page.
+    /// `approval_url` is the link the owner opens; `buttons` adds the inline keyboard.
     fn notify(
         &self,
         request_id: &str,
         text: &str,
         approval_url: &str,
+        buttons: Option<&Buttons>,
     ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + '_>>;
 }
 
@@ -111,6 +126,15 @@ pub fn read_secret_file(path: &Path) -> Result<String, SecretError> {
     Ok(text.to_string())
 }
 
+/// Whether `token` has the shape of a Bot API token. It goes into a URL path, so a `/`, `?` or
+/// `#` in it could change the route.
+pub(crate) fn valid_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b':' || b == b'_' || b == b'-')
+}
+
 /// Why one attempt failed. `Transport` covers every error from `send()` (connect, timeout, reset,
 /// or a lost reply) and gets one retry. The retry can duplicate a message the first attempt
 /// delivered; that risk is accepted. `Rejected` is a reply that is not 2xx and is never retried.
@@ -149,11 +173,7 @@ impl TelegramNotifier {
         chat_id: &str,
         timeout: Duration,
     ) -> Result<Self, NotifyError> {
-        let valid_token = !token.is_empty()
-            && token
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b':' || b == b'_' || b == b'-');
-        if !valid_token || chat_id.is_empty() {
+        if !valid_token(token) || chat_id.is_empty() {
             return Err(NotifyError);
         }
         // `no_proxy` also turns off system proxy detection: the token-bearing URL goes to the
@@ -196,12 +216,21 @@ impl Notifier for TelegramNotifier {
         request_id: &str,
         text: &str,
         approval_url: &str,
+        buttons: Option<&Buttons>,
     ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + '_>> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": format!("{text}\nRequest: {request_id}\n{approval_url}"),
             "link_preview_options": { "is_disabled": true },
         });
+        if let Some(b) = buttons {
+            body["reply_markup"] = serde_json::json!({
+                "inline_keyboard": [[
+                    { "text": "Approve", "callback_data": b.approve },
+                    { "text": "Deny", "callback_data": b.deny },
+                ]],
+            });
+        }
         let body = match serde_json::to_vec(&body) {
             Ok(b) => b,
             Err(_) => return Box::pin(async { Err(NotifyError) }),
@@ -220,6 +249,8 @@ impl Notifier for TelegramNotifier {
 #[cfg(test)]
 pub(crate) struct MockNotifier {
     pub calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    /// Whether each call carried buttons, in call order.
+    pub with_buttons: std::sync::Mutex<Vec<bool>>,
     pub fail: std::sync::atomic::AtomicBool,
 }
 
@@ -228,6 +259,7 @@ impl MockNotifier {
     pub fn new(fail: bool) -> std::sync::Arc<MockNotifier> {
         std::sync::Arc::new(MockNotifier {
             calls: std::sync::Mutex::default(),
+            with_buttons: std::sync::Mutex::default(),
             fail: std::sync::atomic::AtomicBool::new(fail),
         })
     }
@@ -244,12 +276,14 @@ impl Notifier for MockNotifier {
         request_id: &str,
         text: &str,
         approval_url: &str,
+        buttons: Option<&Buttons>,
     ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + '_>> {
         self.calls.lock().unwrap().push((
             request_id.to_string(),
             text.to_string(),
             approval_url.to_string(),
         ));
+        self.with_buttons.lock().unwrap().push(buttons.is_some());
         let fail = self.fail.load(std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
             if fail {
@@ -261,5 +295,9 @@ impl Notifier for MockNotifier {
     }
 }
 
+pub mod poll;
+
+#[cfg(test)]
+mod poll_tests;
 #[cfg(test)]
 mod tests;

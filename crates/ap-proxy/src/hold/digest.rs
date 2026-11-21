@@ -67,6 +67,16 @@ pub fn audit_digest(req: &HeldRequest) -> String {
     hex(&Sha256::digest(encode(req, true)))
 }
 
+/// Equality of two secrets without an early exit on the first differing byte. A length mismatch
+/// answers `false` at once; the lengths here are fixed by the format, so that reveals nothing.
+pub fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Random lowercase hex of `n` bytes, from the operating system.
 pub fn random_hex(n: usize) -> String {
     let mut buf = vec![0u8; n];
@@ -253,6 +263,14 @@ mod tests {
         let shown = format!("{f:?} {fp:?}");
         assert!(!shown.contains(&f.hex_for_test()));
         assert_eq!(shown, "Fingerprint(..) Fingerprinter(..)");
+    }
+
+    #[test]
+    fn ct_eq_compares_whole_values() {
+        assert!(ct_eq("abc", "abc"));
+        assert!(!ct_eq("abc", "abd"));
+        assert!(!ct_eq("abc", "ab"));
+        assert!(!ct_eq("", "a"));
     }
 
     #[test]

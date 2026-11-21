@@ -16,7 +16,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::*;
+use crate::approval::telegram::decide;
+use crate::hold::{CallbackAction, HeldRequest, State, Table};
 use crate::listener::approval::{serve_approval, ApprovalLimits};
+use crate::notify::poll::{callback_data, parse_update, Callback, Update, NOT_AUTHORISED};
 use crate::passthrough::{self, PtApp};
 use crate::test_support::{buffer_sink, caller_key, client_for, start_upstream, Scratch, HOST};
 
@@ -133,6 +136,26 @@ impl Env {
     }
 
     async fn with(tag: &str, delay: Duration, limits: ApprovalLimits) -> Env {
+        Self::with_views_flag(tag, delay, limits, false).await
+    }
+
+    /// The same listener with the Telegram view route on.
+    async fn with_views(tag: &str) -> Env {
+        Self::with_views_flag(
+            tag,
+            Duration::from_millis(1),
+            ApprovalLimits::default(),
+            true,
+        )
+        .await
+    }
+
+    async fn with_views_flag(
+        tag: &str,
+        delay: Duration,
+        limits: ApprovalLimits,
+        view_links: bool,
+    ) -> Env {
         let up = start_upstream().await;
         let s = Scratch::new(tag);
         let key = caller_key();
@@ -189,8 +212,13 @@ path_patterns = ["/hold/*", "/webhooks/*/*"]
         let approval = cfg.approval.clone().expect("approval block");
         let (sink, audit) = buffer_sink();
         let app = PtApp::new(policy, cfg, &text, sink, client_for(&up));
-        let state =
-            ApprovalApp::build(Arc::clone(&app.hold), &approval, delay, app.policy_source());
+        let state = ApprovalApp::build(
+            Arc::clone(&app.hold),
+            &approval,
+            delay,
+            app.policy_source(),
+            view_links,
+        );
         let l = crate::listener::bind_loopback("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
@@ -958,4 +986,276 @@ async fn approving_after_the_hold_grant_is_removed_is_refused_and_sends_nothing(
     assert!(String::from_utf8_lossy(&body).contains("dropped_on_reload"));
     assert_eq!(env.upstream_hits(), 0);
     assert!(env.audit_text().contains("dropped_on_reload"));
+}
+
+// ---------------------------------------------------------- Telegram buttons and view links
+
+const OWNER: i64 = 4242;
+const WRONG_NONCE: &str = "ffffffffffffffffffffffff";
+
+/// One owner press through the same decision the poller runs. Waits for the handler's
+/// confirmation of an approve, so the upstream count is settled when this returns.
+async fn press(env: &Env, action: CallbackAction, id: &str, nonce: &str) -> &'static str {
+    let policy = env.app.policy_source();
+    let check = move |identity: &str, req: &HeldRequest| {
+        policy().is_some_and(|s| crate::passthrough::still_held(&s, identity, req))
+    };
+    let cb = Callback {
+        callback_id: "cbq".into(),
+        action,
+        request_id: id.into(),
+        nonce: nonce.into(),
+    };
+    let out = decide(&env.app.hold, check, &cb);
+    if let Some(rx) = out.confirm {
+        Table::await_confirm(rx).await;
+    }
+    out.reply
+}
+
+fn nonce_of(env: &Env, id: &str) -> String {
+    env.app.hold.test_secrets(id).expect("pending").0
+}
+
+fn view_token_of(env: &Env, id: &str) -> String {
+    env.app.hold.test_secrets(id).expect("pending").1
+}
+
+fn owner_update(data: &str, from: i64) -> serde_json::Value {
+    serde_json::json!({
+        "update_id": 1,
+        "callback_query": { "id": "cbq", "from": { "id": from }, "data": data }
+    })
+}
+
+#[tokio::test]
+async fn callback_from_another_chat_is_refused_and_changes_nothing() {
+    let env = Env::new("tg-other-chat").await;
+    let (_h, id) = env.hold("/discord/hold/1", br#"{"a":1}"#).await;
+    let data = callback_data(CallbackAction::Approve, &id, &nonce_of(&env, &id));
+    let got = parse_update(&owner_update(&data, OWNER + 1), OWNER);
+    assert!(
+        matches!(got, Some(Update::Refused { reply, .. }) if reply == NOT_AUTHORISED),
+        "{got:?}"
+    );
+    assert_eq!(env.app.hold.state(&id), Some(State::Pending));
+    assert_eq!(env.app.hold.pending_len(), 1);
+    assert_eq!(env.upstream_hits(), 0);
+}
+
+#[tokio::test]
+async fn wrong_nonce_is_refused_and_the_hold_stays_pending() {
+    let env = Env::new("tg-wrong-nonce").await;
+    let (h, id) = env.hold("/discord/hold/1", br#"{"a":1}"#).await;
+    assert_eq!(
+        press(&env, CallbackAction::Approve, &id, WRONG_NONCE).await,
+        "No longer waiting"
+    );
+    assert_eq!(env.app.hold.state(&id), Some(State::Pending));
+    assert_eq!(env.upstream_hits(), 0);
+    // The right nonce still decides it.
+    let nonce = nonce_of(&env, &id);
+    assert_eq!(
+        press(&env, CallbackAction::Approve, &id, &nonce).await,
+        "Approved"
+    );
+    let (p, _) = h.await.unwrap().expect("answer");
+    assert_eq!(p.status.as_u16(), 200);
+    assert_eq!(env.upstream_hits(), 1);
+}
+
+#[tokio::test]
+async fn stale_nonce_after_the_hold_ended_is_refused() {
+    let env = Env::new("tg-stale-nonce").await;
+    let (h, id) = env.hold("/discord/hold/1", br#"{"a":1}"#).await;
+    let nonce = nonce_of(&env, &id);
+    assert_eq!(
+        press(&env, CallbackAction::Deny, &id, &nonce).await,
+        "Denied"
+    );
+    assert_eq!(
+        press(&env, CallbackAction::Approve, &id, &nonce).await,
+        "No longer waiting"
+    );
+    assert_eq!(env.app.hold.state(&id), Some(State::Denied));
+    let _ = h.await;
+    assert_eq!(env.upstream_hits(), 0);
+}
+
+#[tokio::test]
+async fn second_callback_after_the_first_decision_is_refused_and_does_nothing() {
+    let env = Env::new("tg-second").await;
+    let (h, id) = env.hold("/discord/hold/1", br#"{"a":1}"#).await;
+    let nonce = nonce_of(&env, &id);
+    assert_eq!(
+        press(&env, CallbackAction::Approve, &id, &nonce).await,
+        "Approved"
+    );
+    assert_eq!(
+        press(&env, CallbackAction::Deny, &id, &nonce).await,
+        "No longer waiting"
+    );
+    assert_eq!(
+        press(&env, CallbackAction::Approve, &id, &nonce).await,
+        "No longer waiting"
+    );
+    let (p, _) = h.await.unwrap().expect("answer");
+    assert_eq!(p.status.as_u16(), 200);
+    assert_eq!(env.upstream_hits(), 1, "one forward, never two");
+    let audit = env.audit_text();
+    assert!(audit.contains(r#""approver":"telegram-owner""#), "{audit}");
+    assert!(!audit.contains("4242"), "the owner id reached the audit");
+}
+
+#[tokio::test]
+async fn approve_after_expiry_is_refused_and_nothing_is_forwarded() {
+    let env = Env::new("tg-expired").await;
+    let (h, id) = env.hold("/discord/hold/1", br#"{"a":1}"#).await;
+    let nonce = nonce_of(&env, &id);
+    // What the hold timer does when `hold_secs` runs out.
+    assert!(env.app.hold.expire(&id));
+    assert_eq!(
+        press(&env, CallbackAction::Approve, &id, &nonce).await,
+        "No longer waiting"
+    );
+    assert_eq!(env.app.hold.state(&id), Some(State::Expired));
+    let _ = h.await;
+    assert_eq!(env.upstream_hits(), 0);
+    assert!(!env.audit_text().contains("forward_started"));
+}
+
+#[tokio::test]
+async fn callback_approve_runs_the_start_claim_and_token_identity_recheck() {
+    let env = Env::new("tg-recheck").await;
+    let (h, id) = env.hold("/discord/hold/1", br#"{"a":1}"#).await;
+    let nonce = nonce_of(&env, &id);
+    // The approve transition succeeds under the policy in force. The handler then stops at the
+    // point after the approve and before its start claim. The owner removes the hold grant and
+    // the reload lands there, so the claim must refuse and nothing is forwarded.
+    let gate = crate::passthrough::pause::Gate::new();
+    env.app.pause.set_after_approve(Arc::clone(&gate));
+    let cb = Callback {
+        callback_id: "cbq".into(),
+        action: CallbackAction::Approve,
+        request_id: id.clone(),
+        nonce: nonce.clone(),
+    };
+    let policy_src = env.app.policy_source();
+    let check = move |identity: &str, req: &HeldRequest| {
+        policy_src().is_some_and(|s| crate::passthrough::still_held(&s, identity, req))
+    };
+    let out = decide(&env.app.hold, check, &cb);
+    assert_eq!(out.reply, "Approved");
+    let confirm = tokio::spawn(Table::await_confirm(out.confirm.expect("approve started")));
+    tokio::time::timeout(Duration::from_secs(5), gate.arrived())
+        .await
+        .expect("the handler reached the point before the start claim");
+    let policy = env._s.path().join("policy.toml");
+    let text = std::fs::read_to_string(&policy).unwrap();
+    let cut = text
+        .find("[[grant]]\nidentity = \"muse-pilot\"\nroute = \"discord\"\nmethods = [\"POST\"]")
+        .unwrap();
+    std::fs::write(&policy, &text[..cut]).unwrap();
+    env.app.reload_tick();
+    gate.release();
+    assert_eq!(
+        confirm.await.unwrap(),
+        crate::hold::ApproveResult::PolicyChanged
+    );
+    let (p, body) = h.await.unwrap().expect("answer");
+    assert_eq!(p.status.as_u16(), 503);
+    assert!(String::from_utf8_lossy(&body).contains("dropped_on_reload"));
+    // `upstream_hits` counts accepted TCP connections, and the hold path may open one before its
+    // claim refuses. The request itself is gated by the claim's `forward_started` write, so that
+    // line is the check that no byte went upstream.
+    assert!(!env.audit_text().contains("forward_started"));
+    assert!(env.audit_text().contains("dropped_on_reload"));
+}
+
+#[tokio::test]
+async fn view_token_serves_the_redacted_page_while_live_and_404_after_each_end() {
+    let env = Env::with_views("tg-view").await;
+    let unknown = send(
+        env.addr,
+        &request("GET", &format!("/view/{}", "0".repeat(32)), "", ""),
+    )
+    .await;
+    assert_eq!(unknown.status, 404);
+
+    let mut ended = Vec::new();
+    for (n, end) in ["approve", "deny", "expire", "drop"]
+        .into_iter()
+        .enumerate()
+    {
+        let body = format!(r#"{{"n":{n}}}"#);
+        let (h, id) = env
+            .hold(
+                "/discord/hold/1",
+                Box::leak(body.into_bytes().into_boxed_slice()),
+            )
+            .await;
+        let token = view_token_of(&env, &id);
+        assert_eq!(token.len(), 32);
+        // No login: the view link works with no Authorization header.
+        let live = send(env.addr, &request("GET", &format!("/view/{token}"), "", "")).await;
+        assert_eq!(live.status, 200, "{}", live.body);
+        assert!(live.body.contains("discord"), "redacted route shown");
+        assert!(live.header("set-cookie").is_none(), "no cookie");
+        assert!(!live.body.contains("csrf") && !live.body.contains("<form"));
+        live.assert_hardened("view");
+        let nonce = nonce_of(&env, &id);
+        match end {
+            "approve" => assert_eq!(
+                press(&env, CallbackAction::Approve, &id, &nonce).await,
+                "Approved"
+            ),
+            "deny" => assert_eq!(
+                press(&env, CallbackAction::Deny, &id, &nonce).await,
+                "Denied"
+            ),
+            "expire" => assert!(env.app.hold.expire(&id)),
+            _ => {
+                env.app.hold.drop_all();
+            }
+        }
+        let _ = h.await;
+        let gone = send(env.addr, &request("GET", &format!("/view/{token}"), "", "")).await;
+        assert_eq!(gone.status, 404, "after {end}");
+        assert_eq!(
+            gone.body, unknown.body,
+            "after {end}: same 404 as an unknown token"
+        );
+        assert_eq!(gone.status, unknown.status);
+        ended.push(token);
+    }
+    // The token never reaches the audit stream, and a live token never appeared there either.
+    let audit = env.audit_text();
+    for t in ended {
+        assert!(!audit.contains(&t), "view token written to audit");
+    }
+}
+
+#[tokio::test]
+async fn view_links_off_have_no_view_route_and_pending_keeps_basic_auth() {
+    let off = Env::new("tg-views-off").await;
+    let (_h, id) = off.hold("/discord/hold/1", br#"{"a":1}"#).await;
+    let token = view_token_of(&off, &id);
+    let anon = send(off.addr, &request("GET", &format!("/view/{token}"), "", "")).await;
+    assert_eq!(anon.status, 401, "no view route when buttons are off");
+    let authed = off.get(&format!("/view/{token}"), "").await;
+    assert_eq!(authed.status, 404);
+
+    let on = Env::with_views("tg-views-auth").await;
+    let (_h2, id2) = on.hold("/discord/hold/1", br#"{"a":1}"#).await;
+    let no_auth = send(on.addr, &request("GET", &format!("/pending/{id2}"), "", "")).await;
+    assert_eq!(
+        no_auth.status, 401,
+        "the decision page still needs Basic auth"
+    );
+    let with_auth = on.get(&format!("/pending/{id2}"), "").await;
+    assert_eq!(with_auth.status, 200);
+    assert!(
+        with_auth.body.contains("name=\"csrf\""),
+        "the decision page keeps its forms"
+    );
 }

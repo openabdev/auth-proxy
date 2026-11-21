@@ -15,6 +15,7 @@
 pub mod auth;
 pub mod csrf;
 pub mod page;
+pub mod telegram;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +44,8 @@ pub struct ApprovalApp {
     csrf: csrf::Csrf,
     realm: String,
     fail_delay: Duration,
+    /// Serve `GET /view/<token>` without Basic auth. Set only when the Telegram buttons are on.
+    view_links: bool,
 }
 
 impl std::fmt::Debug for ApprovalApp {
@@ -56,7 +59,18 @@ pub type PolicySource = Arc<dyn Fn() -> Option<Arc<ap_core::policy::Snapshot>> +
 
 impl ApprovalApp {
     pub fn new(table: Arc<Table>, cfg: &Approval, policy: PolicySource) -> Arc<ApprovalApp> {
-        Self::build(table, cfg, FAIL_DELAY, policy)
+        Self::build(table, cfg, FAIL_DELAY, policy, false)
+    }
+
+    /// Like [`ApprovalApp::new`], and with `view_links` also serves the no-login one-time view
+    /// route (`/view/<token>`). The route is tailnet-only with the rest of this listener.
+    pub fn new_with_view_links(
+        table: Arc<Table>,
+        cfg: &Approval,
+        policy: PolicySource,
+        view_links: bool,
+    ) -> Arc<ApprovalApp> {
+        Self::build(table, cfg, FAIL_DELAY, policy, view_links)
     }
 
     fn build(
@@ -64,6 +78,7 @@ impl ApprovalApp {
         cfg: &Approval,
         fail_delay: Duration,
         policy: PolicySource,
+        view_links: bool,
     ) -> Arc<ApprovalApp> {
         Arc::new(ApprovalApp {
             table,
@@ -72,6 +87,7 @@ impl ApprovalApp {
             csrf: csrf::Csrf::new(),
             realm: cfg.realm.clone(),
             fail_delay,
+            view_links,
         })
     }
 
@@ -195,6 +211,15 @@ fn valid_id(s: &str) -> bool {
 async fn route(app: &ApprovalApp, req: Request<Body>) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let json_wanted = wants_json(&parts.headers);
+    // The one-time view link needs no login. Its token is the only credential, and only a
+    // `Pending` hold has one, so the answer is the same 404 for an unknown or ended token.
+    if app.view_links && parts.method == Method::GET {
+        if let Some(token) = parts.uri.path().strip_prefix("/view/") {
+            if !token.contains('/') {
+                return view_by_token(app, token);
+            }
+        }
+    }
     let Some(approver) = app.creds.authenticate(&parts.headers) else {
         tokio::time::sleep(app.fail_delay).await;
         return unauthorized(app, json_wanted);
@@ -246,6 +271,14 @@ fn show(app: &ApprovalApp, id: &str, json_wanted: bool) -> Response<Body> {
         json_response(StatusCode::OK, &page::entry_json(&view, token.as_deref()))
     } else {
         html_response(StatusCode::OK, page::entry(&view, token.as_deref()))
+    }
+}
+
+/// The read-only page for a `Pending` hold, or the generic 404.
+fn view_by_token(app: &ApprovalApp, token: &str) -> Response<Body> {
+    match app.table.view_by_token(token) {
+        Some(view) => html_response(StatusCode::OK, page::view_only(&view)),
+        None => result(StatusCode::NOT_FOUND, false, "not_found", None),
     }
 }
 
@@ -378,5 +411,7 @@ fn deny_outcome(r: DenyResult) -> (StatusCode, &'static str, Option<String>) {
     }
 }
 
+#[cfg(test)]
+mod telegram_tests;
 #[cfg(test)]
 mod tests;

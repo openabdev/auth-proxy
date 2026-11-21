@@ -34,6 +34,7 @@ use ap_broker::clock::ManualClock;
 use ap_broker::registry::sha256_hex;
 
 const NOTIFY_BASE: &str = "https://approve.example.test/";
+const VIEW_BASE: &str = "https://view.example.test";
 const AUTH: &str = "gate.example.test";
 const SENTINEL: &str = "SENTINEL-DISCORD-TOKEN-0001";
 const PATH_TOKEN: &str = "SENTINEL-PATH-TOKEN-0002";
@@ -252,6 +253,8 @@ struct Opts {
     port: Option<u16>,
     sink: Option<Switch>,
     notifier: Option<Arc<MockNotifier>>,
+    /// Telegram buttons mode: the view link and the buttons.
+    buttons: bool,
 }
 
 impl Default for Opts {
@@ -269,6 +272,7 @@ impl Default for Opts {
             port: None,
             sink: None,
             notifier: None,
+            buttons: false,
         }
     }
 }
@@ -366,7 +370,8 @@ path_patterns = ["/hold/*"]
             o.limits,
         );
         if let Some(n) = &o.notifier {
-            PtApp::set_notifier(&mut app, n.clone(), NOTIFY_BASE);
+            let view = o.buttons.then_some(VIEW_BASE);
+            PtApp::set_notifier(&mut app, n.clone(), NOTIFY_BASE, view);
         }
         Ht {
             app,
@@ -2950,6 +2955,45 @@ async fn pilot_hold_admitted_before_a_token_rotation_is_not_forwarded_after_it()
 }
 
 #[tokio::test]
+async fn pilot_callback_approve_is_not_forwarded_when_the_token_rotates_before_the_claim() {
+    let mock = Mock::start().await;
+    let (t, _clock) = pilot_ht("pilot-cb-rotate", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    let (nonce, _) = t.app.hold.test_secrets(&id).expect("pending");
+    let gate = Gate::new();
+    t.app.pause.set_after_approve(Arc::clone(&gate));
+    // The callback approve transition runs under the token identity in force, so it starts.
+    let started = t.app.hold.transition_by_callback(
+        &id,
+        &nonce,
+        crate::hold::CallbackAction::Approve,
+        "telegram-owner",
+        |identity: &str, req: &crate::hold::HeldRequest| t.app.still_holds(identity, req),
+    );
+    let crate::hold::CallbackTransition::ApproveStarted(rx) = started else {
+        panic!("the callback approve did not start");
+    };
+    let confirm = tokio::spawn(crate::hold::Table::await_confirm(rx));
+    tokio::time::timeout(Duration::from_secs(5), gate.arrived())
+        .await
+        .expect("the handler reached the point before the start claim");
+    // The operator rotates the token hash before the claim reads the policy.
+    t.rewrite(|s| s.replacen(&sha256_hex(PILOT_AUTH), &sha256_hex(PILOT_ROTATED_AUTH), 1));
+    t.app.reload_tick();
+    gate.release();
+    assert_eq!(confirm.await.unwrap(), ApproveResult::PolicyChanged);
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 503, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(code(&b), "dropped_on_reload");
+    assert_eq!(t.count("forward_started"), 0);
+    assert!(
+        mock.recorded().is_empty(),
+        "the upstream received a request after the rotation"
+    );
+}
+
+#[tokio::test]
 async fn pilot_hold_admitted_with_a_token_is_not_forwarded_once_a_keyed_identity_takes_its_name() {
     let mock = Mock::start().await;
     let (t, _clock) = pilot_ht("pilot-mode", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
@@ -3037,4 +3081,50 @@ async fn pilot_token_echoed_in_the_path_or_query_is_refused_before_any_hold() {
     for needle in [PILOT_TOKEN, encoded.as_str()] {
         assert!(!audit.contains(needle), "{needle} reached the audit stream");
     }
+}
+
+#[tokio::test]
+async fn buttons_mode_renotifies_the_newest_entry_on_supersede() {
+    let mock = Mock::start().await;
+    let n = MockNotifier::new(false);
+    let o = Opts {
+        notifier: Some(Arc::clone(&n)),
+        buttons: true,
+        ..Opts::default()
+    };
+    let t = Ht::with("notify-buttons-supersede", &mock.up, o).await;
+    let path = format!("/discord/hold/ok?channel=SENTINEL-CHANNEL-0003&{PATH_TOKEN}=1");
+    let body = r#"{"content":"SENTINEL-BODY-0004"}"#;
+    let _first = t.spawn(t.post(&path, body));
+    let _id1 = t.held(1).await;
+    calls_reach(&n, 1).await;
+    // The first message's buttons are dead once superseded, so the newest entry is announced.
+    let _second = t.spawn(t.post(&path, body));
+    let id2 = t.held(2).await;
+    calls_reach(&n, 2).await;
+    let calls = n.calls();
+    assert_eq!(calls[1].0, id2, "the newest entry is announced");
+    assert_eq!(*n.with_buttons.lock().unwrap(), vec![true, true]);
+}
+
+#[tokio::test]
+async fn buttons_mode_link_is_the_view_token_not_the_request_id() {
+    let mock = Mock::start().await;
+    let n = MockNotifier::new(false);
+    let o = Opts {
+        notifier: Some(Arc::clone(&n)),
+        buttons: true,
+        ..Opts::default()
+    };
+    let t = Ht::with("notify-buttons-link", &mock.up, o).await;
+    let _first = t.spawn(t.post("/discord/hold/ok", r#"{"x":1}"#));
+    let id = t.held(1).await;
+    calls_reach(&n, 1).await;
+    let link = n.calls()[0].2.clone();
+    let token = link
+        .strip_prefix(&format!("{VIEW_BASE}/view/"))
+        .expect("view link");
+    assert_eq!(token.len(), 32);
+    assert_ne!(token, id);
+    assert!(!link.contains(&id), "the link must not name the request id");
 }

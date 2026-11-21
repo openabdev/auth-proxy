@@ -70,6 +70,9 @@ pub struct PtApp {
     /// `[approval].public_base_url` without a trailing slash: the notification link is
     /// `{approval_base}/pending/{id}`.
     pub(crate) approval_base: Option<String>,
+    /// Telegram buttons mode: `Some(base)` makes the notification link `{base}/view/<token>` (the
+    /// no-login one-time view) and sends the approve and deny buttons. `None` is option C.
+    pub(crate) view_base: Option<String>,
     /// Source of "now" for the option B pilot expiry (design 4.5). Tests replace it.
     pub(crate) clock: Arc<dyn Clock + Send + Sync>,
     #[cfg(any(test, feature = "matrix-upstream"))]
@@ -115,12 +118,20 @@ impl PtApp {
         )
     }
 
-    /// Announce new hold entries through `notifier`, linking to `{base}/pending/{id}`. Called
-    /// right after construction, while this is the only handle.
-    pub(crate) fn set_notifier(app: &mut Arc<PtApp>, notifier: Arc<dyn Notifier>, base: &str) {
+    /// Announce new hold entries through `notifier`. Without `view_base` the link is
+    /// `{base}/pending/{id}` (option C). With `view_base` the message carries the approve and
+    /// deny buttons and the link is `{view_base}/view/{token}`. Called right after construction,
+    /// while this is the only handle.
+    pub(crate) fn set_notifier(
+        app: &mut Arc<PtApp>,
+        notifier: Arc<dyn Notifier>,
+        base: &str,
+        view_base: Option<&str>,
+    ) {
         let inner = Arc::get_mut(app).expect("notifier is set before the app is shared");
         inner.notifier = Some(notifier);
         inner.approval_base = Some(base.trim_end_matches('/').to_string());
+        inner.view_base = view_base.map(|v| v.trim_end_matches('/').to_string());
     }
 
     /// Replace the clock that the option B pilot expiry reads. Called right after construction,
@@ -179,6 +190,7 @@ impl PtApp {
             hold: Arc::new(hold::Table::new(limits)),
             notifier: None,
             approval_base: None,
+            view_base: None,
             clock: Arc::new(SystemClock),
             #[cfg(any(test, feature = "matrix-upstream"))]
             pause: pause::Pause::new(),

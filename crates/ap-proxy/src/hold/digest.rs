@@ -148,6 +148,7 @@ mod tests {
                 ("content-type".into(), b"application/json".to_vec()),
                 ("x-api-key".into(), b"KEY-ONE".to_vec()),
             ],
+            token_admitted: false,
             body: Bytes::from_static(b"{\"content\":\"hi\"}"),
         }
     }

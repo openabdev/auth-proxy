@@ -2685,6 +2685,7 @@ const PILOT_NAME: &str = "muse-pilot-b";
 const PILOT_TOKEN: &str = "SENTINEL-PILOT-TOKEN-0003";
 const PILOT_AUTH: &str = "Bot SENTINEL-PILOT-TOKEN-0003";
 const PILOT_ROTATED_AUTH: &str = "Bot SENTINEL-PILOT-TOKEN-0004";
+const PILOT_KEYED_CALLER: &str = "SENTINEL-PILOT-KEYED-CALLER-0005";
 const PILOT_WRITE: &str = "/discord/hold/ok/messages";
 /// 2026-12-20T00:00:00Z, the first second of the last valid day.
 const PILOT_LAST_DAY: u64 = 1_797_724_800;
@@ -2945,6 +2946,45 @@ async fn pilot_hold_admitted_before_a_token_rotation_is_not_forwarded_after_it()
     assert!(
         mock.recorded().is_empty(),
         "the upstream received a request after the rotation"
+    );
+}
+
+#[tokio::test]
+async fn pilot_hold_admitted_with_a_token_is_not_forwarded_once_a_keyed_identity_takes_its_name() {
+    let mock = Mock::start().await;
+    let (t, _clock) = pilot_ht("pilot-mode", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    // Admitted with the token, so the held entry is a token-admitted hold.
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    // The token identity is replaced by a keyed identity of the same name. The route and the
+    // hold grant stay as they were.
+    t.rewrite(|s| {
+        s.replacen(
+            &format!(
+                "[[token_identity]]\nname = \"{PILOT_NAME}\"\nroute = \"discord\"\n\
+                 token_sha256 = \"{}\"\nexpires = \"2026-12-20\"",
+                sha256_hex(PILOT_AUTH)
+            ),
+            &format!(
+                "[[identity]]\nname = \"{PILOT_NAME}\"\ncaller_key_sha256 = \"{}\"",
+                sha256_hex(PILOT_KEYED_CALLER)
+            ),
+            1,
+        )
+    });
+    assert_eq!(
+        t.approve_checked(&id).await,
+        ApproveResult::PolicyChanged,
+        "a token-admitted hold must not survive its token identity being replaced"
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 503, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(code(&b), "dropped_on_reload");
+    assert_eq!(t.count("forward_started"), 0);
+    assert_eq!(t.count("dropped_on_reload"), 1);
+    assert!(
+        mock.recorded().is_empty(),
+        "the upstream received a request after the token identity was replaced"
     );
 }
 

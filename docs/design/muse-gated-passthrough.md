@@ -689,7 +689,8 @@ fails closed at load. The pilot policy sets `expires = "2026-12-20"`, so B reque
 claim, so a request held before the cutoff and approved after it is not forwarded. The start claim also
 checks that the held `Authorization` still hashes to the current `token_sha256`. If the operator rotates the
 hash, every hold admitted with the old token is refused at approval with `dropped_on_reload` (503), and
-nothing is forwarded.
+nothing is forwarded. The same holds when the token identity is replaced by a keyed identity of the same
+name: a hold admitted with the token records that mode at admission and is refused the same way.
 
 **Identity rule.**
 
@@ -698,10 +699,10 @@ nothing is forwarded.
 - The identity label used in grants, holds and audit records is the configured `name`. The hash is not the
   label, so audit records carry no hash prefix. This section is the only place that rule is written down, and
   it allows no hash in audit, logs, error bodies, notifications or the approval page.
-- The token, its hash, and any prefix of either never appear in an audit record, a log line, an error body or
-  a notification. The tests in `hold_tests.rs` check the audit stream and the error bodies on the held,
-  approved, wrong-token, missing-token and expired paths; the echoed-token test checks the audit stream only.
-  They do not capture tracing output or the notifier text.
+- The token, its hash, and any prefix of either never appear in an audit record or an error body. The tests in
+  `hold_tests.rs` check the audit stream and the error bodies on the held, approved, wrong-token,
+  missing-token and expired paths; the echoed-token test checks the audit stream only. No regression test
+  captures tracing output or notifier text, so this section makes no tested claim about those surfaces.
 - Config validation refuses a second token identity anywhere in the policy, whatever its route, so the
   one-caller and one-route limit is enforced at load, not only by convention.
 

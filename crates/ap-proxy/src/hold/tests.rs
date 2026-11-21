@@ -47,6 +47,7 @@ fn req(auth: &str, body: &str) -> Arc<HeldRequest> {
             ("x-api-key".into(), SECRET_KEY.as_bytes().to_vec()),
         ],
         body: Bytes::copy_from_slice(body.as_bytes()),
+        token_admitted: false,
     })
 }
 

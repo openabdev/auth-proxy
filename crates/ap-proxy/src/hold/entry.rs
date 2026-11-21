@@ -63,6 +63,10 @@ pub struct HeldRequest {
     /// lowercase.
     pub headers: Vec<(String, Vec<u8>)>,
     pub body: Bytes,
+    /// Whether admission took the option B token path (design 4.5), fixed at admission. A
+    /// token-admitted hold is claimed only while a token identity of the same name still carries
+    /// the held token.
+    pub token_admitted: bool,
 }
 
 impl HeldRequest {

@@ -375,10 +375,12 @@ fn token_expired(cfg: &Config, identity: &str, now: u64) -> bool {
 
 /// Whether a token identity's held request still carries the token the policy binds to it. The
 /// held `Authorization` value must be the only one and hash, as admission hashed it, to the
-/// identity's current `token_sha256`. A keyed identity has no token, so it passes.
+/// identity's current `token_sha256`. A keyed hold has no token identity and passes, unless it was
+/// admitted with a token: then the token identity must still exist under the same name, or the
+/// hold is refused.
 fn token_bound(cfg: &Config, identity: &str, req: &hold::HeldRequest) -> bool {
     let Some(token) = cfg.token_identities.iter().find(|t| t.name == identity) else {
-        return true;
+        return !req.token_admitted;
     };
     let mut values = req
         .headers
@@ -707,6 +709,7 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
             rel: &rel,
             identity: &identity_name,
             drain,
+            token_admitted: pilot,
         })
         .await;
     }

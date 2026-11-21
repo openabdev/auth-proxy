@@ -570,6 +570,51 @@ async fn the_pages_hide_the_view_token_nonce_caller_key_and_credential_hashes() 
 }
 
 #[tokio::test]
+async fn a_decoded_message_page_shows_the_text_and_no_secret() {
+    let env = Env::with_views("page-decoded").await;
+    let (_h, id) = env
+        .hold(
+            "/discord/hold/1",
+            br#"{"content":"Stage 2 gate test \uff5c \u5c0f"}"#,
+        )
+        .await;
+    let token = view_token_of(&env, &id);
+    let nonce = nonce_of(&env, &id);
+    let view = send(env.addr, &request("GET", &format!("/view/{token}"), "", "")).await;
+    let decision = env.get(&format!("/pending/{id}"), "").await;
+    assert_eq!((view.status, decision.status), (200, 200));
+    let shown = "<pre class=\"body\">Stage 2 gate test \u{ff5c} \u{5c0f}</pre>";
+    let basic_owner = STANDARD.encode(format!("owner:{PW}"));
+    let plain = [
+        SENTINEL,
+        PATH_TOKEN,
+        env.key.as_str(),
+        PW,
+        token.as_str(),
+        nonce.as_str(),
+        basic_owner.as_str(),
+    ];
+    let needles: Vec<String> = plain
+        .iter()
+        .flat_map(|s| [s.to_string(), sha256_hex(s)])
+        .collect();
+    for (what, body) in [("view", &view.body), ("decision", &decision.body)] {
+        assert!(
+            body.contains(shown),
+            "the {what} page lacks the decoded text"
+        );
+        let details = body.find("<details>").expect("details");
+        assert!(
+            body.find(r"\uff5c").expect("raw body") > details,
+            "the {what} page shows the raw JSON outside details"
+        );
+        for n in &needles {
+            assert!(!body.contains(n.as_str()), "the {what} page shows {n}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_body_that_is_not_utf8_gets_a_banner() {
     let env = Env::new("lossy").await;
     let (_h, id) = env.hold("/discord/hold/a", b"{\"x\":\"\xff\xfe\"}").await;

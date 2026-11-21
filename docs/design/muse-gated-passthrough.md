@@ -481,7 +481,10 @@ all. An ntfy publish succeeds with zero subscribers, so a hold could be silently
 `sendMessage` to the owner's chat is the replacement.
 
 - **One send per new distinct entry.** The notifier is called from the hold path (3.4 step 5) and never
-  for a supersede. Each send is one `POST https://api.telegram.org/bot<token>/sendMessage`.
+  for a supersede in option C. In buttons mode (3.6.2) a supersede is announced too. Each send is one
+  `POST https://api.telegram.org/bot<token>/sendMessage`.
+- **Option C.** This section is option C: `[notify] buttons = false`, the link `{approval_url_base}/pending/{id}`
+  to the Basic-auth approval page, and no buttons. It stays intact so the gate can switch back by config.
 - **Payload.** The JSON body has three keys: `chat_id` (from config), `text` and
   `link_preview_options.is_disabled = true`, so Telegram does not fetch the approval link. `text` is the
   fixed sentence, a line with the request id, and the approval URL `{approval_url_base}/pending/{id}`.
@@ -508,6 +511,85 @@ all. An ntfy publish succeeds with zero subscribers, so a hold could be silently
 Not claimed: delivery to Telegram is not confirmed to the gate (the Bot API reply is checked only for
 status); a message Telegram accepted can still be missed by the phone. The owner should confirm one real
 notification end to end, using the steps in `docs/runbooks/muse-stage2.md`.
+
+### 3.6.2 Telegram approve buttons and no-login view link (stage 2, buttons mode)
+
+Owner decision, 2026-11-21. The request content stays on p1 and is never sent to Telegram. The
+Telegram message carries a fixed sentence, the request id, a view link and two inline buttons,
+Approve and Deny. To read the full request the owner opens the view link on p1. Viewing needs no
+login. Approve and deny happen in Telegram. Config: `[notify] buttons = true`, with `owner_chat_id`
+and `view_base_url`. `buttons = false` restores option C (3.6.1) with no code change.
+
+- **The message.** Text: the fixed sentence, `Request: <id>`, the link `{view_base_url}/view/<token>`,
+  and one row of two buttons, `Approve` and `Deny`. Nothing else leaves p1: no body, header, route
+  path, Discord token, digest or fingerprint. The view token is in the link, and it is the one value
+  in the message that reads a request (accepted risk 1).
+- **Callback data.** `a` or `d`, then the 32-hex request id, then a 24-hex nonce: 57 bytes, under
+  Telegram's 64-byte cap. The nonce is 96 random bits, drawn when the hold is admitted and stored with
+  the entry. It is not printed and it ends with the entry.
+- **Receiving presses.** The gate long-polls `getUpdates` with `allowed_updates = ["callback_query"]`.
+  There is no public webhook and no new listener. A 409 from Telegram means a webhook is set. The gate
+  logs one fixed line, backs off 5 s and polls again. The runbook has the check.
+- **Owner check.** Only a press whose `from.id` equals `owner_chat_id` is served. Any other press gets
+  the answer `Not authorised` and changes nothing. The owner id is config, not a secret, and it never
+  reaches the audit stream.
+- **One decision per hold.** A press is served only when the entry is `Pending`, its nonce matches
+  the live entry (constant-time compare), and the request is still held by the policy. Approve checks
+  the policy under the table lock, the same check the approval page's approve makes, then runs the
+  approve path unchanged: start claim, token-identity and hash recheck, and then the first upstream
+  byte. Deny starts the identity's cooldown as the page does. The first valid press decides. A later
+  press, or one after the hold expired, was denied, approved, dropped or superseded, gets a short reply
+  and changes nothing. The replies are `Approved`, `Denied`, `No longer waiting` (missing entry or wrong
+  nonce, one text for both) and `No longer allowed` (the policy no longer holds the request, which
+  drops the entry). Every callback query is answered so the button stops spinning.
+- **Audit.** Approve and deny keep the existing `approved` and `denied` lines, with approver
+  `telegram-owner`. A refused press writes no line.
+- **View link.** `GET /view/<token>` is served by the approval listener, the tailnet-only socket that
+  also serves the approval page. Only this path skips Basic auth. Each hold has its own 128-bit token,
+  compared in constant time. It is valid only while the entry is `Pending`. Approve, deny, expiry, drop,
+  abandon and supersede each end it at once. An unknown or ended token gets the same generic 404 bytes
+  as an unknown path. The page is read-only and shows the redacted request that the approval page shows
+  (method, route, redacted path, body preview, header names, with credential values hidden). It has the
+  six hardened headers, sets no cookie, has no form and no CSRF token, and never logs or audits the
+  token. The route exists only when buttons are on.
+- **Supersede in buttons mode.** A supersede sends one new notification for the newest entry. The
+  older message's buttons decide nothing once it is superseded, so without a new message the owner could
+  not approve the retry. This changes acceptance item 20 for buttons mode only. Option C keeps no
+  notification on supersede.
+- **Failure.** A failed send writes `notify_failed` and nothing else, as in 3.6.1. A failed poll only
+  delays presses. Holds still expire fail-closed at `hold_secs`, so a missed press cannot forward a
+  request.
+- **Config checks.** With `buttons = true`, `owner_chat_id` must be a positive id and `view_base_url`
+  an http(s) URL with no userinfo, query or fragment. With `buttons = false`, either key is an error,
+  so a leftover key never does nothing silently.
+- **Tests.** Synthetic values only, against a loopback mock. Tests cover: a press from another id is
+  refused and changes nothing; a wrong or stale nonce is refused; a second press after a decision is
+  refused; approve after expiry is refused and nothing is forwarded; the view token works while live
+  and gets the generic 404 after each end; the notification text has no body, token or hash; the view
+  token never reaches the audit stream; approve runs the policy recheck before any forward; and option C
+  still needs Basic auth on its page.
+
+**Accepted risks.**
+
+1. **Bearer view link inside the tailnet.** The link carries a per-hold token. Anyone on the tailnet
+   who has the link can read that one request while the hold lives. The same link also sits in
+   Telegram's stored copy of the message, so the link is a bearer secret held by Telegram. The hold is
+   at most `hold_secs` (90 s in the stage 2 policy), and the token dies with the hold. The page shows the
+   redacted request, never a credential value. This risk is part of the approved design (council option 1,
+   2026-11-21); the owner confirms it when the PR is reviewed.
+2. **Telegram account is the only authentication, with no second factor.** Whoever controls the owner's
+   Telegram account, or a session on the owner's phone, can approve or deny. A second factor would need a
+   login on the page, which the owner rejected for viewing. This risk is part of the approved design, and
+   the owner confirms it when the PR is reviewed.
+
+**Constraints.**
+
+- Only the fixed text, the request id, the view link and the two buttons leave p1 toward Telegram.
+- No webhook and no new listener. The view route exists only on the approval listener, and only in
+  buttons mode.
+- Callback data is 57 bytes, and only `from.id` decides ownership.
+- The view page is read-only. It has no decision control and it never prints the token.
+- `buttons = false` restores option C without code changes.
 
 ### 3.7 Concurrency and resource limits (open point f)
 
@@ -1023,7 +1105,8 @@ Adds the hold table, the approval listener, the notification hook and the `hold`
     direct path and through the real front.
 19. **Disconnect through the front:** a caller disconnect while held, made through the real TLS front,
     marks the entry `Abandoned` and frees the slot (the stage 1 measurement of the same path).
-20. **Dedupe and retry during hold:** a second request from the same identity with an equal outbound
+20. **Dedupe and retry during hold (buttons mode, 3.6.2, announces the newest entry on supersede; option C does
+    not notify):** a second request from the same identity with an equal outbound
     request (same forwarded headers and credential values) while the first is held supersedes it: the older
     caller gets 503 `superseded`, the notification count stays one and now points at the new entry, the old id's page shows a `superseded` banner (not `gone`), approve and deny disabled, and a link to the newest entry, one approval
     produces exactly one upstream request, and the approval page lists one entry. Ten rapid retries leave one entry. The same body and path with

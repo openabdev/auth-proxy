@@ -245,6 +245,11 @@ pub(super) struct Entry {
     pub digest: String,
     pub req: Arc<HeldRequest>,
     pub tx: Option<oneshot::Sender<Decision>>,
+    /// Per-hold secret that a Telegram callback must echo (24 hex). Lives only as long as the
+    /// entry is `Pending`.
+    pub nonce: String,
+    /// Per-hold bearer for the one-time view link (32 hex). Dies with the entry.
+    pub view_token: String,
 }
 
 impl fmt::Debug for Entry {
@@ -254,6 +259,32 @@ impl fmt::Debug for Entry {
             .field("req", &self.req)
             .finish_non_exhaustive()
     }
+}
+
+/// A decision a Telegram callback asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallbackAction {
+    Approve,
+    Deny,
+}
+
+/// Why a callback changed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallbackRefusal {
+    /// The entry is not `Pending` (decided, expired, dropped, superseded or unknown).
+    NoLiveEntry,
+    /// The nonce does not match the live entry.
+    NonceMismatch,
+    /// The current policy no longer gives the hold. The entry is dropped.
+    PolicyChanged,
+}
+
+/// The result of a callback. `ApproveStarted` carries the confirmation the approve must await.
+#[derive(Debug)]
+pub enum CallbackTransition {
+    ApproveStarted(oneshot::Receiver<Confirm>),
+    Denied,
+    Refused(CallbackRefusal),
 }
 
 /// What the table remembers about an entry after it left `Pending`: the state only, no request.

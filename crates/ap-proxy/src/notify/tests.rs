@@ -91,7 +91,10 @@ fn notifier(api: &str) -> TelegramNotifier {
 #[tokio::test]
 async fn sends_one_send_message_with_only_the_fixed_text_id_and_link() {
     let (base, seen, hits) = server(Some(ok())).await;
-    notifier(&base).notify(REQ_ID, TEXT, URL).await.unwrap();
+    notifier(&base)
+        .notify(REQ_ID, TEXT, URL, None)
+        .await
+        .unwrap();
     assert_eq!(
         hits.load(Ordering::SeqCst),
         1,
@@ -126,13 +129,66 @@ async fn sends_one_send_message_with_only_the_fixed_text_id_and_link() {
 }
 
 #[tokio::test]
+async fn buttons_message_has_only_fixed_text_id_link_and_buttons() {
+    const VIEW_URL: &str = "https://view.example.test/view/fedcba9876543210fedcba9876543210";
+    const HOLD_ID: &str = "0123456789abcdef0123456789abcdef";
+    const NONCE: &str = "aabbccddeeff001122334455";
+    // Synthetic stand-ins for what must never reach Telegram: a body, a credential, a digest.
+    const SECRET_BODY: &str = "SYNTHETIC-BODY-0009";
+    const SECRET_AUTH: &str = "Bot SYNTHETIC-AUTH-0010";
+    const SECRET_DIGEST: &str = "0f0e0d0c0b0a09080706050403020100";
+    let (base, seen, _hits) = server(Some(ok())).await;
+    let buttons = Buttons {
+        approve: format!("a{HOLD_ID}{NONCE}"),
+        deny: format!("d{HOLD_ID}{NONCE}"),
+    };
+    notifier(&base)
+        .notify(HOLD_ID, TEXT, VIEW_URL, Some(&buttons))
+        .await
+        .unwrap();
+    let s = seen.lock().unwrap()[0].clone();
+    let json: serde_json::Value = serde_json::from_str(&s.body).unwrap();
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["chat_id", "link_preview_options", "reply_markup", "text"]
+    );
+    assert_eq!(
+        json["text"],
+        format!("{TEXT}\nRequest: {HOLD_ID}\n{VIEW_URL}")
+    );
+    let row = &json["reply_markup"]["inline_keyboard"][0];
+    assert_eq!(row[0]["text"], "Approve");
+    assert_eq!(row[1]["text"], "Deny");
+    assert_eq!(row[0]["callback_data"], buttons.approve);
+    assert_eq!(row[1]["callback_data"], buttons.deny);
+    assert_eq!(buttons.approve.len(), poll::CALLBACK_DATA_LEN);
+    assert_eq!(buttons.deny.len(), poll::CALLBACK_DATA_LEN);
+    let text = json["text"].as_str().unwrap();
+    for leak in [SECRET_BODY, SECRET_AUTH, SECRET_DIGEST, NONCE] {
+        assert!(!text.contains(leak), "text carries {leak}");
+        assert!(!s
+            .body
+            .replace(&buttons.approve, "")
+            .replace(&buttons.deny, "")
+            .contains(leak));
+    }
+}
+
+#[tokio::test]
 async fn a_non_success_status_is_a_failure_with_one_attempt() {
     let (base, _, hits) = server(Some(
         "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
     ))
     .await;
     assert_eq!(
-        notifier(&base).notify("a", TEXT, URL).await,
+        notifier(&base).notify("a", TEXT, URL, None).await,
         Err(NotifyError)
     );
     assert_eq!(
@@ -148,7 +204,7 @@ async fn a_transport_failure_is_retried_once() {
     // delivered, so the retry can duplicate it. That is accepted: a missed hold is worse.
     let (base, _, hits) = server(Some(String::new())).await;
     assert_eq!(
-        notifier(&base).notify("a", TEXT, URL).await,
+        notifier(&base).notify("a", TEXT, URL, None).await,
         Err(NotifyError)
     );
     assert_eq!(hits.load(Ordering::SeqCst), 2);
@@ -162,7 +218,7 @@ async fn a_redirect_is_not_followed() {
     )))
     .await;
     assert_eq!(
-        notifier(&base).notify("a", TEXT, URL).await,
+        notifier(&base).notify("a", TEXT, URL, None).await,
         Err(NotifyError)
     );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -174,7 +230,7 @@ async fn a_silent_server_times_out_within_the_bound() {
     let (base, _, hits) = server(None).await;
     let n = TelegramNotifier::with_api(&base, TOKEN, CHAT, Duration::from_millis(300)).unwrap();
     let start = Instant::now();
-    assert_eq!(n.notify("a", TEXT, URL).await, Err(NotifyError));
+    assert_eq!(n.notify("a", TEXT, URL, None).await, Err(NotifyError));
     assert!(start.elapsed() < Duration::from_secs(3));
     assert_eq!(
         hits.load(Ordering::SeqCst),
@@ -190,7 +246,7 @@ async fn a_dead_server_is_a_bounded_failure() {
     drop(l);
     let n = TelegramNotifier::with_api(&base, TOKEN, CHAT, Duration::from_millis(300)).unwrap();
     let start = Instant::now();
-    assert_eq!(n.notify("a", TEXT, URL).await, Err(NotifyError));
+    assert_eq!(n.notify("a", TEXT, URL, None).await, Err(NotifyError));
     // One retry on a refused connect, each attempt bounded by the timeout.
     assert!(start.elapsed() < Duration::from_secs(3));
 }
@@ -374,7 +430,7 @@ async fn isolated_notifier_ignores_proxy_variables() {
         Duration::from_secs(2),
     )
     .unwrap();
-    let r = n.notify("id", TEXT, URL).await;
+    let r = n.notify("id", TEXT, URL, None).await;
     assert!(r.is_err(), "the name does not resolve, so the send fails");
     assert_eq!(hits.load(Ordering::SeqCst), before, "the proxy was dialled");
     let all = format!("{:?}", seen.lock().unwrap());

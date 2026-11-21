@@ -170,19 +170,39 @@ pub fn entry(v: &View, csrf: Option<&str>) -> String {
         )),
     }
     if let Some(c) = &v.content {
-        b.push_str(&content_table(v, c));
-        if c.body_lossy {
-            b.push_str("<p><strong>The body is not valid UTF-8.</strong> Invalid bytes are shown as U+FFFD; Discord receives the original bytes.</p>\n");
-        }
-        b.push_str(&format!(
-            "<h2>Body</h2>\n<pre>{}</pre>\n",
-            escape(&c.body_text)
-        ));
-        b.push_str(&headers_table(c));
+        b.push_str(&details(v, c));
     }
     b.push_str(&buttons(&v.id, csrf));
     b.push_str("<p><a href=\"/pending\">Pending requests</a></p>\n");
     shell(&format!("Request {}", v.id), &b)
+}
+
+/// The read-only page for a `Pending` hold, reached by its one-time view link. It has no form,
+/// no buttons and no token: the owner decides in Telegram.
+pub fn view_only(v: &View) -> String {
+    let mut b = format!(
+        "<h1>Request {}</h1>\n<p>State: {}. This page is read only. Decide in Telegram.</p>\n",
+        escape(&v.id),
+        state_str(v.state)
+    );
+    if let Some(c) = &v.content {
+        b.push_str(&details(v, c));
+    }
+    shell(&format!("Request {}", v.id), &b)
+}
+
+/// The request details shared by the decision page and the read-only view.
+fn details(v: &View, c: &ViewContent) -> String {
+    let mut b = content_table(v, c);
+    if c.body_lossy {
+        b.push_str("<p><strong>The body is not valid UTF-8.</strong> Invalid bytes are shown as U+FFFD; Discord receives the original bytes.</p>\n");
+    }
+    b.push_str(&format!(
+        "<h2>Body</h2>\n<pre>{}</pre>\n",
+        escape(&c.body_text)
+    ));
+    b.push_str(&headers_table(c));
+    b
 }
 
 /// The summary of one pending entry, for the JSON list.

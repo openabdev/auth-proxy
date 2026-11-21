@@ -53,6 +53,15 @@ for a `hold` grant of that identity. One per policy, on one route: a second `[[t
 or an `@channelusername`) and `approval_url_base` (http or https, no userinfo or query; it builds the link
 in the message). Any other key, including the old `topic_file` or `base_url`, refuses to load.
 
+Telegram buttons (stage 2, design 3.6.2), optional: `buttons` (default `false`, which is option C),
+`owner_chat_id` (the positive numeric Telegram user id allowed to press the buttons, required when
+`buttons = true`) and `view_base_url` (http or https, no userinfo or query, required when
+`buttons = true`; the no-login one-time view link is `{view_base_url}/view/<token>`). With
+`buttons = false`, setting `owner_chat_id` or `view_base_url` refuses to load. The view route is served
+only by the approval listener, so the tailnet front must map `/view/` to that listener. Use placeholders
+in the config you commit, such as `owner_chat_id = <OWNER_ID>`. Never commit the real id, the token or a
+host name you do not want public.
+
 ## 3. Approver password and secret files
 
 ```
@@ -94,12 +103,41 @@ To rotate the token, revoke it in BotFather (`/revoke`), write the new token to 
 Anyone who has the token can send messages as the bot and read `getUpdates` for it, so treat it like a
 password.
 
+### 3.2 Telegram buttons (owner steps, `buttons = true`)
+
+Do these in addition to 3.1. Run each one yourself and keep the answers out of chat and commits.
+
+1. Get your own Telegram user id. Send a message to the bot, then open `getUpdates` as in step 3 and read
+   `message.from.id`. In a private chat this equals the chat id. Set it as `owner_chat_id`. Anyone else
+   who presses the buttons is refused.
+2. Check that no webhook is set. Open `https://api.telegram.org/bot<TOKEN>/getWebhookInfo` and confirm
+   `url` is empty. The gate reads presses by long polling, and a set webhook makes Telegram answer those
+   polls with 409, which the gate logs as `getUpdates conflict`. Delete the browser history entry after
+   you check, because that URL holds the token. Clear a stray webhook with `deleteWebhook`, not by
+   editing config.
+3. Set `buttons = true` and `view_base_url` to the tailnet name that the front maps to the approval
+   listener's `/view/` path. Use an https name, not the Muse caller name.
+4. Restart `auth-proxy`. A startup error names the missing or refused key and nothing else.
+5. Send one test hold. The message should have the fixed sentence, the id, the view link and the two
+   buttons. Open the link on the tailnet and read the request. Press Approve or Deny in Telegram. The
+   button should stop spinning and reply `Approved` or `Denied`. Press it again: the reply should be
+   `No longer waiting`.
+6. To go back to option C, set `buttons = false` and remove `owner_chat_id` and `view_base_url`. Restart.
+   The view route then disappears, and the approval page is used as before.
+
+Accepted risks, read them before you turn buttons on (design 3.6.2): the view link is a bearer token that
+works from any tailnet node while the hold lives, and Telegram account access is the only proof of
+ownership for a press.
+
 ## 4. Network placement
 
 The approval listener binds loopback. Put it behind a front that only the approver can reach, on a
 different name and path from the one Muse uses, and keep the approval port off the caller path. This is a
 deployment control; the code cannot prove it. The approver authenticates with Basic auth plus a per-view,
 single-use CSRF token.
+
+With `buttons = true`, the same front must also map `/view/` to the approval listener. That path needs no
+login, so only the tailnet may reach it. Never map it on a public name.
 
 ## 5. Timeouts and the old connector
 

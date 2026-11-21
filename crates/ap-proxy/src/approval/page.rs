@@ -667,10 +667,15 @@ mod tests {
     fn a_field_besides_content_is_named_above_details_and_its_value_is_not() {
         let body = r#"{"content":"hi","username":"SYNTH-VALUE-7"}"#;
         let html = entry(&with_body(body), Some("t"));
-        let line_start = html.find("<p class=\"banner extra-fields\">").expect("indicator");
+        let line_start = html
+            .find("<p class=\"banner extra-fields\">")
+            .expect("indicator");
         let line_end = line_start + html[line_start..].find("</p>").unwrap();
         let line = &html[line_start..line_end];
-        assert!(line.contains("+ 1 more field will be sent: username (see Details)"), "{line}");
+        assert!(
+            line.contains("+ 1 more field will be sent: username (see Details)"),
+            "{line}"
+        );
         assert!(!line.contains("SYNTH-VALUE-7"), "{line}");
         assert!(line_end < html.find("<details>").unwrap());
         assert!(line_start < html.find("<pre class=\"body\">").unwrap());
@@ -683,7 +688,9 @@ mod tests {
         let body = r#"{"content":"hi","<b>x</b>":1,"embeds":[]}"#;
         let html = entry(&with_body(body), Some("t"));
         assert!(
-            html.contains("+ 2 more fields will be sent: &lt;b&gt;x&lt;/b&gt;, embeds (see Details)"),
+            html.contains(
+                "+ 2 more fields will be sent: &lt;b&gt;x&lt;/b&gt;, embeds (see Details)"
+            ),
             "{html}"
         );
         assert!(!html.contains("<b>x</b>"), "{html}");

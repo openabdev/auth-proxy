@@ -2213,11 +2213,7 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
                 "chat_id = \"\"",
                 "notify.chat_id",
             ),
-            (
-                "/etc/ap/telegram-token",
-                "telegram-token",
-                "token_file",
-            ),
+            ("/etc/ap/telegram-token", "telegram-token", "token_file"),
         ] {
             let text = hold_text() + &approval_block().replacen(from, to, 1);
             expect_invalid(&text, needle);
@@ -2239,7 +2235,6 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
         let text = hold_text() + &approval_block() + "topic_file = \"/etc/ap/topic\"\n";
         expect_parse_error(&text);
     }
-
 
     #[test]
     fn approval_needs_a_passthrough_deployment() {

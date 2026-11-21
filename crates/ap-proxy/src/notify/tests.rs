@@ -92,7 +92,11 @@ fn notifier(api: &str) -> TelegramNotifier {
 async fn sends_one_send_message_with_only_the_fixed_text_id_and_link() {
     let (base, seen, hits) = server(Some(ok())).await;
     notifier(&base).notify(REQ_ID, TEXT, URL).await.unwrap();
-    assert_eq!(hits.load(Ordering::SeqCst), 1, "one send, no retry on success");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "one send, no retry on success"
+    );
     let s = seen.lock().unwrap()[0].clone();
 
     // The token is in the path, and only there.
@@ -109,7 +113,12 @@ async fn sends_one_send_message_with_only_the_fixed_text_id_and_link() {
 
     // The body is the chat id, the fixed text with the id and the link, and link preview off.
     let json: serde_json::Value = serde_json::from_str(&s.body).unwrap();
-    let keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+    let keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
     assert_eq!(keys.len(), 3, "{keys:?}");
     assert_eq!(json["chat_id"], CHAT);
     assert_eq!(json["text"], format!("{TEXT}\nRequest: {REQ_ID}\n{URL}"));
@@ -122,8 +131,15 @@ async fn a_non_success_status_is_a_failure_with_one_attempt() {
         "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
     ))
     .await;
-    assert_eq!(notifier(&base).notify("a", TEXT, URL).await, Err(NotifyError));
-    assert_eq!(hits.load(Ordering::SeqCst), 1, "a rejected send is not retried");
+    assert_eq!(
+        notifier(&base).notify("a", TEXT, URL).await,
+        Err(NotifyError)
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "a rejected send is not retried"
+    );
 }
 
 #[tokio::test]
@@ -131,7 +147,10 @@ async fn a_transport_failure_after_sending_is_not_retried() {
     // The server reads the request and closes without a reply. The message may have been
     // delivered, so a second send would risk a duplicate.
     let (base, _, hits) = server(Some(String::new())).await;
-    assert_eq!(notifier(&base).notify("a", TEXT, URL).await, Err(NotifyError));
+    assert_eq!(
+        notifier(&base).notify("a", TEXT, URL).await,
+        Err(NotifyError)
+    );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
@@ -142,7 +161,10 @@ async fn a_redirect_is_not_followed() {
         "HTTP/1.1 307 Temporary Redirect\r\nlocation: {target}/elsewhere\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
     )))
     .await;
-    assert_eq!(notifier(&base).notify("a", TEXT, URL).await, Err(NotifyError));
+    assert_eq!(
+        notifier(&base).notify("a", TEXT, URL).await,
+        Err(NotifyError)
+    );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     assert_eq!(target_hits.load(Ordering::SeqCst), 0);
 }
@@ -171,10 +193,26 @@ async fn a_dead_server_is_a_bounded_failure() {
 
 #[test]
 fn bad_tokens_and_chat_ids_are_refused_and_debug_hides_them() {
-    for token in ["", "123:abc/def", "123:abc?x=1", "123:abc#f", "123 456", "a\nb"] {
-        assert!(TelegramNotifier::with_api("http://127.0.0.1:1", token, CHAT, Duration::from_secs(1)).is_err());
+    for token in [
+        "",
+        "123:abc/def",
+        "123:abc?x=1",
+        "123:abc#f",
+        "123 456",
+        "a\nb",
+    ] {
+        assert!(TelegramNotifier::with_api(
+            "http://127.0.0.1:1",
+            token,
+            CHAT,
+            Duration::from_secs(1)
+        )
+        .is_err());
     }
-    assert!(TelegramNotifier::with_api("http://127.0.0.1:1", TOKEN, "", Duration::from_secs(1)).is_err());
+    assert!(
+        TelegramNotifier::with_api("http://127.0.0.1:1", TOKEN, "", Duration::from_secs(1))
+            .is_err()
+    );
     let n = notifier("http://127.0.0.1:1");
     let shown = format!("{n:?} {}", NotifyError);
     assert!(!shown.contains(TOKEN) && !shown.contains(CHAT));
@@ -325,8 +363,13 @@ async fn isolated_notifier_ignores_proxy_variables() {
     let before = hits.load(Ordering::SeqCst);
     let before_seen = seen.lock().unwrap().len();
 
-    let n = TelegramNotifier::with_api("http://telegram.example.test", TOKEN, CHAT, Duration::from_secs(2))
-        .unwrap();
+    let n = TelegramNotifier::with_api(
+        "http://telegram.example.test",
+        TOKEN,
+        CHAT,
+        Duration::from_secs(2),
+    )
+    .unwrap();
     let r = n.notify("id", TEXT, URL).await;
     assert!(r.is_err(), "the name does not resolve, so the send fails");
     assert_eq!(hits.load(Ordering::SeqCst), before, "the proxy was dialled");

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 
 use super::digest::Fingerprint;
 
@@ -240,6 +241,8 @@ impl DenyResult {
 pub(super) struct Entry {
     /// Admission order, for listing.
     pub seq: u64,
+    /// When the entry was admitted, for the held and remaining time the page shows.
+    pub held_at: Instant,
     pub identity: String,
     pub fingerprint: Fingerprint,
     pub digest: String,
@@ -321,6 +324,10 @@ pub struct ViewContent {
     pub body_lossy: bool,
     pub digest: String,
     pub headers: Vec<ViewHeader>,
+    /// Seconds since admission, at the moment the view was taken.
+    pub held_secs: u64,
+    /// Seconds left before the hold ends, at the moment the view was taken.
+    pub remaining_secs: u64,
 }
 
 /// What the approval API may show about an entry. Credential header values are never in it.

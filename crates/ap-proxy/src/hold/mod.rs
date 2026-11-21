@@ -259,6 +259,7 @@ impl Table {
             id.clone(),
             Entry {
                 seq,
+                held_at: now,
                 identity: identity.to_string(),
                 fingerprint,
                 digest: digest.clone(),
@@ -547,7 +548,7 @@ impl Table {
             }
         }
         let id = hit?;
-        view_in(&g, &id).filter(|v| v.state == State::Pending)
+        view_in(&g, &id, self.limits.hold).filter(|v| v.state == State::Pending)
     }
 
     /// Test-only: the nonce and view token of a `Pending` entry.
@@ -575,13 +576,15 @@ impl Table {
     /// What the approval API may show about `id`. Credential header values are left out, and
     /// request content is present only while the entry is `Pending`.
     pub fn view(&self, id: &str) -> Option<View> {
-        view_in(&self.lock(), id)
+        view_in(&self.lock(), id, self.limits.hold)
     }
 }
 
-fn view_in(g: &Inner, id: &str) -> Option<View> {
+fn view_in(g: &Inner, id: &str, hold: Duration) -> Option<View> {
     if let Some(e) = g.pending.get(id) {
         let req = &e.req;
+        let held = Instant::now().saturating_duration_since(e.held_at);
+        let remaining = hold.saturating_sub(held);
         let content_type = req
             .headers
             .iter()
@@ -618,6 +621,8 @@ fn view_in(g: &Inner, id: &str) -> Option<View> {
                 body_lossy,
                 digest: e.digest.clone(),
                 headers,
+                held_secs: held.as_secs(),
+                remaining_secs: remaining.as_secs(),
             }),
         });
     }

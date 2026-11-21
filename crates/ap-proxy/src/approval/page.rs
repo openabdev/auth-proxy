@@ -1,12 +1,82 @@
 //! The approval pages (design 3.6) and the JSON views the same API serves.
 //!
-//! Every value that came from a request is escaped here, and the pages carry no script and no
-//! inline style. A credential header value is never in a [`View`], so it cannot reach a page; the
+//! Every value that came from a request is escaped here. Each page carries one fixed stylesheet,
+//! and the Content-Security-Policy allows exactly that block by its SHA-256 hash. No page has a
+//! script, an image, a font or any other external resource, and no element has a `style`
+//! attribute. A credential header value is never in a [`View`], so it cannot reach a page; the
 //! page shows that the header is present.
+//!
+//! Layout, top to bottom: a compact header (request id, held time, remaining seconds), the payload
+//! block (method, route, redacted path and the message content), the approve and deny buttons on
+//! the decision page, and a closed `<details>` with the secondary facts.
 
+use std::sync::OnceLock;
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::hold::{State, View, ViewContent};
+
+/// The stylesheet inlined in every page. The Content-Security-Policy allows this block by hash.
+const STYLE: &str = r#"
+*{box-sizing:border-box}
+body{margin:0;font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:#f4f4f1;color:#1a1a1a}
+main{max-width:680px;margin:0 auto;padding:12px 14px 32px}
+h1{font-size:17px;margin:0;font-weight:600}
+h2{font-size:15px;margin:16px 0 6px}
+a{color:#0b5cad}
+.top{padding:4px 0 10px;border-bottom:1px solid #d9d9d4}
+.id{margin:2px 0 0;font:13px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#555;word-break:break-all}
+.meta{margin:6px 0 0;font-size:14px;color:#444}
+.banner{margin:12px 0 0;padding:10px 12px;border-radius:10px;background:#fff3cd;color:#5c4300;font-size:15px}
+.note{margin:12px 0 0;font-size:15px;color:#444}
+.payload{margin-top:12px;background:#fff;border:1px solid #cfcfc9;border-radius:14px;padding:14px}
+.label{margin:10px 0 6px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#666}
+.label:first-child{margin-top:0}
+.req{margin:0;font-size:22px;font-weight:700;line-height:1.25;overflow-wrap:anywhere}
+.method{color:#0b5cad}
+.path{margin:4px 0 0;font:15px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.body{margin:0;padding:12px;max-height:60vh;overflow:auto;background:#f3f3ef;border-radius:10px;font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.actions{display:grid;gap:10px;margin-top:14px}
+.actions form{margin:0}
+.btn{width:100%;min-height:60px;border-radius:14px;font:inherit;font-size:20px;font-weight:700;cursor:pointer}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.approve{background:#1d7a3c;color:#fff;border:0}
+.deny{background:#fff;color:#b3261e;border:2px solid #b3261e}
+details{margin-top:16px;background:#fff;border:1px solid #cfcfc9;border-radius:14px;padding:0 14px}
+summary{min-height:48px;display:flex;align-items:center;font-weight:600;cursor:pointer}
+table{width:100%;border-collapse:collapse;font-size:14px;margin:0 0 12px}
+th,td{padding:8px 4px;border-top:1px solid #ebebe7;text-align:left;vertical-align:top;overflow-wrap:anywhere}
+th{width:36%;color:#555;font-weight:600}
+.foot{margin-top:18px;font-size:15px}
+@media (min-width:560px){.actions{grid-template-columns:1fr 1fr}}
+@media (prefers-color-scheme:dark){
+body{background:#151515;color:#e8e8e6}
+.top{border-color:#333}
+.payload,details{background:#1e1e1e;border-color:#3a3a3a}
+.body{background:#262626}
+.label,.meta,.note,.id,th{color:#aaa}
+th,td{border-color:#333}
+.banner{background:#3d3200;color:#ffe08a}
+.method,a{color:#7ab8ff}
+.approve{background:#2a8f4a}
+.deny{background:#1e1e1e;color:#ff8a80;border-color:#ff8a80}
+}
+"#;
+
+/// The Content-Security-Policy of every response. Scripts, images, fonts and frames are refused,
+/// and the one inline stylesheet is allowed by its SHA-256 hash.
+pub fn csp() -> &'static str {
+    static CSP: OnceLock<String> = OnceLock::new();
+    CSP.get_or_init(|| {
+        let hash = STANDARD.encode(Sha256::digest(STYLE.as_bytes()));
+        format!(
+            "default-src 'none'; style-src 'sha256-{hash}'; frame-ancestors 'none'; form-action 'self'"
+        )
+    })
+}
 
 /// Escape text for an HTML text node or a double-quoted attribute value.
 pub fn escape(s: &str) -> String {
@@ -41,21 +111,25 @@ fn shell(title: &str, body: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>{}</title></head><body>\n{body}</body></html>\n",
+<title>{}</title><style>{STYLE}</style></head><body><main>\n{body}</main></body></html>\n",
         escape(title)
     )
 }
 
 /// A one-line message page (errors and results).
 pub fn message(title: &str, text: &str, newest: Option<&str>) -> String {
-    let mut b = format!("<h1>{}</h1>\n<p>{}</p>\n", escape(title), escape(text));
+    let mut b = format!(
+        "<h1>{}</h1>\n<p class=\"note\">{}</p>\n",
+        escape(title),
+        escape(text)
+    );
     if let Some(n) = newest {
         b.push_str(&format!(
-            "<p>Newer request: <a href=\"/pending/{0}\">{0}</a></p>\n",
+            "<p class=\"note\">Newer request: <a href=\"/pending/{0}\">{0}</a></p>\n",
             escape(n)
         ));
     }
-    b.push_str("<p><a href=\"/pending\">Pending requests</a></p>\n");
+    b.push_str("<p class=\"foot\"><a href=\"/pending\">Pending requests</a></p>\n");
     shell(title, &b)
 }
 
@@ -63,7 +137,7 @@ pub fn message(title: &str, text: &str, newest: Option<&str>) -> String {
 pub fn list(items: &[View]) -> String {
     let mut b = String::from("<h1>Pending requests</h1>\n");
     if items.is_empty() {
-        b.push_str("<p>No request is waiting.</p>\n");
+        b.push_str("<p class=\"note\">No request is waiting.</p>\n");
     } else {
         b.push_str("<ul>\n");
         for v in items {
@@ -86,13 +160,74 @@ fn row(name: &str, value: &str) -> String {
     format!("<tr><th>{}</th><td>{}</td></tr>\n", escape(name), value)
 }
 
-fn content_table(v: &View, c: &ViewContent) -> String {
-    let mut t = String::from("<table border=\"1\">\n");
+fn header(v: &View) -> String {
+    let mut h = format!(
+        "<header class=\"top\"><h1>Request</h1><p class=\"id\">{}</p>",
+        escape(&v.id)
+    );
+    if let Some(c) = &v.content {
+        h.push_str(&format!(
+            "<p class=\"meta\">Held {} s ago · {} s left when this page loaded</p>",
+            c.held_secs, c.remaining_secs
+        ));
+    }
+    h.push_str("</header>\n");
+    h
+}
+
+/// The payload block: what will be sent, in large type, with the body in a monospace block.
+fn payload(c: &ViewContent) -> String {
+    let mut b = String::from("<section class=\"payload\" aria-label=\"Payload to send\">\n");
+    b.push_str("<p class=\"label\">This request will be sent</p>\n");
+    b.push_str(&format!(
+        "<p class=\"req\"><span class=\"method\">{}</span> <span class=\"route\">{}</span></p>\n",
+        escape(&c.method),
+        escape(&c.route)
+    ));
+    b.push_str(&format!("<p class=\"path\">{}</p>\n", escape(&c.path)));
+    b.push_str("<p class=\"label\">Message content</p>\n");
+    if c.body_lossy {
+        b.push_str("<p class=\"banner\"><strong>The body is not valid UTF-8.</strong> Invalid bytes are shown as U+FFFD; Discord receives the original bytes.</p>\n");
+    }
+    b.push_str(&format!(
+        "<pre class=\"body\">{}</pre>\n",
+        escape(&c.body_text)
+    ));
+    b.push_str("</section>\n");
+    b
+}
+
+/// The approve and deny buttons. `csrf` is the token for their forms; without it both buttons are
+/// disabled (every state but `Pending`).
+fn actions(id: &str, csrf: Option<&str>) -> String {
+    let mut b = String::from("<div class=\"actions\">\n");
+    for (action, label, class) in [
+        ("approve", "Approve", "btn approve"),
+        ("deny", "Deny", "btn deny"),
+    ] {
+        match csrf {
+            Some(token) => b.push_str(&format!(
+                "<form method=\"post\" action=\"/pending/{id}/{action}\">\
+<input type=\"hidden\" name=\"csrf\" value=\"{token}\">\
+<button class=\"{class}\" type=\"submit\">{label}</button></form>\n",
+                id = escape(id),
+                token = escape(token),
+            )),
+            None => b.push_str(&format!(
+                "<form><button class=\"{class}\" type=\"button\" disabled>{label}</button></form>\n"
+            )),
+        }
+    }
+    b.push_str("</div>\n");
+    b
+}
+
+/// The secondary facts, closed by default: identity, upstream, query, content type, size, digest,
+/// the caller connection and the forwarded headers.
+fn details(v: &View, c: &ViewContent) -> String {
+    let mut t = String::from("<details>\n<summary>Details</summary>\n<table>\n");
     t.push_str(&row("Identity", &escape(&v.identity)));
-    t.push_str(&row("Method", &escape(&c.method)));
-    t.push_str(&row("Route", &escape(&c.route)));
     t.push_str(&row("Sent to", &escape(&c.upstream)));
-    t.push_str(&row("Path", &escape(&c.path)));
     t.push_str(&row(
         "Query",
         &c.query
@@ -109,11 +244,7 @@ fn content_table(v: &View, c: &ViewContent) -> String {
     t.push_str(&row("Digest", &escape(&c.digest)));
     t.push_str(&row("Caller connection", "unknown"));
     t.push_str("</table>\n");
-    t
-}
-
-fn headers_table(c: &ViewContent) -> String {
-    let mut t = String::from("<h2>Headers that will be forwarded</h2>\n<table border=\"1\">\n");
+    t.push_str("<h2>Headers that will be forwarded</h2>\n<table>\n");
     for h in &c.headers {
         let value = match &h.value {
             Some(v) => escape(v),
@@ -121,40 +252,17 @@ fn headers_table(c: &ViewContent) -> String {
         };
         t.push_str(&row(&h.name, &value));
     }
-    t.push_str("</table>\n");
+    t.push_str("</table>\n</details>\n");
     t
 }
 
-fn buttons(id: &str, csrf: Option<&str>) -> String {
-    let mut b = String::new();
-    for (action, label) in [("approve", "Approve"), ("deny", "Deny")] {
-        match csrf {
-            Some(token) => b.push_str(&format!(
-                "<form method=\"post\" action=\"/pending/{id}/{action}\">\
-<input type=\"hidden\" name=\"csrf\" value=\"{token}\">\
-<button type=\"submit\">{label}</button></form>\n",
-                id = escape(id),
-                token = escape(token),
-            )),
-            None => b.push_str(&format!(
-                "<form><button type=\"button\" disabled>{label}</button></form>\n"
-            )),
-        }
-    }
-    b
-}
-
 /// The page for one entry. `csrf` is the token for the approve and deny forms; without it the
-/// buttons are disabled (every state but `Pending`).
+/// buttons are disabled.
 pub fn entry(v: &View, csrf: Option<&str>) -> String {
-    let mut b = format!(
-        "<h1>Request {}</h1>\n<p>State: {}</p>\n",
-        escape(&v.id),
-        state_str(v.state)
-    );
+    let mut b = header(v);
     match v.state {
         State::Superseded => {
-            b.push_str("<p><strong>Superseded.</strong> A newer identical request replaced this one; nothing was sent for it.");
+            b.push_str("<p class=\"banner\"><strong>Superseded.</strong> A newer identical request replaced this one; nothing was sent for it.");
             if let Some(n) = &v.superseded_by {
                 b.push_str(&format!(
                     " Decide on <a href=\"/pending/{0}\">the newest request {0}</a>.",
@@ -165,44 +273,31 @@ pub fn entry(v: &View, csrf: Option<&str>) -> String {
         }
         State::Pending => {}
         other => b.push_str(&format!(
-            "<p>This request is {} and can no longer be decided.</p>\n",
+            "<p class=\"banner\">This request is {} and can no longer be decided.</p>\n",
             state_str(other)
         )),
     }
     if let Some(c) = &v.content {
+        b.push_str(&payload(c));
+    }
+    b.push_str(&actions(&v.id, csrf));
+    if let Some(c) = &v.content {
         b.push_str(&details(v, c));
     }
-    b.push_str(&buttons(&v.id, csrf));
-    b.push_str("<p><a href=\"/pending\">Pending requests</a></p>\n");
+    b.push_str("<p class=\"foot\"><a href=\"/pending\">Pending requests</a></p>\n");
     shell(&format!("Request {}", v.id), &b)
 }
 
 /// The read-only page for a `Pending` hold, reached by its one-time view link. It has no form,
 /// no buttons and no token: the owner decides in Telegram.
 pub fn view_only(v: &View) -> String {
-    let mut b = format!(
-        "<h1>Request {}</h1>\n<p>State: {}. This page is read only. Decide in Telegram.</p>\n",
-        escape(&v.id),
-        state_str(v.state)
-    );
+    let mut b = header(v);
+    b.push_str("<p class=\"note\">Read only. Decide in Telegram.</p>\n");
     if let Some(c) = &v.content {
+        b.push_str(&payload(c));
         b.push_str(&details(v, c));
     }
     shell(&format!("Request {}", v.id), &b)
-}
-
-/// The request details shared by the decision page and the read-only view.
-fn details(v: &View, c: &ViewContent) -> String {
-    let mut b = content_table(v, c);
-    if c.body_lossy {
-        b.push_str("<p><strong>The body is not valid UTF-8.</strong> Invalid bytes are shown as U+FFFD; Discord receives the original bytes.</p>\n");
-    }
-    b.push_str(&format!(
-        "<h2>Body</h2>\n<pre>{}</pre>\n",
-        escape(&c.body_text)
-    ));
-    b.push_str(&headers_table(c));
-    b
 }
 
 /// The summary of one pending entry, for the JSON list.
@@ -274,7 +369,7 @@ mod tests {
                 method: "POST".into(),
                 route: "discord".into(),
                 upstream: "https://discord.example.test:443".into(),
-                path: "/webhooks/1/<redacted>".into(),
+                path: "/webhooks/123/<redacted>".into(),
                 query: Some("wait=true".into()),
                 content_type: Some("application/json".into()),
                 body_len: body.len(),
@@ -291,6 +386,8 @@ mod tests {
                         value: Some("<b>v</b>".into()),
                     },
                 ],
+                held_secs: 12,
+                remaining_secs: 288,
             }),
         }
     }
@@ -311,7 +408,92 @@ mod tests {
         assert!(!html.contains("<b>v</b>") && html.contains("&lt;b&gt;v&lt;/b&gt;"));
         assert!(html.contains("present (value not shown)"));
         assert!(html.contains("name=\"csrf\" value=\"tok\""));
-        assert!(!html.contains("<style") && !html.contains(" style="));
+        assert!(!html.contains(" style="), "no inline style attribute");
+        assert!(html.contains(&format!("<style>{STYLE}</style>")));
+    }
+
+    #[test]
+    fn every_dynamic_value_in_the_payload_and_details_is_escaped() {
+        let mut v = pending("x");
+        v.identity = "<i>id</i>".into();
+        let c = v.content.as_mut().unwrap();
+        c.route = "<r>".into();
+        c.path = "/p/\"'<q>".into();
+        c.query = Some("a=<x>&b=\"y\"".into());
+        c.content_type = Some("<ct>".into());
+        c.upstream = "https://<up>:443".into();
+        let html = entry(&v, None);
+        for raw in ["<i>", "<r>", "<q>", "<x>", "<ct>", "<up>", "\"y\""] {
+            assert!(!html.contains(raw), "{raw} reached the page");
+        }
+        assert!(html.contains("&lt;r&gt;") && html.contains("&lt;i&gt;id&lt;/i&gt;"));
+    }
+
+    #[test]
+    fn the_details_section_is_present_and_closed_by_default() {
+        let html = entry(&pending("{}"), Some("t"));
+        assert_eq!(html.matches("<details").count(), 1);
+        assert!(html.contains("<details>\n<summary>Details</summary>"));
+        assert!(!html.contains("<details open"), "details must start closed");
+        let d = html.find("<details>").unwrap();
+        for key in [
+            "Sent to",
+            "Digest",
+            "Caller connection",
+            "Headers that will be forwarded",
+        ] {
+            assert!(html.find(key).unwrap() > d, "{key} is outside details");
+        }
+    }
+
+    #[test]
+    fn the_payload_block_comes_first_with_the_buttons_and_before_details() {
+        let html = entry(&pending("hello"), Some("t"));
+        let payload = html.find("<section class=\"payload\"").unwrap();
+        let actions = html.find("<div class=\"actions\">").unwrap();
+        let details = html.find("<details>").unwrap();
+        assert!(payload < actions && actions < details);
+        assert!(html.contains("<pre class=\"body\">hello</pre>"));
+        assert!(html.contains("<p class=\"req\"><span class=\"method\">POST</span>"));
+        assert!(html.contains("Held 12 s ago · 288 s left"));
+    }
+
+    #[test]
+    fn the_view_page_has_the_payload_and_no_form_or_button() {
+        let html = view_only(&pending("hello"));
+        assert!(html.contains("<section class=\"payload\""));
+        assert!(html.contains("Read only. Decide in Telegram."));
+        assert!(!html.contains("<form") && !html.contains("<button") && !html.contains("csrf"));
+        assert!(html.find("<details>").unwrap() > html.find("<pre class=\"body\"").unwrap());
+    }
+
+    #[test]
+    fn no_external_resource_or_script_is_loaded() {
+        for html in [entry(&pending("{}"), Some("t")), view_only(&pending("{}"))] {
+            for banned in [
+                "<script",
+                "<link",
+                "<img",
+                "<iframe",
+                "<object",
+                "src=",
+                "@import",
+                "url(",
+                "href=\"http",
+            ] {
+                assert!(!html.contains(banned), "page contains {banned}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_csp_pins_the_one_stylesheet_by_hash() {
+        let hash = STANDARD.encode(Sha256::digest(STYLE.as_bytes()));
+        assert_eq!(
+            csp(),
+            format!("default-src 'none'; style-src 'sha256-{hash}'; frame-ancestors 'none'; form-action 'self'")
+        );
+        assert!(!csp().contains("unsafe-"), "no unsafe source in the CSP");
     }
 
     #[test]

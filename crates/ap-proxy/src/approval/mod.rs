@@ -109,7 +109,7 @@ pub fn harden(mut resp: Response<Body>) -> Response<Body> {
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; form-action 'self'"),
+        HeaderValue::from_str(page::csp()).expect("the policy is printable ASCII"),
     );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(

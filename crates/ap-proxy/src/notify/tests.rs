@@ -143,15 +143,15 @@ async fn a_non_success_status_is_a_failure_with_one_attempt() {
 }
 
 #[tokio::test]
-async fn a_transport_failure_after_sending_is_not_retried() {
+async fn a_transport_failure_is_retried_once() {
     // The server reads the request and closes without a reply. The message may have been
-    // delivered, so a second send would risk a duplicate.
+    // delivered, so the retry can duplicate it. That is accepted: a missed hold is worse.
     let (base, _, hits) = server(Some(String::new())).await;
     assert_eq!(
         notifier(&base).notify("a", TEXT, URL).await,
         Err(NotifyError)
     );
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -176,7 +176,11 @@ async fn a_silent_server_times_out_within_the_bound() {
     let start = Instant::now();
     assert_eq!(n.notify("a", TEXT, URL).await, Err(NotifyError));
     assert!(start.elapsed() < Duration::from_secs(3));
-    assert_eq!(hits.load(Ordering::SeqCst), 1, "a timeout is not retried");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "a timeout gets one retry, then fails"
+    );
 }
 
 #[tokio::test]

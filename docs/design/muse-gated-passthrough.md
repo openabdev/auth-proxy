@@ -493,15 +493,17 @@ all. An ntfy publish succeeds with zero subscribers, so a hold could be silently
 - **Transport.** A dedicated reqwest client with `no_proxy()`, rustls, redirects off, and a 5 s timeout
   per attempt. Send errors are mapped to a fixed `NotifyError`, because reqwest error text contains the
   URL and so the token.
-- **Retry.** One retry, and only after a failed connect. A failed connect means no byte reached Telegram,
-  so a retry cannot duplicate a message. A timeout or a reply lost after sending is not retried, since
-  the message may already be delivered. The hold path caps the whole notification at 15 s.
+- **Retry.** One retry after any transport error: a failed connect, a timeout, a reset, or a reply lost
+  after sending. No retry after a reply that is not 2xx, because Telegram rejected that send. A lost
+  reply may mean the first message was delivered, so the retry can send a duplicate. The duplicate is
+  accepted: a missed hold is the failure this notifier exists to prevent. The hold path caps the whole
+  notification at 15 s, which covers two 5 s attempts.
 - **Failure.** A failed send writes a `notify_failed` audit record and nothing else. The hold keeps
   waiting for approval or expiry, and no request is forwarded for a missing notification. Approval, CSRF,
   Basic auth and fail-closed expiry are unchanged.
 - **Tests.** The notifier tests run against a loopback mock with a synthetic token. They check the exact
   payload, the token only in the path, the refused token file, the single send on a rejected status,
-  the no-retry on a sent-but-failed request and the timeout bound.
+  one retry after a transport failure (including a timeout), and the timeout bound.
 
 Not claimed: delivery to Telegram is not confirmed to the gate (the Bot API reply is checked only for
 status); a message Telegram accepted can still be missed by the phone. The owner should confirm one real

@@ -97,11 +97,11 @@ impl Ctx {
 }
 
 /// Longest a notification may take, whatever the notifier does: two bounded attempts (one retry
-/// after a failed connect) of five seconds each, with margin.
+/// after any transport error) of five seconds each, with margin.
 const NOTIFY_CAP: Duration = Duration::from_secs(15);
 
 /// Fire-and-forget notification for a new entry: one delivery, with at most one retry inside the
-/// notifier after a failed connect. The link carries only the
+/// notifier after any transport error. The link carries only the
 /// entry id; the text is the fixed sentence. Nothing here waits for the result.
 fn announce(app: &Arc<PtApp>, ctx: &Ctx, id: &str, digest: &str) {
     let (Some(notifier), Some(base)) = (app.notifier.clone(), app.approval_base.clone()) else {

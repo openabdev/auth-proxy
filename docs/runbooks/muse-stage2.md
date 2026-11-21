@@ -75,15 +75,17 @@ Run these yourself. Do not paste the token into chat, a ticket, a commit or this
 3. Find your numeric chat id. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser, using
    your token, and read `message.chat.id`. Use that number as `chat_id`. Delete the browser history entry
    or close the tab, because that URL contains the token.
-4. On the gate host, write the token to a root-owned file, then give the service user read access only:
+4. On the gate host, create the token file owned by the user the `auth-proxy` service runs as, with mode
+   0600. A root-owned 0600 file is unreadable to any other user, so do not install it as root unless the
+   service reads it through systemd `LoadCredential`. Write the token into the file with an editor, not
+   on a command line:
 
    ```
-   sudo install -m 0600 -o root -g root /dev/null /etc/ap/telegram-token
+   install -m 0600 -o <service-user> -g <service-user> /dev/null /etc/ap/telegram-token
    sudoedit /etc/ap/telegram-token        # paste the token, save, nothing else in the file
    ```
 
-   The file path goes in `[notify] token_file`. Keep mode 0600. If the service runs as a different user, set
-   that user as the owner with `sudo chown <service-user> /etc/ap/telegram-token`. No other user may read it.
+   The file path goes in `[notify] token_file`. Keep mode 0600 and no group or other bits. No other user may read it.
 5. Restart `auth-proxy`. A startup error line `notify token file: ...` names only the kind of fault.
 6. Send a test hold from the Muse side. The owner's chat should receive one message with the fixed
    sentence, a request id and a link. Open the link and approve or deny.

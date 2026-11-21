@@ -111,11 +111,12 @@ pub fn read_secret_file(path: &Path) -> Result<String, SecretError> {
     Ok(text.to_string())
 }
 
-/// Why one attempt failed. Only `NotSent` may be retried: a failed connect means no byte reached
-/// Telegram, so a retry cannot duplicate a message.
+/// Why one attempt failed. `Transport` covers every error from `send()` (connect, timeout, reset,
+/// or a lost reply) and gets one retry. The retry can duplicate a message the first attempt
+/// delivered; that risk is accepted. `Rejected` is a reply that is not 2xx and is never retried.
 enum Attempt {
-    NotSent,
-    Failed,
+    Transport,
+    Rejected,
 }
 
 /// Sends one `sendMessage` per notification to the Telegram Bot API. It has its own HTTP client:
@@ -180,17 +181,11 @@ impl TelegramNotifier {
             .body(body.to_vec())
             .send()
             .await
-            .map_err(|e| {
-                if e.is_connect() {
-                    Attempt::NotSent
-                } else {
-                    Attempt::Failed
-                }
-            })?;
+            .map_err(|_| Attempt::Transport)?;
         if resp.status().is_success() {
             Ok(())
         } else {
-            Err(Attempt::Failed)
+            Err(Attempt::Rejected)
         }
     }
 }
@@ -214,8 +209,8 @@ impl Notifier for TelegramNotifier {
         Box::pin(async move {
             match self.send_once(&body).await {
                 Ok(()) => Ok(()),
-                Err(Attempt::NotSent) => self.send_once(&body).await.map_err(|_| NotifyError),
-                Err(Attempt::Failed) => Err(NotifyError),
+                Err(Attempt::Transport) => self.send_once(&body).await.map_err(|_| NotifyError),
+                Err(Attempt::Rejected) => Err(NotifyError),
             }
         })
     }

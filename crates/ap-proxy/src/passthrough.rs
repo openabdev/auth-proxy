@@ -145,12 +145,13 @@ impl PtApp {
         }
     }
 
-    /// Whether the policy in force now still holds `req` for `identity`, for the same upstream.
-    /// Reads the policy at the call. No valid policy answers `false`.
+    /// Whether the policy in force now still holds `req` for `identity`, for the same upstream,
+    /// and a token identity is still inside its pilot window. Reads the policy at the call. No
+    /// valid policy answers `false`.
     pub(crate) fn still_holds(&self, identity: &str, req: &hold::HeldRequest) -> bool {
-        self.policy
-            .current()
-            .is_some_and(|l| still_held(&l.snap, identity, req))
+        self.policy.current().is_some_and(|l| {
+            still_held(&l.snap, identity, req) && !token_expired(&l.cfg, identity, self.clock.now())
+        })
     }
 
     /// The snapshot of the policy in force now, for the approval plane's re-check.
@@ -363,6 +364,28 @@ fn caller_identity<'a>(cfg: &'a Config, caller_key: &str) -> Option<&'a Identity
     found
 }
 
+/// Whether `identity` is an option B token identity whose last accepted second has passed at `now`.
+fn token_expired(cfg: &Config, identity: &str, now: u64) -> bool {
+    cfg.token_identities
+        .iter()
+        .any(|t| t.name == identity && t.expired_at(now))
+}
+
+/// Whether the pilot token is repeated in the route-relative path or the query, in any percent-encoded
+/// spelling. The token is the `Authorization` value without its `Bot ` scheme, and the same
+/// detection that checks the caller key applies to it.
+fn token_echoed(headers: &http::HeaderMap, path: &str, query: Option<&str>) -> bool {
+    let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let token = value.strip_prefix("Bot ").unwrap_or(value);
+    canon::echoes_caller_key(path, token)
+        || query.is_some_and(|q| canon::echoes_caller_key(q, token))
+}
+
 /// Option B (design 4.5): the token identity that a request with no caller key presents. The
 /// `Authorization` value must be the single one and hash to the token bound to this route, the
 /// day must be inside the pilot window, and the policy must give `hold` for that identity on this
@@ -538,7 +561,10 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
             &parts.headers,
             app.clock.now(),
         ) {
-            Ok(name) => (name, parts.uri.path().to_string(), false),
+            Ok(name) => {
+                let echoed = token_echoed(&parts.headers, parts.uri.path(), parts.uri.query());
+                (name, parts.uri.path().to_string(), echoed)
+            }
             Err(code) => return Ok(refuse(&app, &trail, code)),
         }
     } else {

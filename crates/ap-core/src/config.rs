@@ -969,6 +969,13 @@ impl Config {
         // keyed identities, each token is bound to one passthrough route, and each needs a hold
         // grant there, since a keyless request is only ever a hold.
         let mut token_hashes = HashSet::new();
+        // Single caller (design 4.5): one token identity in the whole policy, on one route.
+        if self.token_identities.len() > 1 {
+            return Err(invalid(
+                "the pilot allows one token identity in total, on one route; remove the extra [[token_identity]]"
+                    .to_string(),
+            ));
+        }
         for t in &self.token_identities {
             if !valid_identity_name(&t.name) || !identity_names.insert(t.name.as_str()) {
                 return Err(invalid(format!(
@@ -996,19 +1003,6 @@ impl Config {
                 return Err(invalid(format!(
                     "token identity {:?}: route {:?} is not a passthrough route",
                     t.name, t.route
-                )));
-            }
-            // Single caller (design 4.5): one token per route.
-            if self
-                .token_identities
-                .iter()
-                .filter(|o| o.route == t.route)
-                .count()
-                > 1
-            {
-                return Err(invalid(format!(
-                    "route {:?} has more than one token identity; the pilot allows one caller",
-                    t.route
                 )));
             }
             if !self
@@ -1887,13 +1881,20 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
     }
 
     #[test]
-    fn pilot_allows_one_token_identity_per_route() {
-        let second = format!(
+    fn pilot_allows_one_token_identity_in_total() {
+        let same_route = format!(
             "{}\n[[token_identity]]\nname = \"pilot-c\"\nroute = \"discord\"\ntoken_sha256 = \"{}\"\nexpires = \"2026-12-20\"\n",
             pilot_text(),
             "cd".repeat(32)
         );
-        expect_invalid(&second, "allows one caller");
+        expect_invalid(&same_route, "one token identity");
+        // A second route is refused too: the pilot has one caller on one route.
+        let other_route = format!(
+            "{}\n[[route]]\nname = \"other\"\nhost = \"example.com\"\nmode = \"passthrough\"\n\n[[token_identity]]\nname = \"pilot-c\"\nroute = \"other\"\ntoken_sha256 = \"{}\"\nexpires = \"2026-12-20\"\n\n[[grant]]\nidentity = \"pilot-c\"\nroute = \"other\"\nmethods = [\"POST\"]\ndecision = \"hold\"\npath_patterns = [\"/x/*\"]\n",
+            pilot_text(),
+            "cd".repeat(32)
+        );
+        expect_invalid(&other_route, "one token identity");
     }
 
     #[test]

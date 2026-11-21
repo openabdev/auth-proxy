@@ -2894,3 +2894,79 @@ async fn the_pilot_token_and_its_hash_reach_no_audit_record_or_error_body() {
         }
     }
 }
+
+#[tokio::test]
+async fn pilot_admitted_before_the_cutoff_is_not_forwarded_after_it() {
+    let mock = Mock::start().await;
+    let (t, clock) = pilot_ht("pilot-cross", &mock.up, "2026-12-20", PILOT_REFUSED - 1).await;
+    // Admitted one second before the cutoff, so it is held as usual.
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    // The cutoff passes while the request waits, and the approval lands after it.
+    clock.set(PILOT_REFUSED);
+    assert_eq!(
+        t.app.hold.approve(&id, "alice").await,
+        ApproveResult::PolicyChanged
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 503, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(code(&b), "dropped_on_reload");
+    assert_eq!(t.count("forward_started"), 0);
+    assert_eq!(t.count("dropped_on_reload"), 1);
+    // The connection may have opened before the claim refused; no request reached the upstream.
+    assert!(
+        mock.recorded().is_empty(),
+        "the upstream saw a request after the cutoff"
+    );
+}
+
+/// `s` with every byte percent-encoded.
+fn pct_all(s: &str) -> String {
+    s.bytes().map(|b| format!("%{b:02X}")).collect()
+}
+
+#[tokio::test]
+async fn pilot_token_echoed_in_the_path_or_query_is_refused_before_any_hold() {
+    let mock = Mock::start().await;
+    let (t, _clock) = pilot_ht("pilot-echo", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    let encoded = pct_all(PILOT_TOKEN);
+    // Each spelling with the code it is refused with. An unreserved percent-escape in the path is
+    // refused as ambiguous before the pilot is considered; the query is not subject to that rule.
+    let cases = [
+        (
+            format!("/discord/hold/{PILOT_TOKEN}/messages"),
+            "caller_key_ambiguous",
+        ),
+        (
+            format!("/discord/hold/{encoded}/messages"),
+            "path_ambiguous",
+        ),
+        (
+            format!("/discord/hold/ok/messages?t={PILOT_TOKEN}"),
+            "caller_key_ambiguous",
+        ),
+        (
+            format!("/discord/hold/ok/messages?t={encoded}"),
+            "caller_key_ambiguous",
+        ),
+        (
+            format!("/discord/hold/ok/messages?t={}", pct_all(&encoded)),
+            "caller_key_ambiguous",
+        ),
+    ];
+    for (path, expected) in &cases {
+        let (p, b) = t
+            .send(keyless("POST", path, Some(PILOT_AUTH)))
+            .await
+            .unwrap();
+        assert_eq!(p.status, 400, "{path}: {}", String::from_utf8_lossy(&b));
+        assert_eq!(code(&b), *expected, "{path}");
+    }
+    assert_eq!(t.count("held"), 0, "a hold was built from a token echo");
+    assert!(t.held_ids().is_empty(), "the approval page would list one");
+    assert!(mock.recorded().is_empty(), "the upstream saw a token echo");
+    let audit = t.text();
+    for needle in [PILOT_TOKEN, encoded.as_str()] {
+        assert!(!audit.contains(needle), "{needle} reached the audit stream");
+    }
+}

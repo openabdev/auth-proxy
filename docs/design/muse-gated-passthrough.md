@@ -685,7 +685,8 @@ decision = "hold"
 **Expiry.** `expires` is a policy value, not a constant. The token is accepted through the last second of
 `expires` (UTC) and refused from `expires` + 1 day, 00:00:00 UTC, with `caller_rejected`. A malformed date
 fails closed at load. The pilot policy sets `expires = "2026-12-20"`, so B requests are refused from
-2026-12-21 UTC. Nothing is forwarded after that, and nothing is held.
+2026-12-21 UTC. Nothing is forwarded after that, and nothing is held. The expiry is checked again at the start
+claim, so a request held before the cutoff and approved after it is not forwarded.
 
 **Identity rule.**
 
@@ -697,8 +698,8 @@ fails closed at load. The pilot policy sets `expires = "2026-12-20"`, so B reque
 - The token, its hash, and any prefix of either never appear in an audit record, a log line, an error body or
   a notification. Tests in `hold_tests.rs` check this on the held, approved, wrong-token, missing-token and
   expired paths.
-- Config validation refuses a second token identity on the same route, so the one-caller limit is enforced at
-  load, not only by convention.
+- Config validation refuses a second token identity anywhere in the policy, whatever its route, so the
+  one-caller and one-route limit is enforced at load, not only by convention.
 
 **Compensating controls.** All of these are required for the pilot:
 
@@ -707,7 +708,8 @@ fails closed at load. The pilot policy sets `expires = "2026-12-20"`, so B reque
 2. **Phone approval on every write.** Every B request is a `hold` in the same hold table, with the same
    notification, the same `hold_secs` window (90 s for this pilot), the same audit records and the same
    fail-closed rules as the keyed write route in 3.4 to 3.9. The approval plane is unchanged (3.6).
-3. **Single caller.** One token identity per route, enforced at config load (above).
+3. **Single caller, one route.** One token identity in the whole policy, bound to one route. Config load
+   refuses a second `[[token_identity]]` whatever its route, so this limit is enforced by code.
 4. **Expiry.** The token stops working at the pilot end date, as above.
 5. **Mandatory re-review before any second caller.** A second token identity, a second route, or any
    keyless caller other than the one above needs a new design review and a new decision. This section does

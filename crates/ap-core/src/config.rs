@@ -186,20 +186,20 @@ fn default_realm() -> String {
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum NotifyKind {
-    Ntfy,
+    Telegram,
 }
 
-/// Notifier settings. The topic and token are read from files at startup, never from this file.
+/// Notifier settings. The bot token is read from a file at startup, never from this file.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Notify {
     pub kind: NotifyKind,
-    pub base_url: String,
-    /// Absolute path of a regular file (mode 0600) holding the topic.
-    pub topic_file: String,
-    /// Absolute path of a regular file (mode 0600) holding a bearer token. Optional.
-    #[serde(default)]
-    pub token_file: Option<String>,
+    /// Absolute path of a regular file (mode 0600) holding the Telegram bot token.
+    pub token_file: String,
+    /// Telegram chat id: a number (negative for groups) or an `@channelusername`. Not a secret.
+    pub chat_id: String,
+    /// Base URL the notification link is built from. Same rules as `public_base_url`.
+    pub approval_url_base: String,
 }
 
 fn default_caller_key_header() -> String {
@@ -698,21 +698,33 @@ fn validate_approval(a: &Approval, proxy: SocketAddr) -> Result<(), ConfigError>
     Ok(())
 }
 
+/// A numeric chat id (optionally negative) or a channel username: `@` then 5 to 32 letters, digits
+/// or underscores.
+fn valid_chat_id(c: &str) -> bool {
+    let digits = c.strip_prefix('-').unwrap_or(c);
+    let numeric =
+        !digits.is_empty() && digits.len() <= 20 && digits.bytes().all(|b| b.is_ascii_digit());
+    let channel = c.strip_prefix('@').is_some_and(|name| {
+        (5..=32).contains(&name.len())
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    });
+    numeric || channel
+}
+
 fn validate_notify(n: &Notify) -> Result<(), ConfigError> {
-    if !valid_base_url(&n.base_url) {
+    if !valid_base_url(&n.approval_url_base) {
         return Err(invalid(
-            "notify.base_url must be an http(s) URL without userinfo, query or fragment",
+            "notify.approval_url_base must be an http(s) URL without userinfo, query or fragment",
         ));
     }
-    for (field, path) in [
-        ("topic_file", Some(&n.topic_file)),
-        ("token_file", n.token_file.as_ref()),
-    ] {
-        if let Some(p) = path {
-            if !p.starts_with('/') || p.len() > 1024 || p.bytes().any(|b| b == 0) {
-                return Err(invalid(format!("notify.{field} must be an absolute path")));
-            }
-        }
+    if !valid_chat_id(&n.chat_id) {
+        return Err(invalid(
+            "notify.chat_id must be a numeric id or an @channelusername",
+        ));
+    }
+    let p = &n.token_file;
+    if !p.starts_with('/') || p.len() > 1024 || p.bytes().any(|b| b == 0) {
+        return Err(invalid("notify.token_file must be an absolute path"));
     }
     Ok(())
 }
@@ -2135,7 +2147,7 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
 
     fn approval_block() -> String {
         format!(
-            "\n[approval]\nlisten = \"127.0.0.1:8444\"\nuser = \"owner\"\npassword_sha256 = \"{H64}\"\npublic_base_url = \"https://approve.example.test\"\n\n[notify]\nkind = \"ntfy\"\nbase_url = \"https://ntfy.example.test\"\ntopic_file = \"/etc/ap/topic\"\ntoken_file = \"/etc/ap/token\"\n"
+            "\n[approval]\nlisten = \"127.0.0.1:8444\"\nuser = \"owner\"\npassword_sha256 = \"{H64}\"\npublic_base_url = \"https://approve.example.test\"\n\n[notify]\nkind = \"telegram\"\ntoken_file = \"/etc/ap/telegram-token\"\nchat_id = \"-1001234567890\"\napproval_url_base = \"https://approve.example.test\"\n"
         )
     }
 
@@ -2144,7 +2156,10 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
         let cfg = load(&(hold_text() + &approval_block())).unwrap();
         let a = cfg.approval.unwrap();
         assert_eq!(a.realm, "auth-proxy approval");
-        assert_eq!(cfg.notify.unwrap().kind, NotifyKind::Ntfy);
+        let n = cfg.notify.unwrap();
+        assert_eq!(n.kind, NotifyKind::Telegram);
+        assert_eq!(n.chat_id, "-1001234567890");
+        assert_eq!(n.token_file, "/etc/ap/telegram-token");
     }
 
     #[test]
@@ -2159,27 +2174,50 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
             ("user = \"owner\"", "user = \"a:b\"", "approval.user"),
             (H64, "ABC", "password_sha256"),
             (
-                "https://approve.example.test",
-                "https://u:p@x.test",
+                "https://approve.example.test\"\n\n[notify]",
+                "https://u:p@x.test\"\n\n[notify]",
                 "public_base_url",
             ),
             (
-                "https://approve.example.test",
-                "https://x.test/?q=1",
+                "https://approve.example.test\"\n\n[notify]",
+                "https://x.test/?q=1\"\n\n[notify]",
                 "public_base_url",
             ),
             (
-                "https://approve.example.test",
-                "ftp://x.test",
+                "https://approve.example.test\"\n\n[notify]",
+                "ftp://x.test\"\n\n[notify]",
                 "public_base_url",
             ),
             (
-                "https://ntfy.example.test",
-                "ntfy.example.test",
-                "notify.base_url",
+                "approval_url_base = \"https://approve.example.test\"",
+                "approval_url_base = \"https://u:p@x.test\"",
+                "notify.approval_url_base",
             ),
-            ("/etc/ap/topic", "topic", "topic_file"),
-            ("/etc/ap/token", "token", "token_file"),
+            (
+                "approval_url_base = \"https://approve.example.test\"",
+                "approval_url_base = \"approve.example.test\"",
+                "notify.approval_url_base",
+            ),
+            (
+                "chat_id = \"-1001234567890\"",
+                "chat_id = \"12a\"",
+                "notify.chat_id",
+            ),
+            (
+                "chat_id = \"-1001234567890\"",
+                "chat_id = \"@abc\"",
+                "notify.chat_id",
+            ),
+            (
+                "chat_id = \"-1001234567890\"",
+                "chat_id = \"\"",
+                "notify.chat_id",
+            ),
+            (
+                "/etc/ap/telegram-token",
+                "telegram-token",
+                "token_file",
+            ),
         ] {
             let text = hold_text() + &approval_block().replacen(from, to, 1);
             expect_invalid(&text, needle);
@@ -2187,6 +2225,21 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
         let text = hold_text() + &approval_block() + "extra = 1\n";
         expect_parse_error(&text);
     }
+
+    #[test]
+    fn stale_ntfy_keys_are_refused() {
+        for stale in [
+            "kind = \"ntfy\"",
+            "base_url = \"https://ntfy.example.test\"\n",
+            "topic_file = \"/etc/ap/topic\"\n",
+        ] {
+            let text = hold_text() + &approval_block().replacen("kind = \"telegram\"", stale, 1);
+            expect_parse_error(&text);
+        }
+        let text = hold_text() + &approval_block() + "topic_file = \"/etc/ap/topic\"\n";
+        expect_parse_error(&text);
+    }
+
 
     #[test]
     fn approval_needs_a_passthrough_deployment() {

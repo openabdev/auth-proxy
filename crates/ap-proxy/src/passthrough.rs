@@ -150,7 +150,9 @@ impl PtApp {
     /// valid policy answers `false`.
     pub(crate) fn still_holds(&self, identity: &str, req: &hold::HeldRequest) -> bool {
         self.policy.current().is_some_and(|l| {
-            still_held(&l.snap, identity, req) && !token_expired(&l.cfg, identity, self.clock.now())
+            still_held(&l.snap, identity, req)
+                && !token_expired(&l.cfg, identity, self.clock.now())
+                && token_bound(&l.cfg, identity, req)
         })
     }
 
@@ -369,6 +371,35 @@ fn token_expired(cfg: &Config, identity: &str, now: u64) -> bool {
     cfg.token_identities
         .iter()
         .any(|t| t.name == identity && t.expired_at(now))
+}
+
+/// Whether a token identity's held request still carries the token the policy binds to it. The
+/// held `Authorization` value must be the only one and hash, as admission hashed it, to the
+/// identity's current `token_sha256`. A keyed identity has no token, so it passes.
+fn token_bound(cfg: &Config, identity: &str, req: &hold::HeldRequest) -> bool {
+    let Some(token) = cfg.token_identities.iter().find(|t| t.name == identity) else {
+        return true;
+    };
+    let mut values = req
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case(header::AUTHORIZATION.as_str()))
+        .map(|(_, v)| v);
+    let value = match (values.next(), values.next()) {
+        (Some(v), None) => v,
+        _ => return false,
+    };
+    let Ok(value) = http::HeaderValue::from_bytes(value) else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let presented = sha256_hex(value);
+    presented
+        .as_bytes()
+        .ct_eq(token.token_sha256.as_bytes())
+        .into()
 }
 
 /// Whether the pilot token is repeated in the route-relative path or the query, in any percent-encoded

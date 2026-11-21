@@ -1015,6 +1015,16 @@ impl Config {
                     t.name, t.route
                 )));
             }
+            // A keyless request is only ever a hold (design 4.5), so any other grant for this
+            // identity could never authorize a request. Refused here instead of ignored at runtime.
+            if let Some(g) = self.grants.iter().find(|g| {
+                g.identity == t.name && (g.route != t.route || g.decision != Decision::Hold)
+            }) {
+                return Err(invalid(format!(
+                    "token identity {:?} may hold only: grant on route {:?} with decision {:?} is not a hold on route {:?}",
+                    t.name, g.route, g.decision, t.route
+                )));
+            }
         }
         // A hold pattern must not share a request with an allow grant of the same identity,
         // route and method. Hold wins when both match, but a spelling of the held resource that
@@ -1866,6 +1876,25 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
     fn token_identity_needs_a_hold_grant_on_its_route() {
         let text = pilot_text().replace("decision = \"hold\"", "decision = \"allow\"");
         expect_invalid(&text, "needs a hold grant");
+    }
+
+    #[test]
+    fn token_identity_may_hold_only_on_its_bound_route() {
+        // An allow grant for the token identity on its own route: never reached, since a keyless
+        // request is only ever a hold.
+        let allow = format!(
+            "{}\n[[grant]]\nidentity = \"pilot-b\"\nroute = \"discord\"\nmethods = [\"GET\"]\ndecision = \"allow\"\npath_patterns = [\"/api/v10/users/*\"]\n",
+            pilot_text()
+        );
+        expect_invalid(&allow, "may hold only");
+        // A hold grant for the token identity on another passthrough route: also never reached.
+        let other_route = format!(
+            "{}\n[[route]]\nname = \"other\"\nhost = \"example.com\"\nmode = \"passthrough\"\n\n[[grant]]\nidentity = \"pilot-b\"\nroute = \"other\"\nmethods = [\"POST\"]\ndecision = \"hold\"\npath_patterns = [\"/x/*\"]\n",
+            pilot_text()
+        );
+        expect_invalid(&other_route, "may hold only");
+        // The hold grant on the bound route alone still loads.
+        assert!(load(&pilot_text()).is_ok());
     }
 
     #[test]

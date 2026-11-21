@@ -2684,6 +2684,7 @@ async fn caller_key_repeated_in_the_path_or_query_is_refused_before_anything_is_
 const PILOT_NAME: &str = "muse-pilot-b";
 const PILOT_TOKEN: &str = "SENTINEL-PILOT-TOKEN-0003";
 const PILOT_AUTH: &str = "Bot SENTINEL-PILOT-TOKEN-0003";
+const PILOT_ROTATED_AUTH: &str = "Bot SENTINEL-PILOT-TOKEN-0004";
 const PILOT_WRITE: &str = "/discord/hold/ok/messages";
 /// 2026-12-20T00:00:00Z, the first second of the last valid day.
 const PILOT_LAST_DAY: u64 = 1_797_724_800;
@@ -2917,6 +2918,33 @@ async fn pilot_admitted_before_the_cutoff_is_not_forwarded_after_it() {
     assert!(
         mock.recorded().is_empty(),
         "the upstream saw a request after the cutoff"
+    );
+}
+
+#[tokio::test]
+async fn pilot_hold_admitted_before_a_token_rotation_is_not_forwarded_after_it() {
+    let mock = Mock::start().await;
+    let (t, _clock) = pilot_ht("pilot-rotate", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    // Admitted with the old token, which the policy binds by `token_sha256`.
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    // The operator rotates the hash only: the name, the route and the grant stay as they were.
+    t.rewrite(|s| s.replacen(&sha256_hex(PILOT_AUTH), &sha256_hex(PILOT_ROTATED_AUTH), 1));
+    assert_eq!(
+        t.approve_checked(&id).await,
+        ApproveResult::PolicyChanged,
+        "the held Authorization no longer matches the token in force"
+    );
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 503, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(code(&b), "dropped_on_reload");
+    assert_eq!(t.count("forward_started"), 0);
+    assert_eq!(t.count("dropped_on_reload"), 1);
+    // `hits` counts accepted connections, which can open before the claim refuses. A request
+    // is what reaches the upstream, so the recorded requests are the check.
+    assert!(
+        mock.recorded().is_empty(),
+        "the upstream received a request after the rotation"
     );
 }
 

@@ -356,29 +356,21 @@ a passthrough-only config has no per-UID rules"
         held_client,
     );
     if let Some(n) = notify_cfg {
-        let Some(a) = &approval_cfg else {
+        if approval_cfg.is_none() {
             eprintln!("auth-proxy: [notify] needs an [approval] block to link to");
             return 2;
-        };
-        let topic = match notify::read_secret_file(std::path::Path::new(&n.topic_file)) {
+        }
+        let token = match notify::read_secret_file(std::path::Path::new(&n.token_file)) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("auth-proxy: notify topic file: {e}");
+                eprintln!("auth-proxy: notify token file: {e}");
                 return 2;
             }
         };
-        let token = match n.token_file.as_deref().map(std::path::Path::new) {
-            Some(p) => match notify::read_secret_file(p) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    eprintln!("auth-proxy: notify token file: {e}");
-                    return 2;
-                }
-            },
-            None => None,
-        };
-        match notify::NtfyNotifier::new(&n.base_url, &topic, token.as_deref()) {
-            Ok(nt) => passthrough::PtApp::set_notifier(&mut app, Arc::new(nt), &a.public_base_url),
+        match notify::TelegramNotifier::new(&token, &n.chat_id) {
+            Ok(nt) => {
+                passthrough::PtApp::set_notifier(&mut app, Arc::new(nt), &n.approval_url_base)
+            }
             Err(e) => {
                 eprintln!("auth-proxy: cannot build the notifier: {e}");
                 return 2;

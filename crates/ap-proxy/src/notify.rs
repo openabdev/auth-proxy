@@ -1,9 +1,10 @@
-//! Notification hook for new hold entries (design 3.4 step 5).
+//! Notification hook for new hold entries (design 3.4 step 5, 3.6.1).
 //!
 //! The gate stores an optional [`Notifier`] and calls it for a new distinct entry, never for a
-//! supersede, once and without retry. The text is fixed and carries nothing from the request. The
-//! ntfy implementation reads its topic and token from files that only the owner may read, and no
-//! error or Debug output of this module contains either.
+//! supersede. The Telegram implementation sends one `sendMessage` per call. Its text is the fixed
+//! sentence, the request id and the approval link, and nothing else. The Bot API takes the token in
+//! the URL path, so the token file is read under the rules for every secret file here, and no error
+//! or Debug output of this module contains the URL, the token or the chat id.
 
 use std::fmt;
 use std::future::Future;
@@ -13,12 +14,18 @@ use std::path::Path;
 use std::pin::Pin;
 use std::time::Duration;
 
-use reqwest::header::{HeaderValue, AUTHORIZATION};
+use reqwest::header::CONTENT_TYPE;
 
-/// The only text a notification may carry.
+/// The fixed sentence that opens every notification.
 pub const TEXT: &str = "A gated request is waiting for approval.";
 
-/// A notification could not be delivered. It carries no detail, so no URL, topic or token can
+/// The Bot API root. Production always uses this; tests point the notifier at a loopback mock.
+pub const TELEGRAM_API: &str = "https://api.telegram.org";
+
+/// Per attempt: connect and whole request each get this long.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A notification could not be delivered. It carries no detail, so no URL, token or chat id can
 /// reach a log through it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotifyError;
@@ -33,7 +40,8 @@ impl std::error::Error for NotifyError {}
 
 /// Sends one notification about a new held request.
 pub trait Notifier: Send + Sync {
-    /// One attempt, no retry. `text` is [`TEXT`]; `approval_url` points at the entry's page.
+    /// One delivery, with at most one bounded retry inside the implementation. `text` is [`TEXT`];
+    /// `approval_url` points at the entry's page.
     fn notify(
         &self,
         request_id: &str,
@@ -42,7 +50,7 @@ pub trait Notifier: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + '_>>;
 }
 
-/// Longest secret file read. A topic or token is far shorter.
+/// Longest secret file read. A token is far shorter.
 const SECRET_MAX_BYTES: u64 = 4096;
 
 /// A secret file was refused. The message names the kind of fault, never the path or contents.
@@ -54,7 +62,7 @@ pub enum SecretError {
     TooPermissive,
     Empty,
     TooLong,
-    /// Not valid UTF-8, or holds a character that cannot be part of a topic or header value.
+    /// Not valid UTF-8, or holds a character that cannot be part of a token.
     Invalid,
 }
 
@@ -103,53 +111,53 @@ pub fn read_secret_file(path: &Path) -> Result<String, SecretError> {
     Ok(text.to_string())
 }
 
-/// Sends one POST per notification to an ntfy server. It has its own HTTP client: five second
-/// timeout, no redirects, never the upstream client.
-pub struct NtfyNotifier {
+/// Why one attempt failed. `Transport` covers every error from `send()` (connect, timeout, reset,
+/// or a lost reply) and gets one retry. The retry can duplicate a message the first attempt
+/// delivered; that risk is accepted. `Rejected` is a reply that is not 2xx and is never retried.
+enum Attempt {
+    Transport,
+    Rejected,
+}
+
+/// Sends one `sendMessage` per notification to the Telegram Bot API. It has its own HTTP client:
+/// `no_proxy`, rustls, a five second timeout per attempt, and no redirects.
+pub struct TelegramNotifier {
     client: reqwest::Client,
-    /// `{base_url}/{topic}`. This is the topic, so it is never printed.
+    /// `{api}/bot{token}/sendMessage`. The token is in the path, so this is never printed.
     url: String,
-    bearer: Option<HeaderValue>,
+    chat_id: String,
 }
 
-impl fmt::Debug for NtfyNotifier {
+impl fmt::Debug for TelegramNotifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("NtfyNotifier(..)")
+        f.write_str("TelegramNotifier(..)")
     }
 }
 
-impl NtfyNotifier {
-    /// Build from the server base URL and the secrets read by [`read_secret_file`]. A topic holds
-    /// only letters, digits, `-` and `_`.
-    pub fn new(base_url: &str, topic: &str, token: Option<&str>) -> Result<Self, NotifyError> {
-        Self::with_timeout(base_url, topic, token, Duration::from_secs(5))
+impl TelegramNotifier {
+    /// Build for the production Bot API.
+    pub fn new(token: &str, chat_id: &str) -> Result<Self, NotifyError> {
+        Self::with_api(TELEGRAM_API, token, chat_id, SEND_TIMEOUT)
     }
 
-    pub(crate) fn with_timeout(
-        base_url: &str,
-        topic: &str,
-        token: Option<&str>,
+    /// Build against `api` (scheme, host and port, no path) with a given per-attempt timeout.
+    /// The token must be a Bot API token (`digits:letters`): it goes into the URL path, so a `/`,
+    /// `?` or `#` in it could change the route.
+    pub(crate) fn with_api(
+        api: &str,
+        token: &str,
+        chat_id: &str,
         timeout: Duration,
     ) -> Result<Self, NotifyError> {
-        let valid_topic = !topic.is_empty()
-            && topic
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-        if !valid_topic {
+        let valid_token = !token.is_empty()
+            && token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b':' || b == b'_' || b == b'-');
+        if !valid_token || chat_id.is_empty() {
             return Err(NotifyError);
         }
-        let bearer = match token {
-            Some(t) => {
-                let mut v =
-                    HeaderValue::from_str(&format!("Bearer {t}")).map_err(|_| NotifyError)?;
-                v.set_sensitive(true);
-                Some(v)
-            }
-            None => None,
-        };
-        // `no_proxy` also turns off system proxy detection: the topic URL, the bearer token and
-        // the approval link go to the configured ntfy host and nowhere else. Redirects are never
-        // followed, so a reply cannot send them to another host either.
+        // `no_proxy` also turns off system proxy detection: the token-bearing URL goes to the
+        // configured API host and nowhere else. Redirects are never followed.
         let client = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(timeout)
@@ -157,37 +165,52 @@ impl NtfyNotifier {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| NotifyError)?;
-        Ok(NtfyNotifier {
+        Ok(TelegramNotifier {
             client,
-            url: format!("{}/{topic}", base_url.trim_end_matches('/')),
-            bearer,
+            url: format!("{}/bot{token}/sendMessage", api.trim_end_matches('/')),
+            chat_id: chat_id.to_string(),
         })
+    }
+
+    async fn send_once(&self, body: &[u8]) -> Result<(), Attempt> {
+        // The error is dropped: its text contains the URL, and so the token.
+        let resp = self
+            .client
+            .post(&self.url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(|_| Attempt::Transport)?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(Attempt::Rejected)
+        }
     }
 }
 
-impl Notifier for NtfyNotifier {
+impl Notifier for TelegramNotifier {
     fn notify(
         &self,
-        _request_id: &str,
+        request_id: &str,
         text: &str,
         approval_url: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + '_>> {
-        let text = text.to_string();
-        let click = HeaderValue::from_str(approval_url).map_err(|_| NotifyError);
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": format!("{text}\nRequest: {request_id}\n{approval_url}"),
+            "link_preview_options": { "is_disabled": true },
+        });
+        let body = match serde_json::to_vec(&body) {
+            Ok(b) => b,
+            Err(_) => return Box::pin(async { Err(NotifyError) }),
+        };
         Box::pin(async move {
-            let mut req = self
-                .client
-                .post(&self.url)
-                .header("Click", click?)
-                .body(text);
-            if let Some(b) = &self.bearer {
-                req = req.header(AUTHORIZATION, b.clone());
-            }
-            let resp = req.send().await.map_err(|_| NotifyError)?;
-            if resp.status().is_success() {
-                Ok(())
-            } else {
-                Err(NotifyError)
+            match self.send_once(&body).await {
+                Ok(()) => Ok(()),
+                Err(Attempt::Transport) => self.send_once(&body).await.map_err(|_| NotifyError),
+                Err(Attempt::Rejected) => Err(NotifyError),
             }
         })
     }

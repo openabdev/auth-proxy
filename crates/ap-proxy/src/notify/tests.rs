@@ -1,4 +1,5 @@
-//! The ntfy notifier against a local TCP server, and the secret-file loader.
+//! The Telegram notifier against a local TCP server, and the secret-file loader. Every value here is
+//! synthetic and no test reaches the real Bot API.
 
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,9 +12,10 @@ use tokio::net::TcpListener;
 use super::*;
 use crate::test_support::Scratch;
 
-const TOKEN: &str = "tk_SECRET_TOKEN_0007";
-const TOPIC: &str = "secret-topic-0008";
+const TOKEN: &str = "123456:SYNTHETIC_TOKEN_0007";
+const CHAT: &str = "-100777000111";
 const URL: &str = "https://approve.example.test/pending/abc123";
+const REQ_ID: &str = "abc123";
 
 /// What the server saw: the head (request line and headers) and the body.
 #[derive(Clone, Debug, Default)]
@@ -82,45 +84,74 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+fn notifier(api: &str) -> TelegramNotifier {
+    TelegramNotifier::with_api(api, TOKEN, CHAT, Duration::from_secs(5)).unwrap()
+}
+
 #[tokio::test]
-async fn posts_the_fixed_text_with_click_and_bearer() {
-    let (base, seen, _) = server(Some(ok())).await;
-    let n = NtfyNotifier::new(&format!("{base}/"), TOPIC, Some(TOKEN)).unwrap();
-    n.notify("abc123", TEXT, URL).await.unwrap();
+async fn sends_one_send_message_with_only_the_fixed_text_id_and_link() {
+    let (base, seen, hits) = server(Some(ok())).await;
+    notifier(&base).notify(REQ_ID, TEXT, URL).await.unwrap();
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "one send, no retry on success"
+    );
     let s = seen.lock().unwrap()[0].clone();
+
+    // The token is in the path, and only there.
     assert!(
-        s.head.starts_with(&format!("POST /{TOPIC} HTTP/1.1")),
+        s.head
+            .starts_with(&format!("POST /bot{TOKEN}/sendMessage HTTP/1.1")),
         "{}",
         s.head
     );
-    assert_eq!(s.body, TEXT);
-    assert_eq!(header(&s.head, "click"), Some(URL));
-    assert_eq!(
-        header(&s.head, "authorization"),
-        Some(format!("Bearer {TOKEN}").as_str())
-    );
-    assert!(!s.head.contains("abc123 ") && !s.body.contains("abc123"));
-}
-
-#[tokio::test]
-async fn no_bearer_header_without_a_token() {
-    let (base, seen, _) = server(Some(ok())).await;
-    let n = NtfyNotifier::new(&base, TOPIC, None).unwrap();
-    n.notify("abc123", TEXT, URL).await.unwrap();
-    let s = seen.lock().unwrap()[0].clone();
+    assert_eq!(s.head.matches(TOKEN).count(), 1);
+    assert!(!s.body.contains(TOKEN));
     assert!(header(&s.head, "authorization").is_none());
+    assert_eq!(header(&s.head, "content-type"), Some("application/json"));
+
+    // The body is the chat id, the fixed text with the id and the link, and link preview off.
+    let json: serde_json::Value = serde_json::from_str(&s.body).unwrap();
+    let keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+    assert_eq!(json["chat_id"], CHAT);
+    assert_eq!(json["text"], format!("{TEXT}\nRequest: {REQ_ID}\n{URL}"));
+    assert_eq!(json["link_preview_options"]["is_disabled"], true);
 }
 
 #[tokio::test]
-async fn a_non_success_status_is_a_failure() {
+async fn a_non_success_status_is_a_failure_with_one_attempt() {
     let (base, _, hits) = server(Some(
-        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-            .to_string(),
+        "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
     ))
     .await;
-    let n = NtfyNotifier::new(&base, TOPIC, None).unwrap();
-    assert_eq!(n.notify("a", TEXT, URL).await, Err(NotifyError));
-    assert_eq!(hits.load(Ordering::SeqCst), 1, "one attempt, no retry");
+    assert_eq!(
+        notifier(&base).notify("a", TEXT, URL).await,
+        Err(NotifyError)
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "a rejected send is not retried"
+    );
+}
+
+#[tokio::test]
+async fn a_transport_failure_is_retried_once() {
+    // The server reads the request and closes without a reply. The message may have been
+    // delivered, so the retry can duplicate it. That is accepted: a missed hold is worse.
+    let (base, _, hits) = server(Some(String::new())).await;
+    assert_eq!(
+        notifier(&base).notify("a", TEXT, URL).await,
+        Err(NotifyError)
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -130,39 +161,71 @@ async fn a_redirect_is_not_followed() {
         "HTTP/1.1 307 Temporary Redirect\r\nlocation: {target}/elsewhere\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
     )))
     .await;
-    let n = NtfyNotifier::new(&base, TOPIC, Some(TOKEN)).unwrap();
-    assert_eq!(n.notify("a", TEXT, URL).await, Err(NotifyError));
+    assert_eq!(
+        notifier(&base).notify("a", TEXT, URL).await,
+        Err(NotifyError)
+    );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     assert_eq!(target_hits.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn a_silent_server_times_out() {
-    let (base, _, _) = server(None).await;
-    let n = NtfyNotifier::with_timeout(&base, TOPIC, None, Duration::from_millis(300)).unwrap();
+async fn a_silent_server_times_out_within_the_bound() {
+    let (base, _, hits) = server(None).await;
+    let n = TelegramNotifier::with_api(&base, TOKEN, CHAT, Duration::from_millis(300)).unwrap();
     let start = Instant::now();
     assert_eq!(n.notify("a", TEXT, URL).await, Err(NotifyError));
     assert!(start.elapsed() < Duration::from_secs(3));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "a timeout gets one retry, then fails"
+    );
 }
 
 #[tokio::test]
-async fn a_dead_server_is_a_failure() {
+async fn a_dead_server_is_a_bounded_failure() {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", l.local_addr().unwrap());
     drop(l);
-    let n = NtfyNotifier::new(&base, TOPIC, None).unwrap();
+    let n = TelegramNotifier::with_api(&base, TOKEN, CHAT, Duration::from_millis(300)).unwrap();
+    let start = Instant::now();
     assert_eq!(n.notify("a", TEXT, URL).await, Err(NotifyError));
+    // One retry on a refused connect, each attempt bounded by the timeout.
+    assert!(start.elapsed() < Duration::from_secs(3));
 }
 
 #[test]
-fn bad_topics_and_tokens_are_refused_and_debug_hides_them() {
-    for topic in ["", "a/b", "a b", "t?x=1", "t#f"] {
-        assert!(NtfyNotifier::new("http://127.0.0.1:1", topic, None).is_err());
+fn bad_tokens_and_chat_ids_are_refused_and_debug_hides_them() {
+    for token in [
+        "",
+        "123:abc/def",
+        "123:abc?x=1",
+        "123:abc#f",
+        "123 456",
+        "a\nb",
+    ] {
+        assert!(TelegramNotifier::with_api(
+            "http://127.0.0.1:1",
+            token,
+            CHAT,
+            Duration::from_secs(1)
+        )
+        .is_err());
     }
-    assert!(NtfyNotifier::new("http://127.0.0.1:1", TOPIC, Some("bad\ntoken")).is_err());
-    let n = NtfyNotifier::new("http://127.0.0.1:1", TOPIC, Some(TOKEN)).unwrap();
+    assert!(
+        TelegramNotifier::with_api("http://127.0.0.1:1", TOKEN, "", Duration::from_secs(1))
+            .is_err()
+    );
+    let n = notifier("http://127.0.0.1:1");
     let shown = format!("{n:?} {}", NotifyError);
-    assert!(!shown.contains(TOPIC) && !shown.contains(TOKEN));
+    assert!(!shown.contains(TOKEN) && !shown.contains(CHAT));
+}
+
+#[test]
+fn production_notifier_targets_the_bot_api_root() {
+    assert_eq!(TELEGRAM_API, "https://api.telegram.org");
+    assert!(TelegramNotifier::new(TOKEN, CHAT).is_ok());
 }
 
 fn secret(tag: &str, mode: u32, text: &str) -> (Scratch, std::path::PathBuf) {
@@ -174,18 +237,18 @@ fn secret(tag: &str, mode: u32, text: &str) -> (Scratch, std::path::PathBuf) {
 }
 
 #[test]
-fn secret_file_with_mode_0600_is_read_and_trimmed() {
-    let (_s, p) = secret("sec-ok", 0o600, "  my-topic\n\n");
-    assert_eq!(read_secret_file(&p).unwrap(), "my-topic");
+fn token_file_with_mode_0600_is_read_and_trimmed() {
+    let (_s, p) = secret("tok-ok", 0o600, &format!("{TOKEN}\n\n"));
+    assert_eq!(read_secret_file(&p).unwrap(), TOKEN);
 }
 
 #[test]
-fn secret_file_readable_by_group_or_other_is_refused() {
+fn token_file_readable_by_group_or_other_is_refused() {
     for mode in [0o644, 0o640, 0o604, 0o660, 0o666, 0o601] {
-        let (_s, p) = secret("sec-perm", mode, "my-topic\n");
+        let (_s, p) = secret("tok-perm", mode, &format!("{TOKEN}\n"));
         let e = read_secret_file(&p).unwrap_err();
         assert_eq!(e, SecretError::TooPermissive, "mode {mode:o}");
-        assert!(!e.to_string().contains("my-topic"));
+        assert!(!e.to_string().contains(TOKEN));
     }
 }
 
@@ -294,7 +357,7 @@ async fn isolated_notifier_ignores_proxy_variables() {
     // request and the assertions below mean something.
     let control = reqwest::Client::builder().build().unwrap();
     let _ = control
-        .post("http://notify.example.test/control")
+        .post("http://telegram.example.test/control")
         .send()
         .await;
     assert!(
@@ -304,13 +367,19 @@ async fn isolated_notifier_ignores_proxy_variables() {
     let before = hits.load(Ordering::SeqCst);
     let before_seen = seen.lock().unwrap().len();
 
-    let n = NtfyNotifier::new("http://notify.example.test", TOPIC, Some(TOKEN)).unwrap();
+    let n = TelegramNotifier::with_api(
+        "http://telegram.example.test",
+        TOKEN,
+        CHAT,
+        Duration::from_secs(2),
+    )
+    .unwrap();
     let r = n.notify("id", TEXT, URL).await;
     assert!(r.is_err(), "the name does not resolve, so the send fails");
     assert_eq!(hits.load(Ordering::SeqCst), before, "the proxy was dialled");
     let all = format!("{:?}", seen.lock().unwrap());
     assert_eq!(seen.lock().unwrap().len(), before_seen);
-    for s in [TOKEN, TOPIC, URL] {
+    for s in [TOKEN, CHAT, URL] {
         assert!(!all.contains(s), "{s} reached the proxy");
     }
 }

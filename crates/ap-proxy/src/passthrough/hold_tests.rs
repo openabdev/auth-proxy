@@ -2955,6 +2955,45 @@ async fn pilot_hold_admitted_before_a_token_rotation_is_not_forwarded_after_it()
 }
 
 #[tokio::test]
+async fn pilot_callback_approve_is_not_forwarded_when_the_token_rotates_before_the_claim() {
+    let mock = Mock::start().await;
+    let (t, _clock) = pilot_ht("pilot-cb-rotate", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;
+    let h = t.spawn(keyless("POST", PILOT_WRITE, Some(PILOT_AUTH)));
+    let id = t.held(1).await;
+    let (nonce, _) = t.app.hold.test_secrets(&id).expect("pending");
+    let gate = Gate::new();
+    t.app.pause.set_after_approve(Arc::clone(&gate));
+    // The callback approve transition runs under the token identity in force, so it starts.
+    let started = t.app.hold.transition_by_callback(
+        &id,
+        &nonce,
+        crate::hold::CallbackAction::Approve,
+        "telegram-owner",
+        |identity: &str, req: &crate::hold::HeldRequest| t.app.still_holds(identity, req),
+    );
+    let crate::hold::CallbackTransition::ApproveStarted(rx) = started else {
+        panic!("the callback approve did not start");
+    };
+    let confirm = tokio::spawn(crate::hold::Table::await_confirm(rx));
+    tokio::time::timeout(Duration::from_secs(5), gate.arrived())
+        .await
+        .expect("the handler reached the point before the start claim");
+    // The operator rotates the token hash before the claim reads the policy.
+    t.rewrite(|s| s.replacen(&sha256_hex(PILOT_AUTH), &sha256_hex(PILOT_ROTATED_AUTH), 1));
+    t.app.reload_tick();
+    gate.release();
+    assert_eq!(confirm.await.unwrap(), ApproveResult::PolicyChanged);
+    let (p, b) = h.await.unwrap().unwrap();
+    assert_eq!(p.status, 503, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(code(&b), "dropped_on_reload");
+    assert_eq!(t.count("forward_started"), 0);
+    assert!(
+        mock.recorded().is_empty(),
+        "the upstream received a request after the rotation"
+    );
+}
+
+#[tokio::test]
 async fn pilot_hold_admitted_with_a_token_is_not_forwarded_once_a_keyed_identity_takes_its_name() {
     let mock = Mock::start().await;
     let (t, _clock) = pilot_ht("pilot-mode", &mock.up, "2026-12-20", PILOT_LAST_DAY).await;

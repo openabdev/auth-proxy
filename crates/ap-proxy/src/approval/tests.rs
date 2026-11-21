@@ -1129,23 +1129,47 @@ async fn callback_approve_runs_the_start_claim_and_token_identity_recheck() {
     let env = Env::new("tg-recheck").await;
     let (h, id) = env.hold("/discord/hold/1", br#"{"a":1}"#).await;
     let nonce = nonce_of(&env, &id);
-    // The owner removes the hold grant after the hold was admitted. The approve is checked
-    // against the policy in force at the transition, so nothing is forwarded.
+    // The approve transition succeeds under the policy in force. The handler then stops at the
+    // point after the approve and before its start claim. The owner removes the hold grant and
+    // the reload lands there, so the claim must refuse and nothing is forwarded.
+    let gate = crate::passthrough::pause::Gate::new();
+    env.app.pause.set_after_approve(Arc::clone(&gate));
+    let cb = Callback {
+        callback_id: "cbq".into(),
+        action: CallbackAction::Approve,
+        request_id: id.clone(),
+        nonce: nonce.clone(),
+    };
+    let policy_src = env.app.policy_source();
+    let check = move |identity: &str, req: &HeldRequest| {
+        policy_src().is_some_and(|s| crate::passthrough::still_held(&s, identity, req))
+    };
+    let out = decide(&env.app.hold, check, &cb);
+    assert_eq!(out.reply, "Approved");
+    let confirm = tokio::spawn(Table::await_confirm(out.confirm.expect("approve started")));
+    tokio::time::timeout(Duration::from_secs(5), gate.arrived())
+        .await
+        .expect("the handler reached the point before the start claim");
     let policy = env._s.path().join("policy.toml");
     let text = std::fs::read_to_string(&policy).unwrap();
     let cut = text
         .find("[[grant]]\nidentity = \"muse-pilot\"\nroute = \"discord\"\nmethods = [\"POST\"]")
         .unwrap();
     std::fs::write(&policy, &text[..cut]).unwrap();
+    env.app.reload_tick();
+    gate.release();
     assert_eq!(
-        press(&env, CallbackAction::Approve, &id, &nonce).await,
-        "No longer allowed"
+        confirm.await.unwrap(),
+        crate::hold::ApproveResult::PolicyChanged
     );
     let (p, body) = h.await.unwrap().expect("answer");
     assert_eq!(p.status.as_u16(), 503);
     assert!(String::from_utf8_lossy(&body).contains("dropped_on_reload"));
-    assert_eq!(env.upstream_hits(), 0);
+    // `upstream_hits` counts accepted TCP connections, and the hold path may open one before its
+    // claim refuses. The request itself is gated by the claim's `forward_started` write, so that
+    // line is the check that no byte went upstream.
     assert!(!env.audit_text().contains("forward_started"));
+    assert!(env.audit_text().contains("dropped_on_reload"));
 }
 
 #[tokio::test]

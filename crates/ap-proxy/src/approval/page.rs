@@ -175,7 +175,21 @@ fn header(v: &View) -> String {
     h
 }
 
-/// The payload block: what will be sent, in large type, with the body in a monospace block.
+/// The text of the `content` field when the body is a JSON object whose `content` is a string.
+/// The JSON string is decoded, so escapes such as `\uff5c` become the characters they stand for.
+/// `None` for anything else, including malformed JSON; this never panics.
+fn message_content(body: &str) -> Option<String> {
+    match serde_json::from_str::<Value>(body).ok()? {
+        Value::Object(mut fields) => match fields.remove("content")? {
+            Value::String(text) => Some(text),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The payload block: what will be sent, in large type. The message content is shown decoded when
+/// the body has one; otherwise the body is shown as it was received.
 fn payload(c: &ViewContent) -> String {
     let mut b = String::from("<section class=\"payload\" aria-label=\"Payload to send\">\n");
     b.push_str("<p class=\"label\">This request will be sent</p>\n");
@@ -189,10 +203,8 @@ fn payload(c: &ViewContent) -> String {
     if c.body_lossy {
         b.push_str("<p class=\"banner\"><strong>The body is not valid UTF-8.</strong> Invalid bytes are shown as U+FFFD; Discord receives the original bytes.</p>\n");
     }
-    b.push_str(&format!(
-        "<pre class=\"body\">{}</pre>\n",
-        escape(&c.body_text)
-    ));
+    let shown = message_content(&c.body_text).unwrap_or_else(|| c.body_text.clone());
+    b.push_str(&format!("<pre class=\"body\">{}</pre>\n", escape(&shown)));
     b.push_str("</section>\n");
     b
 }
@@ -223,7 +235,8 @@ fn actions(id: &str, csrf: Option<&str>) -> String {
 }
 
 /// The secondary facts, closed by default: identity, upstream, query, content type, size, digest,
-/// the caller connection and the forwarded headers.
+/// the caller connection, the forwarded headers and, when the message content was decoded, the raw
+/// JSON body.
 fn details(v: &View, c: &ViewContent) -> String {
     let mut t = String::from("<details>\n<summary>Details</summary>\n<table>\n");
     t.push_str(&row("Identity", &escape(&v.identity)));
@@ -252,7 +265,15 @@ fn details(v: &View, c: &ViewContent) -> String {
         };
         t.push_str(&row(&h.name, &value));
     }
-    t.push_str("</table>\n</details>\n");
+    t.push_str("</table>\n");
+    if message_content(&c.body_text).is_some() {
+        t.push_str("<h2>Raw body</h2>\n");
+        t.push_str(&format!(
+            "<pre class=\"body\">{}</pre>\n",
+            escape(&c.body_text)
+        ));
+    }
+    t.push_str("</details>\n");
     t
 }
 
@@ -538,5 +559,66 @@ mod tests {
             json!({"name":"authorization","credential":"present"})
         );
         assert!(entry_json(&pending("{}"), None).get("csrf").is_none());
+    }
+
+    fn with_body(body: &str) -> View {
+        let mut v = pending(body);
+        v.content.as_mut().unwrap().body_len = body.len();
+        v
+    }
+
+    #[test]
+    fn decoded_content_is_shown_in_the_message_block() {
+        let html = entry(
+            &with_body(r#"{"content":"Stage 2 gate test \uff5c \u5c0f"}"#),
+            Some("t"),
+        );
+        let block = html.find("<pre class=\"body\">").unwrap();
+        let shown = "<pre class=\"body\">Stage 2 gate test \u{ff5c} \u{5c0f}</pre>";
+        assert!(html.contains(shown), "{html}");
+        assert!(html.find(shown).unwrap() < html.find("<details>").unwrap());
+        assert!(block < html.find("<details>").unwrap());
+    }
+
+    #[test]
+    fn malformed_json_falls_back_to_the_raw_text() {
+        for body in [r#"{"content":"x""#, "not json", "\"plain\"", "[1,2]", "{}"] {
+            let html = entry(&with_body(body), Some("t"));
+            let escaped = escape(body);
+            assert!(
+                html.contains(&format!("<pre class=\"body\">{escaped}</pre>")),
+                "{body} did not fall back: {html}"
+            );
+            assert_eq!(html.matches("<h2>Raw body</h2>").count(), 0, "{body}");
+        }
+    }
+
+    #[test]
+    fn a_non_string_content_field_falls_back_to_the_raw_text() {
+        let body = r#"{"content":5}"#;
+        let html = entry(&with_body(body), Some("t"));
+        assert!(html.contains(&format!("<pre class=\"body\">{}</pre>", escape(body))));
+    }
+
+    #[test]
+    fn the_raw_json_appears_only_inside_details() {
+        let body = r#"{"content":"Stage 2 gate test \uff5c \u5c0f"}"#;
+        let html = entry(&with_body(body), Some("t"));
+        let details = html.find("<details>").unwrap();
+        assert_eq!(html.matches(&escape(body)).count(), 1, "{html}");
+        assert!(html.find(&escape(body)).unwrap() > details);
+        assert!(!html.contains("<details open"));
+        let view = view_only(&with_body(body));
+        assert_eq!(view.matches(&escape(body)).count(), 1);
+        assert!(view.find(&escape(body)).unwrap() > view.find("<details>").unwrap());
+    }
+
+    #[test]
+    fn escaping_applies_to_the_decoded_content() {
+        let body = r#"{"content":"<script>alert(1)<\/script> \u003cb\u003e"}"#;
+        let html = entry(&with_body(body), Some("t"));
+        assert!(!html.contains("<script>alert(1)"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt; &lt;b&gt;"));
     }
 }

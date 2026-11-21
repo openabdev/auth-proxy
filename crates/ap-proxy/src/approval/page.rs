@@ -188,8 +188,41 @@ fn message_content(body: &str) -> Option<String> {
     }
 }
 
+/// The top-level fields of a JSON object body other than `content`, as names only. serde_json
+/// without `preserve_order` keeps object keys sorted, so these are sorted, not in body order.
+/// Empty for anything that is not a JSON object.
+fn extra_field_names(body: &str) -> Vec<String> {
+    match serde_json::from_str::<Value>(body) {
+        Ok(Value::Object(fields)) => fields
+            .keys()
+            .filter(|k| k.as_str() != "content")
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The visible line that names fields sent besides `content`. Empty when there are none.
+fn extra_fields_line(body: &str) -> String {
+    let names = extra_field_names(body);
+    if names.is_empty() {
+        return String::new();
+    }
+    let escaped: Vec<String> = names.iter().map(|n| escape(n)).collect();
+    let (count, noun) = if names.len() == 1 {
+        (1, "field")
+    } else {
+        (names.len(), "fields")
+    };
+    format!(
+        "<p class=\"banner extra-fields\">+ {count} more {noun} will be sent: {} (see Details)</p>\n",
+        escaped.join(", ")
+    )
+}
+
 /// The payload block: what will be sent, in large type. The message content is shown decoded when
-/// the body has one; otherwise the body is shown as it was received.
+/// the body has one; otherwise the body is shown as it was received. Fields other than `content`
+/// are named in a line above the content, so they are visible without opening Details.
 fn payload(c: &ViewContent) -> String {
     let mut b = String::from("<section class=\"payload\" aria-label=\"Payload to send\">\n");
     b.push_str("<p class=\"label\">This request will be sent</p>\n");
@@ -203,6 +236,7 @@ fn payload(c: &ViewContent) -> String {
     if c.body_lossy {
         b.push_str("<p class=\"banner\"><strong>The body is not valid UTF-8.</strong> Invalid bytes are shown as U+FFFD; Discord receives the original bytes.</p>\n");
     }
+    b.push_str(&extra_fields_line(&c.body_text));
     let shown = message_content(&c.body_text).unwrap_or_else(|| c.body_text.clone());
     b.push_str(&format!("<pre class=\"body\">{}</pre>\n", escape(&shown)));
     b.push_str("</section>\n");
@@ -620,5 +654,38 @@ mod tests {
         assert!(!html.contains("<script>alert(1)"), "{html}");
         assert!(!html.contains("<b>"), "{html}");
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt; &lt;b&gt;"));
+    }
+
+    #[test]
+    fn a_content_only_body_shows_no_extra_fields_line() {
+        let html = entry(&with_body(r#"{"content":"hi"}"#), Some("t"));
+        assert!(!html.contains("extra-fields"), "{html}");
+        assert!(!view_only(&with_body(r#"{"content":"hi"}"#)).contains("extra-fields"));
+    }
+
+    #[test]
+    fn a_field_besides_content_is_named_above_details_and_its_value_is_not() {
+        let body = r#"{"content":"hi","username":"SYNTH-VALUE-7"}"#;
+        let html = entry(&with_body(body), Some("t"));
+        let line_start = html.find("<p class=\"banner extra-fields\">").expect("indicator");
+        let line_end = line_start + html[line_start..].find("</p>").unwrap();
+        let line = &html[line_start..line_end];
+        assert!(line.contains("+ 1 more field will be sent: username (see Details)"), "{line}");
+        assert!(!line.contains("SYNTH-VALUE-7"), "{line}");
+        assert!(line_end < html.find("<details>").unwrap());
+        assert!(line_start < html.find("<pre class=\"body\">").unwrap());
+        let view = view_only(&with_body(body));
+        assert!(view.contains("+ 1 more field will be sent: username"));
+    }
+
+    #[test]
+    fn the_extra_field_name_is_escaped() {
+        let body = r#"{"content":"hi","<b>x</b>":1,"embeds":[]}"#;
+        let html = entry(&with_body(body), Some("t"));
+        assert!(
+            html.contains("+ 2 more fields will be sent: &lt;b&gt;x&lt;/b&gt;, embeds (see Details)"),
+            "{html}"
+        );
+        assert!(!html.contains("<b>x</b>"), "{html}");
     }
 }

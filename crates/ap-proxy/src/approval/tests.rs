@@ -27,13 +27,9 @@ const AUTH: &str = "gate.example.test";
 const PW: &str = "approver-password-0001-xxxxxxxxxxxxxxxxxxxx";
 const SENTINEL: &str = "SENTINEL-DISCORD-TOKEN-0001";
 const PATH_TOKEN: &str = "SENTINEL-PATH-TOKEN-0002";
-const HEADERS: [(&str, &str); 6] = [
-    (
-        "content-security-policy",
-        "default-src 'none'; frame-ancestors 'none'; form-action 'self'",
-    ),
-    ("x-frame-options", "DENY"),
+const HEADERS: [(&str, &str); 5] = [
     ("referrer-policy", "no-referrer"),
+    ("x-frame-options", "DENY"),
     ("cache-control", "no-store"),
     ("pragma", "no-cache"),
     ("x-content-type-options", "nosniff"),
@@ -64,16 +60,25 @@ impl Resp {
             .to_string()
     }
 
-    /// All six design 3.6 headers, with exactly the specified values.
+    /// All six design 3.6 headers, with exactly the specified values. The policy is the one
+    /// `page::csp` builds, which pins the page's stylesheet by hash.
     fn assert_hardened(&self, what: &str) {
-        for (n, v) in HEADERS {
+        let mut expected: Vec<(&str, String)> =
+            HEADERS.iter().map(|(n, v)| (*n, v.to_string())).collect();
+        expected.push(("content-security-policy", page::csp().to_string()));
+        for (n, v) in expected {
             let all: Vec<&str> = self
                 .headers
                 .iter()
                 .filter(|(h, _)| h == n)
                 .map(|(_, v)| v.as_str())
                 .collect();
-            assert_eq!(all, vec![v], "{what}: header {n} in {:?}", self.headers);
+            assert_eq!(
+                all,
+                vec![v.as_str()],
+                "{what}: header {n} in {:?}",
+                self.headers
+            );
         }
     }
 }
@@ -523,6 +528,45 @@ async fn the_page_escapes_a_script_body_and_shows_no_credential() {
     assert_eq!(v["path"], "/webhooks/123/<redacted>");
     assert_eq!(v["body_len"], 39);
     assert!(v["digest"].as_str().unwrap().len() == 64);
+}
+
+#[tokio::test]
+async fn the_pages_hide_the_view_token_nonce_caller_key_and_credential_hashes() {
+    let env = Env::with_views("page-secrets").await;
+    let (_h, id) = env.hold("/discord/hold/1", br#"{"content":"hi"}"#).await;
+    let token = view_token_of(&env, &id);
+    let nonce = nonce_of(&env, &id);
+    let view = send(env.addr, &request("GET", &format!("/view/{token}"), "", "")).await;
+    let decision = env.get(&format!("/pending/{id}"), "").await;
+    assert_eq!((view.status, decision.status), (200, 200));
+    assert!(view.body.contains("<section class=\"payload\""));
+    assert!(decision.body.contains("<section class=\"payload\""));
+    let basic_owner = STANDARD.encode(format!("owner:{PW}"));
+    let plain = [
+        SENTINEL,
+        PATH_TOKEN,
+        env.key.as_str(),
+        PW,
+        token.as_str(),
+        nonce.as_str(),
+        basic_owner.as_str(),
+    ];
+    let needles: Vec<String> = plain
+        .iter()
+        .flat_map(|s| [s.to_string(), sha256_hex(s)])
+        .collect();
+    for (what, body) in [("view", &view.body), ("decision", &decision.body)] {
+        for n in &needles {
+            assert!(
+                !body.contains(n.as_str()),
+                "the {what} page shows a secret or hash: {n}"
+            );
+        }
+        assert!(
+            !body.contains("<details open"),
+            "{what}: details must start closed"
+        );
+    }
 }
 
 #[tokio::test]

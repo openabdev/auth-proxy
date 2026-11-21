@@ -48,8 +48,10 @@ notification link) and an optional `realm`.
 for a `hold` grant of that identity. One per policy, on one route: a second `[[token_identity]]` fails at load. Pilot value: `expires = "2026-12-20"`. Without the table
 (the default), every request needs a caller key.
 
-`[notify]` (optional; without it holds just wait and expire): `kind = "ntfy"`, `base_url`, `topic_file`,
-and an optional `token_file`.
+`[notify]` (optional; without it holds just wait and expire, and it needs `[approval]`): `kind = "telegram"`,
+`token_file` (absolute path, the bot token), `chat_id` (the owner's numeric chat id, negative for a group,
+or an `@channelusername`) and `approval_url_base` (http or https, no userinfo or query; it builds the link
+in the message). Any other key, including the old `topic_file` or `base_url`, refuses to load.
 
 ## 3. Approver password and secret files
 
@@ -58,10 +60,37 @@ pw="$(openssl rand -hex 32)"
 printf '%s' "$pw" | shasum -a 256          # put the hex digest in password_sha256
 ```
 
-Keep `$pw` in a password manager. The proxy stores only the digest. The notification topic and token are
-read at startup from the files named in `[notify]`. Each must be a regular file with mode 0600 (no group or
-other bits); anything else refuses to start. Treat the topic like a password: whoever knows it can read the
-notifications, and the notification carries only a fixed sentence and a link.
+Keep `$pw` in a password manager. The proxy stores only the digest. The Telegram bot token is read at
+startup from the file named in `[notify] token_file`. It must be a regular file with mode 0600 (no group or
+other bits); anything else refuses to start. The token is never printed. The message carries a fixed
+sentence, the request id and the approval link, and nothing else.
+
+### 3.1 Telegram setup (owner steps)
+
+Run these yourself. Do not paste the token into chat, a ticket, a commit or this runbook.
+
+1. In Telegram, open @BotFather, send `/newbot`, and follow the prompts. BotFather returns a token.
+2. Send any message to your new bot from the account that should receive approvals. For a group, add the
+   bot to the group and send a message there.
+3. Find your numeric chat id. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser, using
+   your token, and read `message.chat.id`. Use that number as `chat_id`. Delete the browser history entry
+   or close the tab, because that URL contains the token.
+4. On the gate host, write the token to a root-owned file, then give the service user read access only:
+
+   ```
+   sudo install -m 0600 -o root -g root /dev/null /etc/ap/telegram-token
+   sudoedit /etc/ap/telegram-token        # paste the token, save, nothing else in the file
+   ```
+
+   The file path goes in `[notify] token_file`. Keep mode 0600. If the service runs as a different user, set
+   that user as the owner with `sudo chown <service-user> /etc/ap/telegram-token`. No other user may read it.
+5. Restart `auth-proxy`. A startup error line `notify token file: ...` names only the kind of fault.
+6. Send a test hold from the Muse side. The owner's chat should receive one message with the fixed
+   sentence, a request id and a link. Open the link and approve or deny.
+
+To rotate the token, revoke it in BotFather (`/revoke`), write the new token to the same file, and restart.
+Anyone who has the token can send messages as the bot and read `getUpdates` for it, so treat it like a
+password.
 
 ## 4. Network placement
 

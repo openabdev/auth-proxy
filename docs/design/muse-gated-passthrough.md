@@ -467,11 +467,45 @@ Page controls:
   every value with HTML escaping.
 - The page never renders or logs an `Authorization` value from a held request (the entry keeps it for
   forwarding but the view model omits it). It shows that the header is present.
-- Notification carries a link and a one-line summary only (method, route, redacted path), never a body or
-  a credential. A display is not a reliable push when the phone is locked [I issue #6 comment 2].
+- Notification carries the fixed sentence, the request id and the approval link only. It has no method,
+  route, path, body or credential (3.6.1). A display is not a reliable push when the phone is locked
+  [I issue #6 comment 2].
 
 An unreachable approval plane is not a special case. Holds expire as `expired` after `hold_secs`. The
 gate fails closed in time as well as in space [I issue #5 comment 1, point 3].
+
+### 3.6.1 Notifier (Telegram, stage 2)
+
+Owner decision, 2026-11-21: Telegram only. ntfy is not used on the stage 2 path and is not called at
+all. An ntfy publish succeeds with zero subscribers, so a hold could be silently missed. A Telegram
+`sendMessage` to the owner's chat is the replacement.
+
+- **One send per new distinct entry.** The notifier is called from the hold path (3.4 step 5) and never
+  for a supersede. Each send is one `POST https://api.telegram.org/bot<token>/sendMessage`.
+- **Payload.** The JSON body has three keys: `chat_id` (from config), `text` and
+  `link_preview_options.is_disabled = true`, so Telegram does not fetch the approval link. `text` is the
+  fixed sentence, a line with the request id, and the approval URL `{approval_url_base}/pending/{id}`.
+  Nothing else: no header, no caller data, no route path, no digest, no fingerprint.
+- **Token.** The Bot API requires the token in the URL path. It is read from `token_file` at startup under
+  the same rule as every secret file here: a regular file with no group or other permission bits, and
+  contents never logged. The token alphabet is `[A-Za-z0-9:_-]`, so no character can change the path.
+  The token is never printed, in Debug output, errors or the audit stream.
+- **Transport.** A dedicated reqwest client with `no_proxy()`, rustls, redirects off, and a 5 s timeout
+  per attempt. Send errors are mapped to a fixed `NotifyError`, because reqwest error text contains the
+  URL and so the token.
+- **Retry.** One retry, and only after a failed connect. A failed connect means no byte reached Telegram,
+  so a retry cannot duplicate a message. A timeout or a reply lost after sending is not retried, since
+  the message may already be delivered. The hold path caps the whole notification at 15 s.
+- **Failure.** A failed send writes a `notify_failed` audit record and nothing else. The hold keeps
+  waiting for approval or expiry, and no request is forwarded for a missing notification. Approval, CSRF,
+  Basic auth and fail-closed expiry are unchanged.
+- **Tests.** The notifier tests run against a loopback mock with a synthetic token. They check the exact
+  payload, the token only in the path, the refused token file, the single send on a rejected status,
+  the no-retry on a sent-but-failed request and the timeout bound.
+
+Not claimed: delivery to Telegram is not confirmed to the gate (the Bot API reply is checked only for
+status); a message Telegram accepted can still be missed by the phone. The owner should confirm one real
+notification end to end, using the steps in `docs/runbooks/muse-stage2.md`.
 
 ### 3.7 Concurrency and resource limits (open point f)
 
@@ -1101,8 +1135,8 @@ Open questions 1 to 4 are stage 1 blockers.
 6. **Retry behaviour.** (Answered [M-reported] for the 423, 410 and 503 probes and a real 423 `no_grant` write: no retry; see `docs/evidence/muse-stage1.md`.) After an `expired` or `denied`, does Muse's agent retry automatically? If so each
    retry is another phone prompt; dedupe, the per-identity cap and the default 60 s cooldown bound this.
 7. **Approver channel.** Answered in the review comments: Basic auth plus a per-page CSRF token for the PoC,
-   WebAuthn later, and the approval API stays client-agnostic (a requirement). Which notifier the hook
-   targets is still open.
+   WebAuthn later, and the approval API stays client-agnostic (a requirement). The notifier is Telegram only
+   (section 3.6.1, owner decision 2026-11-21).
 8. **One caller key per what?** One identity per Muse user, per connector, or per Discord channel set?
    This sets how revocation and the audit identity read.
 9. **Missing `Authorization` on a held route.** Answered in the review comments: refuse it before it reaches

@@ -42,8 +42,9 @@ There is no retained-entry cap beyond this window and no per-identity retained c
 
 ## 5. Idempotency
 
-The Idempotency-Key is bound to the payload hash (method, route, body digest). Admission is atomic under
-the table lock:
+The Idempotency-Key is required. A POST with a missing, empty, over-long (more than 64 characters) or
+malformed key (anything outside `[A-Za-z0-9_-]`) is refused with `400` before admission. The key is bound
+to the payload hash (method, route, body digest). Admission is atomic under the table lock:
 
 - Same key, same payload, while pending or inside the 60 s final window: return the same `request_id` and
   token. A retry MUST NOT become a newly admitted send.

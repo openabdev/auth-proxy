@@ -150,19 +150,17 @@ async fn wait_returns_pending_after_the_wait_and_the_final_status_when_it_arrive
 }
 
 #[tokio::test]
-async fn a_token_is_rate_limited_per_clock_second() {
+async fn rapid_polls_just_return_the_current_status() {
     let store = PollStore::default();
     let c = clock();
     let token = store.insert("r", c.now());
-    for _ in 0..POLLS_PER_SEC {
-        assert_eq!(get(&store, &c, &token, None).await.0, StatusCode::OK);
+    for _ in 0..50 {
+        let (code, v) = get(&store, &c, &token, None).await;
+        assert_eq!(
+            (code, v["status"].as_str()),
+            (StatusCode::OK, Some("pending"))
+        );
     }
-    assert_eq!(
-        get(&store, &c, &token, None).await.0,
-        StatusCode::TOO_MANY_REQUESTS
-    );
-    c.advance(1);
-    assert_eq!(get(&store, &c, &token, None).await.0, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -170,7 +168,12 @@ async fn the_guard_ends_an_unfinished_entry_as_dropped() {
     let store = Arc::new(PollStore::default());
     let c = clock();
     let token = store.insert("r", c.now());
-    drop(FinishGuard::new(Arc::clone(&store), c.clone(), "r"));
+    drop(FinishGuard::new(
+        Arc::clone(&store),
+        c.clone(),
+        "r",
+        Box::new(|| Final::Dropped),
+    ));
     assert_eq!(get(&store, &c, &token, None).await.1["status"], "dropped");
 }
 

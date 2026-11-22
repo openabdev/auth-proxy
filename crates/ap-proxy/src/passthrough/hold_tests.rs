@@ -256,6 +256,8 @@ struct Opts {
     limits: Limits,
     /// Extra keys inside `[passthrough]`.
     extra: String,
+    /// Extra keys inside the `discord` `[[route]]`.
+    route_extra: String,
     held_body_max: u64,
     /// Text appended after the grants.
     tail: String,
@@ -276,6 +278,7 @@ impl Default for Opts {
                 cooldown: Duration::ZERO,
             },
             extra: String::new(),
+            route_extra: String::new(),
             held_body_max: 2048,
             tail: String::new(),
             port: None,
@@ -333,6 +336,7 @@ name = "discord"
 host = "{HOST}"
 port = {port}
 mode = "passthrough"
+{route_extra}
 
 [[grant]]
 identity = "muse-pilot"
@@ -357,6 +361,7 @@ path_patterns = ["/hold/*"]
 "#,
             max = o.held_body_max,
             extra = o.extra,
+            route_extra = o.route_extra,
             tail = o.tail,
             sha = sha256_hex(&key),
             sha2 = sha256_hex(&other_key),

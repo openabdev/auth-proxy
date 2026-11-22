@@ -59,21 +59,62 @@ pub(super) async fn run(r: Request<'_>) -> Response<Body> {
 
     // The `held` record is written first, under the table lock. A failed write refuses before any
     // entry exists; a refusal by the checks that follow leaves the record and gets its own.
-    let admission = app
-        .hold
-        .admit_async(identity, Arc::clone(&req), |id, digest| {
+    let admission = app.hold.admit_async(
+        identity,
+        Arc::clone(&req),
+        |id, digest| {
             let mut rec = ctx.rec(id, digest, "held", None, None, None);
             rec.upstream = Some(req.upstream.authority());
             rec.policy_generation = Some(req.generation);
             app.audit.try_write_hold(&rec)
-        });
+        },
+        // A refusal after the `held` record gets its own terminal record for the same id.
+        |id, digest, code| {
+            let rec = ctx.rec(
+                id,
+                digest,
+                "abandoned",
+                None,
+                Some(code.code_str()),
+                Some(503),
+            );
+            app.audit.write_hold(&rec);
+        },
+    );
     let held = match admission {
         Admission::Refused(code) => return refuse(&app, &trail, code),
         Admission::Held(h) => h,
     };
     let token = app.polls.insert(&held.id, app.clock.now());
     announce(&app, &ctx, &held);
-    let fin = FinishGuard::new(Arc::clone(&app.polls), Arc::clone(&app.clock), &held.id);
+    let started = Arc::new(Started::new());
+    // If the task is cut (shutdown past the wait), a forward that already passed
+    // `forward_started` is `send_unknown`, never `dropped`; before it, `dropped`.
+    let on_cut = {
+        let (app, ctx, started) = (Arc::clone(&app), ctx.clone(), Arc::clone(&started));
+        let (id, digest) = (held.id.clone(), held.digest.clone());
+        Box::new(move || {
+            if started.get().is_some() {
+                app.audit.write_hold(&ctx.rec(
+                    &id,
+                    &digest,
+                    "completed",
+                    None,
+                    Some("upstream_reset"),
+                    None,
+                ));
+                Final::SendUnknown("reset")
+            } else {
+                Final::Dropped
+            }
+        })
+    };
+    let fin = FinishGuard::new(
+        Arc::clone(&app.polls),
+        Arc::clone(&app.clock),
+        &held.id,
+        on_cut,
+    );
     let guard = Guard {
         app: Arc::clone(&app),
         ctx,
@@ -81,11 +122,12 @@ pub(super) async fn run(r: Request<'_>) -> Response<Body> {
         digest: held.digest,
         phase: Phase::Pending,
         rx: Some(held.decision),
-        started: Arc::new(Started::new()),
+        started,
     };
     trail.write_evidence(&app.audit, 202);
     let response = async_poll::accepted(&guard.id, &token);
-    tokio::spawn(drive(Drive {
+    let tasks = Arc::clone(&app.async_tasks);
+    tasks.spawn(drive(Drive {
         app,
         trail,
         req,

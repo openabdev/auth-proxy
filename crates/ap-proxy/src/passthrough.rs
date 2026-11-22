@@ -67,6 +67,8 @@ pub struct PtApp {
     pub hold: Arc<hold::Table>,
     /// Poll tokens and final statuses of the async hold mode. Empty in blocking mode.
     pub(crate) polls: Arc<crate::async_poll::PollStore>,
+    /// The detached async forwards, which shutdown waits for.
+    pub(crate) async_tasks: Arc<crate::async_poll::AsyncTasks>,
     /// Told about each new distinct hold entry. `None` until a notifier is configured.
     pub notifier: Option<Arc<dyn Notifier>>,
     /// `[approval].public_base_url` without a trailing slash: the notification link is
@@ -191,6 +193,7 @@ impl PtApp {
             held_client,
             hold: Arc::new(hold::Table::new(limits)),
             polls: Arc::default(),
+            async_tasks: Arc::default(),
             notifier: None,
             approval_base: None,
             view_base: None,
@@ -564,9 +567,14 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
         return Ok(refuse(&app, &trail, Code::PolicyUnavailable));
     };
 
-    // Async hold mode: `GET /poll/<token>` is answered before any authentication, because the
+    // Async hold mode (any route with `hold_mode = "async"`): `GET /poll/<token>` is answered before any authentication, because the
     // token is its only credential and the answer must not depend on the headers sent.
-    if pt.hold_mode == HoldMode::Async {
+    if policy
+        .cfg
+        .routes
+        .iter()
+        .any(|r| r.hold_mode == HoldMode::Async)
+    {
         if let Some(token) = parts.uri.path().strip_prefix("/poll/") {
             if parts.method != Method::GET || token.is_empty() || token.contains('/') {
                 return Ok(crate::async_poll::not_found());

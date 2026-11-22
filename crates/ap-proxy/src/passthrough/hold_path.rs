@@ -514,7 +514,7 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
         started: trail.started,
     };
 
-    if pt.hold_mode == HoldMode::Async {
+    if route.hold_mode == HoldMode::Async {
         return Ok(async_mode::run(async_mode::Request {
             app,
             trail,
@@ -530,7 +530,7 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
                     None => rel.to_string(),
                 },
             ),
-            hold: Duration::from_secs(pt.async_hold_secs),
+            hold: Duration::from_secs(route.async_hold_secs),
             deadline: Duration::from_secs(pt.request_deadline_secs),
             idle: Duration::from_secs(pt.upstream_idle_secs),
             identity,

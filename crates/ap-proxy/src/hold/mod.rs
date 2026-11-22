@@ -53,10 +53,7 @@ pub struct Limits {
 impl Limits {
     pub fn from_config(pt: &Passthrough) -> Limits {
         Limits {
-            hold: Duration::from_secs(match pt.hold_mode {
-                ap_core::config::HoldMode::Blocking => pt.hold_secs,
-                ap_core::config::HoldMode::Async => pt.async_hold_secs,
-            }),
+            hold: Duration::from_secs(pt.hold_secs),
             max_total: pt.max_held_total,
             max_per_identity: pt.max_held_per_identity,
             cooldown: Duration::from_secs(pt.cooldown_secs),
@@ -288,10 +285,18 @@ impl Table {
     ///
     /// `persist` runs under the table lock, before the cooldown and cap checks. A failed write
     /// refuses with `audit_unavailable` and leaves no entry. A refusal after the write leaves the
-    /// `held` record in the log; the caller writes the terminal record with the refusal's code.
-    pub fn admit_async<F>(&self, identity: &str, req: Arc<HeldRequest>, persist: F) -> Admission
+    /// `held` record in the log, so `refused` then writes the terminal record for the same id and
+    /// digest with the refusal's code, under the same lock, before the refusal is returned.
+    pub fn admit_async<F, R>(
+        &self,
+        identity: &str,
+        req: Arc<HeldRequest>,
+        persist: F,
+        refused: R,
+    ) -> Admission
     where
         F: FnOnce(&str, &str) -> io::Result<()>,
+        R: FnOnce(&str, &str, Code),
     {
         let fingerprint = self.fingerprinter.fingerprint(&req);
         let digest = digest::audit_digest(&req);
@@ -305,19 +310,23 @@ impl Table {
             return Admission::Refused(Code::AuditUnavailable);
         }
         g.cooldown.retain(|_, until| *until > now);
-        if g.cooldown.contains_key(identity) {
-            return Admission::Refused(Code::Cooldown);
-        }
         let own = g
             .pending
             .values()
             .filter(|e| e.identity == identity)
             .count();
-        if own >= self.limits.max_per_identity {
-            return Admission::Refused(Code::IdentityCap);
-        }
-        if g.pending.len() >= self.limits.max_total {
-            return Admission::Refused(Code::TableFull);
+        let refusal = if g.cooldown.contains_key(identity) {
+            Some(Code::Cooldown)
+        } else if own >= self.limits.max_per_identity {
+            Some(Code::IdentityCap)
+        } else if g.pending.len() >= self.limits.max_total {
+            Some(Code::TableFull)
+        } else {
+            None
+        };
+        if let Some(code) = refusal {
+            refused(&id, &digest, code);
+            return Admission::Refused(code);
         }
         let nonce = digest::random_hex(12);
         let view_token = digest::random_hex(16);

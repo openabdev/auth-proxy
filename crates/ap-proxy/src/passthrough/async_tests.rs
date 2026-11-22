@@ -8,7 +8,8 @@ const ASYNC: &str = "hold_mode = \"async\"";
 
 fn async_opts(extra: &str) -> Opts {
     Opts {
-        extra: format!("{ASYNC}\n{extra}"),
+        route_extra: ASYNC.to_string(),
+        extra: extra.to_string(),
         ..Opts::default()
     }
 }
@@ -172,7 +173,9 @@ async fn denied_request_polls_as_denied_and_sends_nothing() {
 #[tokio::test]
 async fn unapproved_entry_expires_after_async_hold_secs() {
     let mock = Mock::start().await;
-    let t = Ht::with("async-expire", &mock.up, async_opts("async_hold_secs = 5")).await;
+    let mut o = async_opts("");
+    o.route_extra.push_str("\nasync_hold_secs = 5");
+    let t = Ht::with("async-expire", &mock.up, o).await;
     let a = t.submit("/discord/hold/ok", "{}").await;
     let (_, v) = t.poll(&a.token, "").await;
     assert_eq!(v["status"], "pending");
@@ -480,6 +483,17 @@ async fn admission_refusals_keep_their_codes_after_the_held_record_and_issue_no_
         2,
         "the held record comes before the checks"
     );
+    // The refused request's id has a terminal record with the refusal's code and 503.
+    let refused_id = t.held(2).await;
+    assert_ne!(refused_id, a.id);
+    let term: Vec<_> = t
+        .lines()
+        .into_iter()
+        .filter(|v| v["request_id"] == refused_id.as_str() && v["transition"] != "held")
+        .collect();
+    assert_eq!(term.len(), 1, "{term:?}");
+    assert_eq!(term[0]["code"], "identity_cap");
+    assert_eq!(term[0]["status"], 503);
     assert_eq!(t.app.hold.state(&a.id), Some(State::Pending));
     assert_eq!(t.app.hold.pending_len(), 1);
 }
@@ -530,18 +544,93 @@ async fn the_blocking_mode_is_the_default_and_has_no_poll_route() {
 }
 
 #[tokio::test]
-async fn a_poll_that_is_rate_limited_changes_nothing() {
+async fn rapid_polls_just_return_the_current_status() {
     let mock = Mock::start().await;
-    let t = async_ht("async-rate", &mock.up).await;
+    let t = async_ht("async-rapid", &mock.up).await;
     let a = t.submit("/discord/hold/ok", "{}").await;
-    let mut limited = false;
     for _ in 0..40 {
-        if t.poll(&a.token, "").await.0 == 429 {
-            limited = true;
+        let (code, v) = t.poll(&a.token, "").await;
+        assert_eq!((code, v["status"].as_str()), (200, Some("pending")));
+    }
+    assert_eq!(t.app.hold.state(&a.id), Some(State::Pending));
+}
+
+/// A second held route on the same policy: another port, so its own `[[route]]`.
+fn second_route(port: u16) -> String {
+    format!(
+        "\n[[route]]\nname = \"other\"\nhost = \"{HOST}\"\nport = {port}\nmode = \"passthrough\"\n\n[[grant]]\nidentity = \"muse-pilot\"\nroute = \"other\"\nmethods = [\"POST\"]\ndecision = \"hold\"\npath_patterns = [\"/hold/*\"]\n"
+    )
+}
+
+#[tokio::test]
+async fn a_second_held_route_stays_blocking_while_the_muse_route_is_async() {
+    let mock = Mock::start().await;
+    let mut o = async_opts("");
+    o.tail = second_route(mock.up.addr.port().wrapping_add(1).max(1024));
+    let t = Ht::with("async-two-routes", &mock.up, o).await;
+    // The async route answers 202 at once.
+    let a = t.submit("/discord/hold/ok", "{}").await;
+    // The other route holds the caller's connection until it is decided, with an X-AP-Decision answer.
+    let first = t.spawn(t.post("/other/hold/ok", "{}"));
+    let id1 = t.held(2).await;
+    assert_ne!(id1, a.id);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!first.is_finished());
+    t.app.hold.deny(&id1, "alice");
+    let (p1, _) = first.await.unwrap().unwrap();
+    assert_eq!(p1.status.as_u16(), 423);
+    // And the async entry is untouched.
+    assert_eq!(t.poll(&a.token, "").await.1["status"], "pending");
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_a_started_forward_and_a_cut_after_start_is_send_unknown() {
+    let mock = Mock::start().await;
+    let t = async_ht("async-shutdown", &mock.up).await;
+    let a = t.submit("/discord/hold/stall", "{}").await;
+    t.app.hold.approve(&a.id, "alice").await;
+    for _ in 0..250 {
+        if t.count("forward_started") == 1 {
             break;
         }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // The loop may straddle a clock second; at 40 polls at least one second holds more than 10.
-    assert!(limited);
-    assert_eq!(t.app.hold.state(&a.id), Some(State::Pending));
+    assert_eq!(t.count("forward_started"), 1);
+    // Shutdown closes the table; the started forward is not told to stop and the wait covers it.
+    t.app.hold.drain_pending();
+    let waited = tokio::time::timeout(Duration::from_millis(400), t.app.async_tasks.idle()).await;
+    assert!(
+        waited.is_err(),
+        "the wait did not cover the started forward"
+    );
+    assert_eq!(t.poll(&a.token, "").await.1["status"], "pending");
+    // The wait ran out: the cut ends it as send_unknown, with the existing code, not dropped.
+    t.app.async_tasks.cut();
+    tokio::time::timeout(Duration::from_secs(2), t.app.async_tasks.idle())
+        .await
+        .expect("tasks ended");
+    let v = t.poll(&a.token, "").await.1;
+    assert_eq!(v["status"], "send_unknown");
+    assert_eq!(v["error_class"], "reset");
+    let end: Vec<_> = t
+        .lines()
+        .into_iter()
+        .filter(|v| v["request_id"] == a.id.as_str() && v["transition"] == "completed")
+        .collect();
+    assert_eq!(end.len(), 1);
+    assert_eq!(end[0]["code"], "upstream_reset");
+    assert_eq!(t.count("abandoned_after_approve"), 0);
+}
+
+#[tokio::test]
+async fn a_cut_before_forward_started_is_dropped() {
+    let mock = Mock::start().await;
+    let t = async_ht("async-cut-early", &mock.up).await;
+    let a = t.submit("/discord/hold/ok", "{}").await;
+    t.app.async_tasks.cut();
+    tokio::time::timeout(Duration::from_secs(2), t.app.async_tasks.idle())
+        .await
+        .expect("tasks ended");
+    assert_eq!(t.poll(&a.token, "").await.1["status"], "dropped");
+    assert_eq!(mock.hits(), 0);
 }

@@ -7,6 +7,7 @@
 //! store does not know, the answer is one uniform 404. Nothing here is persistent, so a restart
 //! forgets every entry.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use ap_broker::registry::sha256_hex;
 use axum::body::Body;
 use http::{header, HeaderValue, Response, StatusCode};
 use serde_json::{json, Value};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tokio::time::Instant;
 
 use crate::hold::digest::{ct_eq, random_hex};
@@ -25,8 +26,6 @@ pub const FINAL_WINDOW_SECS: u64 = 60;
 pub const MAX_WAIT_SECS: u64 = 25;
 /// Largest Discord response body kept for a poll.
 pub const BODY_MAX: usize = 64 * 1024;
-/// Polls one token may make in one clock second before it is answered 429.
-const POLLS_PER_SEC: u32 = 10;
 
 /// How a held request ended, as the poll reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,15 +56,11 @@ struct Slot {
     request_id: String,
     state: State,
     notify: Arc<Notify>,
-    /// Rate-limit window: the clock second and the polls seen in it.
-    second: u64,
-    polls: u32,
 }
 
 /// What a read found.
 enum Read {
     NotFound,
-    Limited,
     Pending { id: String, notify: Arc<Notify> },
     Final { id: String, out: Final },
 }
@@ -94,8 +89,6 @@ impl PollStore {
             request_id: request_id.to_string(),
             state: State::Pending,
             notify: Arc::new(Notify::new()),
-            second: now,
-            polls: 0,
         });
         token
     }
@@ -120,7 +113,7 @@ impl PollStore {
             .count()
     }
 
-    fn read(&self, token: &str, now: u64, count: bool) -> Read {
+    fn read(&self, token: &str, now: u64) -> Read {
         let key = sha256_hex(token);
         let mut g = self.lock();
         g.retain(|s| !expired(s, now));
@@ -134,17 +127,7 @@ impl PollStore {
         let Some(i) = hit else {
             return Read::NotFound;
         };
-        let s = &mut g[i];
-        if count {
-            if s.second != now {
-                s.second = now;
-                s.polls = 0;
-            }
-            if s.polls >= POLLS_PER_SEC {
-                return Read::Limited;
-            }
-            s.polls += 1;
-        }
+        let s = &g[i];
         match &s.state {
             State::Pending => Read::Pending {
                 id: s.request_id.clone(),
@@ -162,11 +145,14 @@ fn expired(s: &Slot, now: u64) -> bool {
     matches!(&s.state, State::Final { at, .. } if now >= at.saturating_add(FINAL_WINDOW_SECS))
 }
 
-/// Ends the entry as `dropped` if the task that should finish it goes away without doing so.
+/// Ends the entry if the task that should finish it goes away without doing so. `on_cut` decides
+/// how: `dropped` before the first request byte, `send_unknown` after it.
 pub struct FinishGuard {
     store: Arc<PollStore>,
     clock: Arc<dyn ap_broker::clock::Clock + Send + Sync>,
     request_id: String,
+    done: AtomicBool,
+    on_cut: Box<dyn Fn() -> Final + Send + Sync>,
 }
 
 impl FinishGuard {
@@ -174,23 +160,94 @@ impl FinishGuard {
         store: Arc<PollStore>,
         clock: Arc<dyn ap_broker::clock::Clock + Send + Sync>,
         request_id: &str,
+        on_cut: Box<dyn Fn() -> Final + Send + Sync>,
     ) -> FinishGuard {
         FinishGuard {
             store,
             clock,
             request_id: request_id.to_string(),
+            done: AtomicBool::new(false),
+            on_cut,
         }
     }
 
     pub fn finish(&self, out: Final) {
+        self.done.store(true, Ordering::SeqCst);
         self.store.finish(&self.request_id, out, self.clock.now());
     }
 }
 
 impl Drop for FinishGuard {
     fn drop(&mut self) {
-        // A no-op when `finish` already ran: the first final status wins.
-        self.finish(Final::Dropped);
+        if !self.done.load(Ordering::SeqCst) {
+            let out = (self.on_cut)();
+            self.finish(out);
+        }
+    }
+}
+
+/// The detached async forwards. Shutdown waits for them like it waits for blocking requests, and
+/// cuts the ones still running when the wait ends.
+pub struct AsyncTasks {
+    live: AtomicUsize,
+    idle: Notify,
+    cut: watch::Sender<bool>,
+}
+
+impl Default for AsyncTasks {
+    fn default() -> AsyncTasks {
+        AsyncTasks {
+            live: AtomicUsize::new(0),
+            idle: Notify::new(),
+            cut: watch::channel(false).0,
+        }
+    }
+}
+
+struct Live(Arc<AsyncTasks>);
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if self.0.live.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl AsyncTasks {
+    /// Run `f` detached. It is dropped, and so runs its guards, when [`AsyncTasks::cut`] fires.
+    pub fn spawn<F>(self: &Arc<Self>, f: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.live.fetch_add(1, Ordering::SeqCst);
+        let live = Live(Arc::clone(self));
+        let mut cut = self.cut.subscribe();
+        tokio::spawn(async move {
+            let _live = live;
+            tokio::select! {
+                () = f => {}
+                _ = cut.wait_for(|c| *c) => {}
+            }
+        });
+    }
+
+    /// Resolves once no task is running.
+    pub async fn idle(&self) {
+        loop {
+            let n = self.idle.notified();
+            tokio::pin!(n);
+            n.as_mut().enable();
+            if self.live.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            n.await;
+        }
+    }
+
+    /// Cancel every running task.
+    pub fn cut(&self) {
+        self.cut.send_replace(true);
     }
 }
 
@@ -276,25 +333,14 @@ pub async fn poll(
         return json_response(StatusCode::BAD_REQUEST, &json!({"error": "bad_wait"}));
     };
     let deadline = Instant::now() + Duration::from_secs(wait);
-    let mut count = true;
     loop {
-        let (id, notify) = match store.read(token, clock.now(), count) {
+        let (id, notify) = match store.read(token, clock.now()) {
             Read::NotFound => return not_found(),
-            Read::Limited => {
-                let mut r = json_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    &json!({"error": "rate_limited"}),
-                );
-                r.headers_mut()
-                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-                return r;
-            }
             Read::Final { id, out } => {
                 return json_response(StatusCode::OK, &final_json(&id, &out))
             }
             Read::Pending { id, notify } => (id, notify),
         };
-        count = false;
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return json_response(
@@ -306,7 +352,7 @@ pub async fn poll(
         let notified = notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if !matches!(store.read(token, clock.now(), false), Read::Pending { .. }) {
+        if !matches!(store.read(token, clock.now()), Read::Pending { .. }) {
             continue;
         }
         let _ = tokio::time::timeout(left, notified).await;

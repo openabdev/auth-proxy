@@ -140,6 +140,15 @@ pub struct Passthrough {
     pub cooldown_secs: u64,
 }
 
+/// How a held request is answered to its caller.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HoldMode {
+    #[default]
+    Blocking,
+    Async,
+}
+
 fn default_hold_secs() -> u64 {
     120
 }
@@ -405,6 +414,15 @@ pub struct Route {
     /// forwarded. Default empty.
     #[serde(default)]
     pub keep_auth_headers: Vec<String>,
+    /// Passthrough routes with a hold grant only. `blocking` (default) keeps the caller's
+    /// connection open while a request is held. `async` answers 202 with a poll token and the
+    /// caller polls `GET /poll/<token>` (design `muse-async-poll.md`). Applies to this route only.
+    #[serde(default)]
+    pub hold_mode: HoldMode,
+    /// With `hold_mode = "async"`: seconds an unapproved entry stays pending before it ends as
+    /// `expired`, 5..=600. Ignored in `blocking` mode, where `[passthrough].hold_secs` applies.
+    #[serde(default = "default_hold_secs")]
+    pub async_hold_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -911,6 +929,27 @@ impl Config {
                 }
             }
             route_hosts.insert(r.name.as_str(), r.host.as_str());
+        }
+
+        for r in &self.routes {
+            if !(5..=600).contains(&r.async_hold_secs) {
+                return Err(invalid(format!(
+                    "route {:?}: async_hold_secs must be in 5..=600",
+                    r.name
+                )));
+            }
+            if r.hold_mode == HoldMode::Async
+                && !(r.mode == RouteMode::Passthrough
+                    && self
+                        .grants
+                        .iter()
+                        .any(|g| g.route == r.name && g.decision == Decision::Hold))
+            {
+                return Err(invalid(format!(
+                    "route {:?}: hold_mode \"async\" needs a passthrough route with a hold grant",
+                    r.name
+                )));
+            }
         }
 
         let passthrough_routes: HashSet<&str> = self
@@ -2170,6 +2209,37 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
             "public_authority = \"gate.example.test\"\nhold_secs = 5\ncooldown_secs = 0",
         );
         assert!(load(&ok).is_ok());
+    }
+
+    #[test]
+    fn hold_mode_is_per_route_and_needs_a_hold_grant() {
+        let route = "mode = \"passthrough\"\n";
+        let c = load(&hold_text()).unwrap();
+        assert_eq!(c.routes[0].hold_mode, HoldMode::Blocking);
+        assert_eq!(c.routes[0].async_hold_secs, 120);
+        let on = hold_text().replacen(
+            route,
+            &format!("{route}hold_mode = \"async\"\nasync_hold_secs = 30\n"),
+            1,
+        );
+        let c = load(&on).unwrap();
+        assert_eq!(c.routes[0].hold_mode, HoldMode::Async);
+        assert_eq!(c.routes[0].async_hold_secs, 30);
+        // The old global spelling is gone.
+        let global = hold_text().replace(
+            "public_authority = \"gate.example.test\"",
+            "public_authority = \"gate.example.test\"\nhold_mode = \"async\"",
+        );
+        assert!(load(&global).is_err());
+        let bad = hold_text().replacen(route, &format!("{route}hold_mode = \"sync\"\n"), 1);
+        assert!(load(&bad).is_err());
+        for secs in ["4", "601"] {
+            let t = on.replace("async_hold_secs = 30", &format!("async_hold_secs = {secs}"));
+            expect_invalid(&t, "async_hold_secs");
+        }
+        // No hold grant on the route: refused.
+        let allow = on.replace("decision = \"hold\"", "decision = \"allow\"");
+        expect_invalid(&allow, "hold_mode");
     }
 
     fn approval_block() -> String {

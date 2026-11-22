@@ -5,6 +5,7 @@
 
 pub mod admin_http;
 pub mod approval;
+pub mod async_poll;
 pub mod audit_sink;
 pub mod evidence;
 pub mod forward;
@@ -475,14 +476,21 @@ a passthrough-only config has no per-UID rules"
     app.hold.drain_pending();
     let wait = std::time::Duration::from_secs(pt.request_deadline_secs)
         .saturating_add(std::time::Duration::from_secs(2));
-    let ended = permits.acquire_many(pt.max_connections as u32);
+    // Detached async forwards count too: the 202 released their connection permit already.
+    let ended = async {
+        let _ = permits.acquire_many(pt.max_connections as u32).await;
+        app.async_tasks.idle().await;
+    };
     tokio::select! {
-        _ = ended => {}
+        () = ended => {}
         () = tokio::time::sleep(wait) => {
             eprintln!("auth-proxy: shutdown wait reached the request deadline");
         }
         _ = sigterm.recv() => {}
         _ = sigint.recv() => {}
     }
+    // Whatever still runs is cut; a forward past `forward_started` ends as `send_unknown`.
+    app.async_tasks.cut();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), app.async_tasks.idle()).await;
     0
 }

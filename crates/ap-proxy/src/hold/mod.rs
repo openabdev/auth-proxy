@@ -279,6 +279,84 @@ impl Table {
         })
     }
 
+    /// Admit a new hold in async mode (`muse-async-poll.md`): the `held` record comes first,
+    /// then the admission checks. There is no fingerprint dedupe and no supersede, so every
+    /// request is an independent entry.
+    ///
+    /// `persist` runs under the table lock, before the cooldown and cap checks. A failed write
+    /// refuses with `audit_unavailable` and leaves no entry. A refusal after the write leaves the
+    /// `held` record in the log, so `refused` then writes the terminal record for the same id and
+    /// digest with the refusal's code, under the same lock, before the refusal is returned.
+    pub fn admit_async<F, R>(
+        &self,
+        identity: &str,
+        req: Arc<HeldRequest>,
+        persist: F,
+        refused: R,
+    ) -> Admission
+    where
+        F: FnOnce(&str, &str) -> io::Result<()>,
+        R: FnOnce(&str, &str, Code),
+    {
+        let fingerprint = self.fingerprinter.fingerprint(&req);
+        let digest = digest::audit_digest(&req);
+        let now = Instant::now();
+        let mut g = self.lock();
+        if g.closed {
+            return Admission::Refused(Code::Shutdown);
+        }
+        let id = digest::random_hex(16);
+        if persist(&id, &digest).is_err() {
+            return Admission::Refused(Code::AuditUnavailable);
+        }
+        g.cooldown.retain(|_, until| *until > now);
+        let own = g
+            .pending
+            .values()
+            .filter(|e| e.identity == identity)
+            .count();
+        let refusal = if g.cooldown.contains_key(identity) {
+            Some(Code::Cooldown)
+        } else if own >= self.limits.max_per_identity {
+            Some(Code::IdentityCap)
+        } else if g.pending.len() >= self.limits.max_total {
+            Some(Code::TableFull)
+        } else {
+            None
+        };
+        if let Some(code) = refusal {
+            refused(&id, &digest, code);
+            return Admission::Refused(code);
+        }
+        let nonce = digest::random_hex(12);
+        let view_token = digest::random_hex(16);
+        let (tx, rx) = oneshot::channel();
+        let seq = g.next_seq;
+        g.next_seq += 1;
+        g.pending.insert(
+            id.clone(),
+            Entry {
+                seq,
+                held_at: now,
+                identity: identity.to_string(),
+                fingerprint,
+                digest: digest.clone(),
+                req,
+                tx: Some(tx),
+                nonce: nonce.clone(),
+                view_token: view_token.clone(),
+            },
+        );
+        Admission::Held(Held {
+            id,
+            digest,
+            decision: rx,
+            superseded: None,
+            nonce,
+            view_token,
+        })
+    }
+
     /// Approve `id` for `approver` and wait for the handler's confirmation, with no policy
     /// re-check. The approval listener uses [`Table::approve_if`].
     ///

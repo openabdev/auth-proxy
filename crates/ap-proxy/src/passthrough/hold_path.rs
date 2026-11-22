@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use ap_core::audit::HoldRec;
-use ap_core::config::{Passthrough, Route};
+use ap_core::config::{HoldMode, Passthrough, Route};
 use bytes::Bytes;
 use futures_util::Stream;
 use http::{header, HeaderMap, HeaderValue};
@@ -33,6 +33,8 @@ use super::{
     audited, refusal_response, refuse, refuse_unread, ConnAbort, Drain, End, PtApp, Trail,
 };
 use super::{Code, Duration, Instant, Response, StreamAudit};
+
+mod async_mode;
 use crate::forward::{self, BufferError};
 use crate::hold::{Admission, CallbackAction, Confirm, ConfirmTx, Decision, HeldRequest, Upstream};
 use crate::notify::poll::callback_data;
@@ -511,6 +513,30 @@ pub(super) async fn run(r: Request<'_>) -> Result<Response<Body>, ConnAbort> {
         auth_present: req.auth_present(),
         started: trail.started,
     };
+
+    if route.hold_mode == HoldMode::Async {
+        return Ok(async_mode::run(async_mode::Request {
+            app,
+            trail,
+            ctx,
+            req,
+            headers,
+            bytes,
+            method: parts.method,
+            url: forward::upstream_url(
+                route,
+                &match &query {
+                    Some(q) => format!("{rel}?{q}"),
+                    None => rel.to_string(),
+                },
+            ),
+            hold: Duration::from_secs(route.async_hold_secs),
+            deadline: Duration::from_secs(pt.request_deadline_secs),
+            idle: Duration::from_secs(pt.upstream_idle_secs),
+            identity,
+        })
+        .await);
+    }
 
     // 6. Admission. The `held` record is written under the table lock, before anything changes.
     let admission = app.hold.admit(identity, Arc::clone(&req), |id, digest| {

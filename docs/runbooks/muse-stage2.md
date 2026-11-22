@@ -179,6 +179,37 @@ Muse may retry. The retry is a new request, the owner can approve it, and it wil
 is not claimed. A `forward_started` audit record with no `completed` marks the requests where this can
 have happened.
 
+## Asynchronous polling for the Muse route
+
+Off by default. Enable it per route on the `[[route]]` table; other routes stay blocking:
+
+```toml
+[[route]]
+name = "discord"
+mode = "passthrough"
+hold_mode = "async"      # default "blocking"
+async_hold_secs = 120    # optional, 5..=600, default 120
+```
+
+Load validation refuses the policy unless the route is `mode = "passthrough"` and a `decision = "hold"`
+grant exists on that same route. `[passthrough].hold_secs` is not used on an async route. The helper
+timeout rule in section 5 for blocking mode no longer applies there: the POST returns at once.
+
+| Step | Contract |
+|---|---|
+| POST (same URL as before) | `202` with `status` (`pending`), `request_id`, `poll_token`. Non-202 answers (for example 503 `cooldown`) are unchanged. |
+| Poll | `GET https://<public-host>/poll/<token>?wait=N` at the listener root, no credentials. `wait` missing is 0, above 25 is 25, invalid is 400 `bad_wait`. |
+| Final statuses | `approved_and_sent` (adds `discord_status`, `body`, `truncated`), `denied`, `expired`, `dropped`, `send_failed`, `send_unknown`. `pending` means keep polling. |
+| 404 `not_found` | Unknown token, more than 60 s after the final status, or gate restarted. Uniform, reveals nothing. |
+
+Client rules:
+
+- Poll until a final status, for at most about `async_hold_secs` + 330 s after the POST. Running out of time means outcome unknown.
+- Never retry a POST blindly: a retry is a second pending request and a second approval prompt.
+- `send_unknown`, or a 404 after the request was approved, means outcome unknown. Check the channel or ask the owner before sending again.
+- A deny or an expiry starts the per-identity cooldown (default 60 s, `[passthrough] cooldown_secs`), so a quick new POST can get 503 `cooldown`.
+- Never log the poll token.
+
 ## 8. Not claimed
 
 - Protection from the Muse platform or anything that holds the real token.

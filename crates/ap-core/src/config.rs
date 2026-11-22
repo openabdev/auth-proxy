@@ -138,6 +138,24 @@ pub struct Passthrough {
     /// Seconds an identity is refused after a human deny, 0..=3600 (0 disables).
     #[serde(default = "default_cooldown_secs")]
     pub cooldown_secs: u64,
+    /// `blocking` (default) keeps the caller's connection open while a request is held. `async`
+    /// answers 202 with a poll token and the caller polls `GET /poll/<token>` (design
+    /// `muse-async-poll.md`).
+    #[serde(default)]
+    pub hold_mode: HoldMode,
+    /// In `async` mode, how long an unapproved entry stays pending before it ends as `expired`,
+    /// 5..=600. Ignored in `blocking` mode, where `hold_secs` applies.
+    #[serde(default = "default_hold_secs")]
+    pub async_hold_secs: u64,
+}
+
+/// How a held request is answered to its caller.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HoldMode {
+    #[default]
+    Blocking,
+    Async,
 }
 
 fn default_hold_secs() -> u64 {
@@ -643,6 +661,7 @@ fn validate_passthrough(p: &Passthrough) -> Result<(), ConfigError> {
     }
     for (field, v, min, max) in [
         ("hold_secs", p.hold_secs, 5, 600),
+        ("async_hold_secs", p.async_hold_secs, 5, 600),
         (
             "held_body_max_bytes",
             p.held_body_max_bytes,
@@ -2151,6 +2170,8 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
         for (k, v) in [
             ("hold_secs", "4"),
             ("hold_secs", "601"),
+            ("async_hold_secs", "4"),
+            ("async_hold_secs", "601"),
             ("held_body_max_bytes", "0"),
             ("held_body_max_bytes", "8388609"),
             ("max_held_total", "0"),
@@ -2170,6 +2191,25 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
             "public_authority = \"gate.example.test\"\nhold_secs = 5\ncooldown_secs = 0",
         );
         assert!(load(&ok).is_ok());
+    }
+
+    #[test]
+    fn hold_mode_defaults_to_blocking_and_accepts_async() {
+        let p = load(&hold_text()).unwrap().passthrough.unwrap();
+        assert_eq!(p.hold_mode, HoldMode::Blocking);
+        assert_eq!(p.async_hold_secs, 120);
+        let text = hold_text().replace(
+            "public_authority = \"gate.example.test\"",
+            "public_authority = \"gate.example.test\"\nhold_mode = \"async\"\nasync_hold_secs = 30",
+        );
+        let p = load(&text).unwrap().passthrough.unwrap();
+        assert_eq!(p.hold_mode, HoldMode::Async);
+        assert_eq!(p.async_hold_secs, 30);
+        let bad = hold_text().replace(
+            "public_authority = \"gate.example.test\"",
+            "public_authority = \"gate.example.test\"\nhold_mode = \"sync\"",
+        );
+        assert!(load(&bad).is_err());
     }
 
     fn approval_block() -> String {

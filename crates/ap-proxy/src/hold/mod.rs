@@ -53,7 +53,10 @@ pub struct Limits {
 impl Limits {
     pub fn from_config(pt: &Passthrough) -> Limits {
         Limits {
-            hold: Duration::from_secs(pt.hold_secs),
+            hold: Duration::from_secs(match pt.hold_mode {
+                ap_core::config::HoldMode::Blocking => pt.hold_secs,
+                ap_core::config::HoldMode::Async => pt.async_hold_secs,
+            }),
             max_total: pt.max_held_total,
             max_per_identity: pt.max_held_per_identity,
             cooldown: Duration::from_secs(pt.cooldown_secs),
@@ -274,6 +277,72 @@ impl Table {
             digest,
             decision: rx,
             superseded: duplicate,
+            nonce,
+            view_token,
+        })
+    }
+
+    /// Admit a new hold in async mode (`muse-async-poll.md`): the `held` record comes first,
+    /// then the admission checks. There is no fingerprint dedupe and no supersede, so every
+    /// request is an independent entry.
+    ///
+    /// `persist` runs under the table lock, before the cooldown and cap checks. A failed write
+    /// refuses with `audit_unavailable` and leaves no entry. A refusal after the write leaves the
+    /// `held` record in the log; the caller writes the terminal record with the refusal's code.
+    pub fn admit_async<F>(&self, identity: &str, req: Arc<HeldRequest>, persist: F) -> Admission
+    where
+        F: FnOnce(&str, &str) -> io::Result<()>,
+    {
+        let fingerprint = self.fingerprinter.fingerprint(&req);
+        let digest = digest::audit_digest(&req);
+        let now = Instant::now();
+        let mut g = self.lock();
+        if g.closed {
+            return Admission::Refused(Code::Shutdown);
+        }
+        let id = digest::random_hex(16);
+        if persist(&id, &digest).is_err() {
+            return Admission::Refused(Code::AuditUnavailable);
+        }
+        g.cooldown.retain(|_, until| *until > now);
+        if g.cooldown.contains_key(identity) {
+            return Admission::Refused(Code::Cooldown);
+        }
+        let own = g
+            .pending
+            .values()
+            .filter(|e| e.identity == identity)
+            .count();
+        if own >= self.limits.max_per_identity {
+            return Admission::Refused(Code::IdentityCap);
+        }
+        if g.pending.len() >= self.limits.max_total {
+            return Admission::Refused(Code::TableFull);
+        }
+        let nonce = digest::random_hex(12);
+        let view_token = digest::random_hex(16);
+        let (tx, rx) = oneshot::channel();
+        let seq = g.next_seq;
+        g.next_seq += 1;
+        g.pending.insert(
+            id.clone(),
+            Entry {
+                seq,
+                held_at: now,
+                identity: identity.to_string(),
+                fingerprint,
+                digest: digest.clone(),
+                req,
+                tx: Some(tx),
+                nonce: nonce.clone(),
+                view_token: view_token.clone(),
+            },
+        );
+        Admission::Held(Held {
+            id,
+            digest,
+            decision: rx,
+            superseded: None,
             nonce,
             view_token,
         })

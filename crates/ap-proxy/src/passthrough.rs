@@ -19,7 +19,7 @@ use ap_broker::clock::{Clock, SystemClock};
 use ap_broker::registry::sha256_hex;
 use ap_core::audit::{path_only, AuditRec};
 use ap_core::canon;
-use ap_core::config::{Config, Identity};
+use ap_core::config::{Config, HoldMode, Identity};
 use ap_core::error::Code;
 use ap_core::outcome::{render_passthrough, DECISION_HEADER};
 use ap_core::policy::{Snapshot, Verdict};
@@ -65,6 +65,8 @@ pub struct PtApp {
     held_client: reqwest::Client,
     /// Held requests waiting for a decision.
     pub hold: Arc<hold::Table>,
+    /// Poll tokens and final statuses of the async hold mode. Empty in blocking mode.
+    pub(crate) polls: Arc<crate::async_poll::PollStore>,
     /// Told about each new distinct hold entry. `None` until a notifier is configured.
     pub notifier: Option<Arc<dyn Notifier>>,
     /// `[approval].public_base_url` without a trailing slash: the notification link is
@@ -188,6 +190,7 @@ impl PtApp {
             client,
             held_client,
             hold: Arc::new(hold::Table::new(limits)),
+            polls: Arc::default(),
             notifier: None,
             approval_base: None,
             view_base: None,
@@ -560,6 +563,23 @@ pub async fn handle(app: Arc<PtApp>, req: Request<Body>) -> Result<Response<Body
     let Some(pt) = policy.cfg.passthrough.as_ref() else {
         return Ok(refuse(&app, &trail, Code::PolicyUnavailable));
     };
+
+    // Async hold mode: `GET /poll/<token>` is answered before any authentication, because the
+    // token is its only credential and the answer must not depend on the headers sent.
+    if pt.hold_mode == HoldMode::Async {
+        if let Some(token) = parts.uri.path().strip_prefix("/poll/") {
+            if parts.method != Method::GET || token.is_empty() || token.contains('/') {
+                return Ok(crate::async_poll::not_found());
+            }
+            return Ok(crate::async_poll::poll(
+                &app.polls,
+                app.clock.as_ref(),
+                token,
+                parts.uri.query(),
+            )
+            .await);
+        }
+    }
 
     // 3. Canonical request target, host and path.
     if let Err(code) = canon::check_origin_form(

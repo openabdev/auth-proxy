@@ -5,6 +5,7 @@
 
 pub mod admin_http;
 pub mod approval;
+pub mod async_poll;
 pub mod audit_sink;
 pub mod evidence;
 pub mod forward;

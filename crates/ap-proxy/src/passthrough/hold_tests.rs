@@ -43,6 +43,10 @@ const PATH_TOKEN: &str = "SENTINEL-PATH-TOKEN-0002";
 #[path = "../leak_tests.rs"]
 mod leak_tests;
 
+// The Muse async poll mode.
+#[path = "async_tests.rs"]
+mod async_tests;
+
 // ---------------------------------------------------------------- mock upstreams
 
 #[derive(Clone, Debug)]
@@ -148,6 +152,11 @@ async fn serve(
             .body(full("short and stout"))
             .expect("teapot")),
         "reset-after-read" => Err(io::Error::other("reset")),
+        "big" => Ok(hyper::Response::new(
+            Full::new(Bytes::from(vec![b'x'; 70_000]))
+                .map_err(|never: Infallible| match never {})
+                .boxed_unsync(),
+        )),
         "stall" => std::future::pending().await,
         "stall-body" => {
             let s = futures_util::stream::once(async {

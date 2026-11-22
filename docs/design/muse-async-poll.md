@@ -8,7 +8,8 @@ blocking|async` (default `blocking`); `async_hold_secs` applies only in `async`.
    exists and before any notification.
 2. Run the existing admission checks (cooldown, `max_held_per_identity`, `max_held_total`). A refusal
    writes a terminal audit record with the existing code (`cooldown`, `identity_cap`, `table_full`)
-   after the `held` record and returns the existing 503. No token is issued.
+   after the `held` record and returns the existing 503. No token is issued. In async mode the fingerprint dedupe and supersede are
+   not applied, so every POST is an independent pending entry and there is no `superseded` status.
 3. Insert into the in-memory pending table and send the existing Telegram notification.
 4. Return 202 with `request_id` and a random poll token (at least 128 bits, stored only as a hash,
    constant-time compare). Body and `Authorization` are never echoed.
@@ -52,7 +53,7 @@ current shape and never carry a token, `Authorization`, hash or body. Unapproved
 
 ## Departures
 Connection-as-state is replaced for this route. No cancel on Muse disconnect. Discord response
-headers are not returned verbatim. `X-AP-Decision` is not returned after admission.
+headers are not returned verbatim. `X-AP-Decision` is not returned after admission. Fingerprint dedupe and supersede do not apply.
 Owner confirmation of these four departures is needed before implementation.
 ## Tests
 Poll after each final status; uniform 404 after the window and for unknown tokens; `send_unknown`

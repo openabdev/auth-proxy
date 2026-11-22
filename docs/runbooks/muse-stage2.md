@@ -207,10 +207,8 @@ Client rules:
 - Poll until a final status, for at most about `async_hold_secs` + 330 s after the POST. Running out of time means outcome unknown.
 - Never retry a POST blindly: a retry is a second pending request and a second approval prompt.
 - `send_unknown`, or a 404 after the request was approved, means outcome unknown. Check the channel or ask the owner before sending again.
-- A deny starts the identity cooldown (default 60 s), so a quick new POST can get 503 `cooldown`.
+- A deny or an expiry starts the per-identity cooldown (default 60 s, `[passthrough] cooldown_secs`), so a quick new POST can get 503 `cooldown`.
 - Never log the poll token.
-
-Verified on p1 (2026-11-22): `approved_and_sent` with Discord 200, `denied`, and `expired`.
 
 ## 8. Not claimed
 

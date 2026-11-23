@@ -5,7 +5,7 @@ the `netinit` init container installs. If those rules are missing or ineffective
 rule flushed, a changed UID mapping, a lost capability) the boundary is gone, and before this check
 the proxy kept serving. Now it fails closed.
 
-Standalone and passthrough deployments (a loopback listener behind a private-network TLS front, no
+Single-host and passthrough deployments (a loopback listener behind a private-network TLS front, no
 per-UID rules) are out of scope and unchanged. The check exists only when the proxy is started with
 the `--netfilter-*` flags, and a passthrough-only config refuses to start with them.
 
@@ -155,6 +155,6 @@ passthrough-only config started with any `--netfilter-*` flag exits with status 
 `passthrough_config_with_the_netfilter_check_exits_with_status_2`), so no process can park a request
 in a world where the check is failing, and no approval can be granted into one. The fail-closed
 choice is therefore enforced at startup: the combination is refused, not degraded. Passthrough and
-standalone runs without the flags are unaffected by the gate. In the sidecar profile the admin socket
+single-host runs without the flags are unaffected by the gate. In the sidecar profile the admin socket
 and `/ready` stay responsive while the gate is closed; only the agent listener answers
 `503 netfilter_unverified`.

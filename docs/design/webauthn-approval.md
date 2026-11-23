@@ -603,7 +603,7 @@ Until that enrolment is done, holds expire without a forward.
 
 **Add their own credential, and then approve anything they can see a challenge for.** Say so plainly. The
 protection is the file system: owner-only mode, the proxy user's directory, and the fact that the agent and
-Muse have no access to the gate host [A, standalone deployment on the owner's own node]. This is the same
+Muse have no access to the gate host [A, single-host deployment on the owner's own node]. This is the same
 trust as the Basic hash in the config file today (anyone who can write the config can replace it) [I]. A
 MAC key stored next to the file would add nothing. Detection instead: the proxy writes an audit line at load
 and at every change listing the credential count and the short fingerprint of each credential (section 12),

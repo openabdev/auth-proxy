@@ -2,7 +2,7 @@
 
 Status: stage 1 is implemented and measured. Stage 2 (held-connection approval) is implemented on
 main (merged), in pilot use, and tested in CI against a mock upstream; the through-the-front hold window was measured in stage 1
-(a 300 s probe completed end to end, see docs/evidence/muse-stage1.md), and the disconnect signal is still open. The asynchronous route needs no long client connection and was exercised through the front in pilot use for approve, deny and expired outcomes. Asynchronous polling is also implemented on main, see
+(a 300 s probe completed end to end, see docs/evidence/muse-stage1.md), and the disconnect signal is still open. The asynchronous route needs no long client connection. Asynchronous polling is also implemented on main, see
 [muse-async-poll.md](muse-async-poll.md). Scope: a minimal proof
 of concept (PoC) for one consumer, Muse calling the Discord HTTP API through auth-proxy in standalone
 service mode. See "Stage 2 implementation notes" at the end of section 7 for where the code differs from
@@ -834,7 +834,9 @@ name: a hold admitted with the token records that mode at admission and is refus
    gate on that port.
 2. **Phone approval on every write.** Every B request is a `hold` in the same hold table, with the same
    notification, the same hold window (`hold_secs` on a blocking route; `async_hold_secs` on an async route, default 120 s, range 5..=600), the same audit records and the same
-   fail-closed rules as the keyed write route in 3.4 to 3.9. The approval plane is unchanged (3.6).
+   fail-closed rules as the keyed write route in 3.4 to 3.9, except that an async route has no
+   fingerprint dedupe or supersede and does not cancel when the caller disconnects (see
+   docs/design/muse-async-poll.md, Departures). The approval plane is unchanged (3.6).
 3. **Single caller, one route.** One token identity in the whole policy, bound to one route. Config load
    refuses a second `[[token_identity]]` whatever its route, so this limit is enforced by code.
 4. **Expiry.** The token stops working at the pilot end date, as above.

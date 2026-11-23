@@ -49,8 +49,8 @@ sequenceDiagram
     participant O as Owner
     participant D as Discord
     M->>G: POST /discord/api/v10/channels/ID/messages
-    G->>G: write held audit record first
-    G->>G: admission: cooldown and caps
+    G->>G: admission: cooldown, dedupe or supersede, caps
+    G->>G: write held audit record
     G->>T: notify with request id and view link
     T->>O: message with Approve and Deny
     alt owner approves before hold_secs
@@ -69,8 +69,11 @@ sequenceDiagram
     end
 ```
 
-An admission refusal returns 503 (`cooldown`, `identity_cap`, `table_full`) and sends no notification. If the
-`held` audit write fails the answer is 503 `audit_unavailable`. A deny or an expiry starts the cooldown.
+In blocking mode the gate checks cooldown, then dedupe or supersede, then the caps, and only then writes the
+`held` audit record. An admission refusal returns 503 (`cooldown`, `identity_cap`, `table_full`), writes no
+`held` record and sends no notification. If the `held` audit write fails the answer is 503 `audit_unavailable`,
+and the table is left unchanged. A deny or an expiry starts the cooldown. Async mode (section 4) reverses the
+order: it writes the `held` record first, then checks admission.
 
 ## 4. Request flow, async polling mode
 
@@ -116,7 +119,7 @@ max_held_total = 32                     # 1..=1024
 max_held_per_identity = 4               # 1..=max_held_total
 cooldown_secs = 60                      # 0..=3600, 0 disables
 
-[approval]                              # required when any grant holds
+[approval]                              # validated when present; see the note below
 listen = "127.0.0.1:<approval-port>"    # loopback, not listen.proxy
 user = "<approver>"
 password_sha256 = "<sha256>"
@@ -162,20 +165,26 @@ decision = "hold"
 path_patterns = ["/api/v10/channels/*/messages"]
 ```
 
-Notes: a hold grant uses `path_patterns`, never `paths`, and only on a passthrough route. Async needs a
+Notes: `[approval]` is validated when present, and it is refused outside a passthrough deployment. Loading
+does not require it for a hold grant. A hold policy with no `[approval]` loads, binds no approval listener, and
+its holds expire with no approval path. `[notify]` needs `[approval]`, and the gate exits 2 without it.
+A hold grant uses `path_patterns`, never `paths`, and only on a passthrough route. Async needs a
 passthrough route that has a hold grant, or the policy is refused at load. With `buttons = false`, setting
 `owner_chat_id` or `view_base_url` is refused. A token identity authenticates keyless requests on its route,
 only for a `hold` grant. Whether the Muse connector sends a caller key, a token, or both is not verified here.
 
 ## 6. Credentials and secrets
 
-- **Stored by the gate**: a caller key hash, a token hash, an approver password hash. Never a token or key.
-- **Telegram bot token**: read at startup from `token_file`. It must be a regular file with mode 0600, owned by
-  the service user. Any other mode refuses to start.
+- **Stored by the gate**: a caller key hash, a token hash, an approver password hash. Never a caller token or key.
+- **Telegram bot token**: read at startup from `token_file`. The gate checks that it is a regular file and that
+  its group and other permission bits are zero; a file with any of those bits set is refused. Ownership by the
+  service user and an exact mode of 0600 are operational guidance, not checked by the gate. The gate does hold
+  this token in memory, so it is a secret the gate host stores.
 - **Discord token**: lives in Muse's secure connector storage, entered by the owner. It reaches the gate only
   in the request's `Authorization` header and is forwarded, not kept.
 - **Audit**: each held-request record has the request id, identity, route, method, path (query dropped), a
-  request digest, the transition, status and timing. It never has a token, `Authorization`, hash or body.
+  credential-blind request digest (SHA-256 of the outbound request with credential headers replaced), the
+  transition, status and timing. It never has a token, an `Authorization` value, a credential hash or a body.
   The Telegram message carries a fixed sentence, the request id and a link, not the content.
 
 ## 7. Operations

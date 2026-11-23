@@ -120,7 +120,7 @@ and `deploy/muse/pilot-policy.example.toml`.
 
 Stage 2 adds a third verdict, `hold`, for writes the owner wants to approve one by one. A held request
 keeps its connection open. The gate tells the owner a request is waiting (a fixed text and a link, never
-the content), the owner opens a separate approval page, and only an explicit approve forwards the request.
+the content; with `[notify] buttons = true` the Telegram message also has Approve and Deny buttons and a no-login view link), the owner decides on the approval page or, with buttons, in Telegram, and only an explicit approve forwards the request.
 Deny, expiry (`hold_secs`), a caller who gives up, a policy reload that drops the identity, and shutdown
 all end the request with a refusal and nothing sent upstream. The connection is the state: there is no
 queue, and a restart forgets every held request.

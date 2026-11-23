@@ -451,7 +451,9 @@ owner's phone through a second `tailscale serve` mapping on its own port, never 
 port; the ACL shape is in section 4.2 [A]. A local CLI over a Unix socket remains a fallback. The HTTP
 API is client-agnostic (`GET /pending`, `GET /pending/<id>`, `POST /pending/<id>/approve|deny`), in line
 with the #6 decision that app shells are thin clients over the same endpoints [I issue #6 comment 1].
-WebAuthn approval over the digest is a later replacement for the credential step [I issue #6 comment 1].
+WebAuthn approval over the digest is a later replacement for the credential step [I issue #6 comment 1]. WebAuthn is a design only (`docs/design/webauthn-approval.md`), not implemented.
+
+Current state: with `[notify] buttons = true` the owner decides in Telegram with Approve and Deny buttons, and the message carries a no-login one-time view link (PR #41). The Basic-auth page and CSRF code remain and are used when `buttons = false`; they are not the primary path.
 
 Page controls:
 
@@ -549,7 +551,7 @@ and `view_base_url`. `buttons = false` restores option C (3.6.1) with no code ch
   compared in constant time. It is valid only while the entry is `Pending`. Approve, deny, expiry, drop,
   abandon and supersede each end it at once. An unknown or ended token gets the same generic 404 bytes
   as an unknown path. The page is read-only and shows the redacted request that the approval page shows
-  (method, route, redacted path, body preview, header names, with credential values hidden). It has the
+  (method, route, redacted path, header names, with credential values hidden). It shows the decoded message content (PR #42) and a banner naming any other top-level fields, names only (PR #43); the raw body is in a closed Details block. It has the
   six hardened headers, sets no cookie, has no form and no CSRF token, and never logs or audits the
   token. The route exists only when buttons are on.
 - **Supersede in buttons mode.** A supersede sends one new notification for the newest entry. The
@@ -889,7 +891,7 @@ those exists because the caller does not wait. Here the caller waits, so the rea
 | Audit transitions `held/approved/denied/expired/executed` | **Keep**, rename `executed` to `forward_started` and `completed` | Same purpose; the record precedes the action |
 | Expiry as a recorded terminal refusal, not a state | **Keep** | Matches the connection model directly |
 | Single execution | **Keep** as at-most-once per connection (section 5.1) | In-memory state machine, no store |
-| WebAuthn approval | **Defer** | Part of the end state in #6. The PoC uses Basic auth plus a per-page CSRF token |
+| WebAuthn approval | **Defer** (not implemented) | Part of the end state in #6. The PoC uses Basic auth plus a per-page CSRF token |
 | Durable pending store surviving restart | **Drop** | The connection is the state. A restart loses it and that is the specified behaviour |
 | "Consume approval and mark executed in one durable write" (restart-safe exactly once) | **Drop** | Nothing to recover. After a restart there is no approved id to re-execute |
 | Request id and polling endpoint, callback | **Drop** | The response is the connection's own response. The request id remains, as an audit and approval-page key only |
@@ -1220,7 +1222,7 @@ Open questions 1 to 4 are stage 1 blockers.
 6. **Retry behaviour.** (Answered [M-reported] for the 423, 410 and 503 probes and a real 423 `no_grant` write: no retry; see `docs/evidence/muse-stage1.md`.) After an `expired` or `denied`, does Muse's agent retry automatically? If so each
    retry is another phone prompt; dedupe, the per-identity cap and the default 60 s cooldown bound this.
 7. **Approver channel.** Answered in the review comments: Basic auth plus a per-page CSRF token for the PoC,
-   WebAuthn later, and the approval API stays client-agnostic (a requirement). The notifier is Telegram only
+   WebAuthn later (design only, not implemented), and the approval API stays client-agnostic (a requirement). The notifier is Telegram only
    (section 3.6.1, owner decision 2026-11-21).
 8. **One caller key per what?** One identity per Muse user, per connector, or per Discord channel set?
    This sets how revocation and the audit identity read.

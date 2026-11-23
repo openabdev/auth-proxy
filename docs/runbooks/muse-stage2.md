@@ -2,7 +2,7 @@
 
 Design: `docs/design/muse-gated-passthrough.md` (sections 3.4 to 3.9, 5, 7 stage 2). Stage 2 adds the
 `hold` verdict, the approval listener and a notification hook to the stage 1 passthrough. Everything
-here is generic: use your own hosts, and never commit real host names, addresses, logins, topics or keys.
+here is generic: use your own hosts, and never commit real host names, addresses, logins or keys.
 
 **The gate constrains the agent, not the Muse platform.** Muse's egress holds the real Discord token, so
 Muse or anyone who compromises it can call Discord directly and skip the gate.
@@ -97,7 +97,9 @@ Run these yourself. Do not paste the token into chat, a ticket, a commit or this
    The file path goes in `[notify] token_file`. Keep mode 0600 and no group or other bits. No other user may read it.
 5. Restart `auth-proxy`. A startup error line `notify token file: ...` names only the kind of fault.
 6. Send a test hold from the Muse side. The owner's chat should receive one message with the fixed
-   sentence, a request id and a link. Open the link and approve or deny.
+   sentence, a request id and a link. With `buttons = false`, open the link and approve or deny on the
+   approval page. With `buttons = true` (3.2), press Approve or Deny in Telegram; the link opens a read-only
+   view.
 
 To rotate the token, revoke it in BotFather (`/revoke`), write the new token to the same file, and restart.
 Anyone who has the token can send messages as the bot and read `getUpdates` for it, so treat it like a
@@ -119,8 +121,8 @@ Do these in addition to 3.1. Run each one yourself and keep the answers out of c
    listener's `/view/` path. Use an https name, not the Muse caller name.
 4. Restart `auth-proxy`. A startup error names the missing or refused key and nothing else.
 5. Send one test hold. The message should have the fixed sentence, the id, the view link and the two
-   buttons. Open the link on the tailnet and read the request. Press Approve or Deny in Telegram. The
-   button should stop spinning and reply `Approved` or `Denied`. Press it again: the reply should be
+   buttons. Open the link on the tailnet: the view page shows the decoded message content and names any
+   other fields. Press Approve or Deny in Telegram. The button should stop spinning and reply `Approved` or `Denied`. Press it again: the reply should be
    `No longer waiting`.
 6. To go back to option C, set `buttons = false` and remove `owner_chat_id` and `view_base_url`. Restart.
    The view route then disappears, and the approval page is used as before.
@@ -133,8 +135,9 @@ ownership for a press.
 
 The approval listener binds loopback. Put it behind a front that only the approver can reach, on a
 different name and path from the one Muse uses, and keep the approval port off the caller path. This is a
-deployment control; the code cannot prove it. The approver authenticates with Basic auth plus a per-view,
-single-use CSRF token.
+deployment control; the code cannot prove it. With `buttons = false` the approver authenticates on the
+approval page with Basic auth plus a per-view, single-use CSRF token. With `buttons = true` the owner
+decides in Telegram, and the Basic-auth page is not the primary path.
 
 With `buttons = true`, the same front must also map `/view/` to the approval listener. That path needs no
 login, so only the tailnet may reach it. Never map it on a public name.

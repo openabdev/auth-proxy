@@ -1,8 +1,8 @@
 # Muse gated passthrough: a hold-the-connection approval gate
 
 Status: stage 1 is implemented and measured. Stage 2 (held-connection approval) is implemented on
-main (merged), in pilot use, and tested in CI against a mock upstream; the through-the-front measurements (hold window,
-disconnect signal) are still open. Asynchronous polling is also implemented on main, see
+main (merged), in pilot use, and tested in CI against a mock upstream; the through-the-front hold window was measured in stage 1
+(a 300 s probe completed end to end, see docs/evidence/muse-stage1.md), and the disconnect signal is still open. The asynchronous route needs no long client connection and was exercised through the front in pilot use for approve, deny and expired outcomes. Asynchronous polling is also implemented on main, see
 [muse-async-poll.md](muse-async-poll.md). Scope: a minimal proof
 of concept (PoC) for one consumer, Muse calling the Discord HTTP API through auth-proxy in standalone
 service mode. See "Stage 2 implementation notes" at the end of section 7 for where the code differs from
@@ -553,7 +553,7 @@ and `view_base_url`. `buttons = false` restores option C (3.6.1) with no code ch
   compared in constant time. It is valid only while the entry is `Pending`. Approve, deny, expiry, drop,
   abandon and supersede each end it at once. An unknown or ended token gets the same generic 404 bytes
   as an unknown path. The page is read-only and shows the redacted request that the approval page shows
-  (method, route, redacted path, header names, with credential values hidden). It shows the decoded message content (PR #42) and a banner naming any other top-level fields, names only (PR #43); the raw body is in a closed Details block. It has the
+  (method, route, redacted path, header names, with credential values hidden). It shows the decoded message content and a banner naming any other top-level fields, names only (PR #43); the raw body is in a closed Details block. It has the
   six hardened headers, sets no cookie, has no form and no CSRF token, and never logs or audits the
   token. The route exists only when buttons are on.
 - **Supersede in buttons mode.** A supersede sends one new notification for the newest entry. The
@@ -833,7 +833,7 @@ name: a hold admitted with the token records that mode at admission and is refus
 1. **ACL to the Muse node.** Only the Muse tag reaches the public port (4.2 item 1). Nothing else reaches the
    gate on that port.
 2. **Phone approval on every write.** Every B request is a `hold` in the same hold table, with the same
-   notification, the same `hold_secs` window (set by the deployment policy; the code default is 120 s, range 5..=600), the same audit records and the same
+   notification, the same hold window (`hold_secs` on a blocking route; `async_hold_secs` on an async route, default 120 s, range 5..=600), the same audit records and the same
    fail-closed rules as the keyed write route in 3.4 to 3.9. The approval plane is unchanged (3.6).
 3. **Single caller, one route.** One token identity in the whole policy, bound to one route. Config load
    refuses a second `[[token_identity]]` whatever its route, so this limit is enforced by code.

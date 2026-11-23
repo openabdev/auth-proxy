@@ -1,8 +1,9 @@
 # Muse gated passthrough: a hold-the-connection approval gate
 
 Status: stage 1 is implemented and measured. Stage 2 (held-connection approval) is implemented on
-branch `feat/muse-stage2` and tested in CI against a mock upstream; it is not deployed, and the
-through-the-front measurements (hold window, disconnect signal) are still open. Scope: a minimal proof
+main (merged) and tested in CI against a mock upstream; the through-the-front measurements (hold window,
+disconnect signal) are still open. Asynchronous polling is also implemented on main, see
+[muse-async-poll.md](muse-async-poll.md). Scope: a minimal proof
 of concept (PoC) for one consumer, Muse calling the Discord HTTP API through auth-proxy in standalone
 service mode. See "Stage 2 implementation notes" at the end of section 7 for where the code differs from
 this text.
@@ -43,7 +44,8 @@ Stated by the owner and treated as fixed [A owner]:
    (section 3.5). Discord's own responses, including any `x-ap-*` headers they carry, pass through
    unchanged.
 6. The connection is the state. There is no durable approved state, no polling endpoint and no one-time
-   proof. A crash after approval and before forwarding loses the held connection, nothing executes, and
+   proof. (For a route with `hold_mode = "async"` this is replaced: the POST returns 202 and the caller
+   polls, see [muse-async-poll.md](muse-async-poll.md). Nothing is durable there either.) A crash after approval and before forwarding loses the held connection, nothing executes, and
    Muse's retry starts a new approval round.
 
 ## 2. Overview
@@ -462,10 +464,10 @@ Page controls:
 - `approve` and `deny` are form `POST`s. A browser sends Basic credentials automatically, so each page
   carries a per-page CSRF token (random, bound to the entry id, single use) that the POST must echo.
 - Every approval response, including errors, carries `Content-Security-Policy: default-src 'none';
-  frame-ancestors 'none'; form-action 'self'`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+  style-src 'sha256-<hash of the one inline stylesheet>'; frame-ancestors 'none'; form-action 'self'`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
   `Cache-Control: no-store`, `Pragma: no-cache` and `X-Content-Type-Options: nosniff`. `default-src` does
   not cover `frame-ancestors`, so it is named, which stops a page framing the approve button over the
-  owner's cached Basic credentials. The page has no script and no inline style, and renders the body and
+  owner's cached Basic credentials. The page has no script and no `style` attributes; its one inline `<style>` block is allowed by that hash. It renders the body and
   every value with HTML escaping.
 - The page never renders or logs an `Authorization` value from a held request (the entry keeps it for
   forwarding but the view model omits it). It shows that the header is present.
@@ -894,7 +896,7 @@ those exists because the caller does not wait. Here the caller waits, so the rea
 | WebAuthn approval | **Defer** (not implemented) | Part of the end state in #6. The PoC uses Basic auth plus a per-page CSRF token |
 | Durable pending store surviving restart | **Drop** | The connection is the state. A restart loses it and that is the specified behaviour |
 | "Consume approval and mark executed in one durable write" (restart-safe exactly once) | **Drop** | Nothing to recover. After a restart there is no approved id to re-execute |
-| Request id and polling endpoint, callback | **Drop** | The response is the connection's own response. The request id remains, as an audit and approval-page key only |
+| Request id and polling endpoint, callback | **Drop** (blocking routes) | The response is the connection's own response. An async route has a poll endpoint, see `muse-async-poll.md`. The request id remains, as an audit and approval-page key only |
 | Result slot recorded against the id | **Drop** | Discord's response goes straight back on the connection |
 | One-time approval proof (platform vault path) | **Drop** | Muse needs no proof; owner decision |
 | Credential store and swap in the proxy | **Drop for this mode** | The credential arrives with the request |

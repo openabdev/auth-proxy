@@ -48,8 +48,8 @@ flowchart LR
 
 auth-proxy runs in two deployment models. The gate's mechanisms — caller check,
 canonicalization, per-identity policy, credential swap, and audit — work the same in
-both, and the planned `require_approval` mechanism ([#5](https://github.com/openabdev/auth-proxy/issues/5);
-not implemented in Phase 1) is meant to behave the same in both. What changes is the trust
+both. The sidecar `require_approval` mechanism ([#5](https://github.com/openabdev/auth-proxy/issues/5)) is still
+planned and not implemented; standalone mode already has a `hold` verdict (see the Muse sections below). What changes is the trust
 scaffolding around the gate: who vouches for the caller, where the proxy sits, and
 where the real credential lives.
 
@@ -65,13 +65,13 @@ flowchart LR
 
     UP1 ~~~ TP
 
-    subgraph STAND["Standalone service mode — third-party callers (under development)"]
+    subgraph STAND["Standalone service mode — third-party callers (Muse pilot implemented)"]
         TP["Third-party caller<br/>Muse / Grok · pre-provisioned caller key"]
         GATE["auth-proxy<br/>standalone service<br/>on a user-controlled host"]
         UP2["Upstream APIs<br/>Discord is the first consumer"]
         TP -->|"no registrar — caller key<br/>provisioned out of band"| GATE
-        GATE -->|"platform vault path (proposed, under review): approval proof only<br/>the platform's egress would swap the credential"| UP2
-        GATE -->|"gate-held path (planned): gate holds the credential<br/>swaps and forwards in-path"| UP2
+        GATE -->|"platform vault path (proposed, not built): approval proof only<br/>the platform's egress would swap the credential"| UP2
+        GATE -->|"gate-held path (not built): gate holds the credential<br/>swaps and forwards in-path"| UP2
     end
 ```
 
@@ -94,15 +94,17 @@ control to credential control, in two sub-shapes.
 - **Gate-held path.** The gate holds the credential in its own store and forwards
   in-path. Once `require_approval` lands, this path would forward after approval.
   This is the shape described in [#5](https://github.com/openabdev/auth-proxy/issues/5).
-- **Platform vault path (proposed, under review).** If the caller's platform has its
+- **Platform vault path (proposed, not built).** If the caller's platform has its
   own vault and egress enforcement (Muse), the gate would hold no credential and stay
   out of the data path: it would issue a one-time approval proof bound to the request
   hash, and the platform's egress would swap in the credential. This is a new
   architecture that #5 does not contain and no design review has covered yet. It is
   not settled and is not part of Phase 1.
 
-This mode is **under development** and is not part of Phase 1; its first consumer is
-tracked in [#5](https://github.com/openabdev/auth-proxy/issues/5).
+Neither sub-shape is built. What runs in standalone mode is the Muse gated passthrough below: the
+caller's own `Authorization` passes through and the gate only decides. Stage 1, stage 2 (`hold`) and
+asynchronous polling are implemented on main as a pilot for one consumer and one upstream; that pilot is not
+a general standalone product, and Phase 1 is unchanged.
 
 ## Muse gated passthrough (stage 1, pilot)
 
@@ -122,8 +124,10 @@ Stage 2 adds a third verdict, `hold`, for writes the owner wants to approve one 
 keeps its connection open. The gate tells the owner a request is waiting (a fixed text and a link, never
 the content; with `[notify] buttons = true` the Telegram message also has Approve and Deny buttons and a no-login view link), the owner decides on the approval page or, with buttons, in Telegram, and only an explicit approve forwards the request.
 Deny, expiry (`hold_secs`), a caller who gives up, a policy reload that drops the identity, and shutdown
-all end the request with a refusal and nothing sent upstream. The connection is the state: there is no
-queue, and a restart forgets every held request.
+all end the request with a refusal and nothing sent upstream. By default the connection is the state: there is no
+queue, and a restart forgets every held request. A route can opt into asynchronous polling instead
+(`hold_mode = "async"`): the POST returns 202 with a poll token, see `docs/design/muse-async-poll.md` and
+the runbook `docs/runbooks/muse-stage2.md`.
 
 The gate constrains the agent, not the Muse platform. Muse's egress holds the real Discord token and can
 call Discord directly. A stolen caller key lets someone send requests as that identity (the per-identity

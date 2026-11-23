@@ -144,9 +144,9 @@ login, so only the tailnet may reach it. Never map it on a public name.
 
 ## 5. Timeouts and the old connector
 
-- The connector's helper timeout must be longer than `hold_secs`, and so must every idle timeout between
+- For blocking routes the connector's helper timeout must be longer than `hold_secs` (max 600), and so must every idle timeout between
   Muse and the gate (the TLS front, any load balancer). The effective window is the smallest of them.
-  Measure it before relying on a long `hold_secs`.
+  Measure it before relying on a long `hold_secs`. This does not apply to an async route.
 - Remove the previous direct connector once the gate is the only path, or the agent can still write
   without approval.
 

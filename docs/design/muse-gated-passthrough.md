@@ -1039,7 +1039,7 @@ Acceptance:
     stage 2 does not start until they are answered. Results: `docs/evidence/muse-stage1.md`.
 
     Stage 2 prerequisites from those results:
-    - The connector's helper timeout for gated routes must exceed the hold window (the default 30 s is not enough).
+    - The connector's helper timeout for gated routes must exceed the hold window (the default 30 s is not enough). This applies to blocking routes only; an async route returns 202 at once (`muse-async-poll.md`).
     - The connector for the gate host must be the agent's only route to Discord; remove the old connector or
       unregister its credential before the gate is relied on.
 
@@ -1203,7 +1203,7 @@ Open questions 1 to 4 are stage 1 blockers.
    300 s through the TLS front (no cut up to 300 s); helper side [M-reported], the Muse helper received
    each completed response end to end with its timeout raised above the hold, and the default 30 s helper
    timeout gave up on a 30 s hold. Hard condition: the default 30 s helper timeout is not enough, so the
-   helper timeout for gated routes must exceed `hold_secs`. Still unmeasured: any ceiling above 300 s, and
+   helper timeout for gated routes must exceed `hold_secs` (blocking routes only; it does not apply to an async route). Still unmeasured: any ceiling above 300 s, and
    the platform-internal swap logs. The 120 s default for `hold_secs` is within the observed range, only
    with the raised helper timeout. See `docs/evidence/muse-stage1.md`.
 2. **Caller-key header name.** Answered [M-reported]: the current helper cannot add a custom request header,

@@ -207,7 +207,7 @@ timeout rule in section 5 for blocking mode no longer applies there: the POST re
 
 Client rules:
 
-- Poll until a final status, for at most about `async_hold_secs` + 330 s after the POST. Running out of time means outcome unknown.
+- Poll until a final status, for at most about `async_hold_secs` + 330 s after the POST (a recommended client-side polling budget, not a gate setting). Running out of time means outcome unknown.
 - Never retry a POST blindly: a retry is a second pending request and a second approval prompt.
 - `send_unknown`, or a 404 after the request was approved, means outcome unknown. Check the channel or ask the owner before sending again.
 - A deny or an expiry starts the per-identity cooldown (default 60 s, `[passthrough] cooldown_secs`), so a quick new POST can get 503 `cooldown`.

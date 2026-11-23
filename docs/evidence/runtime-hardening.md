@@ -22,7 +22,7 @@ Settings and rules: README "Runtime container hardening".
 | Seed file | As seen by the runtime: `runtime_ed25519.seed` mode 444, owner 0:0 (kubelet-written, `..data` symlink). In the agent container: `cat /var/run/auth-proxy-runtime/runtime_ed25519.seed` gives "No such file or directory", `find / -name 'runtime_ed25519*'` finds nothing, `/var/run/auth-proxy-runtime` is not in its mountinfo, `/run/auth-proxy-session` does not exist. Scan of the agent's process environments and its writable paths for the seed and the credential: 0 hits. The seed's protection is the missing mount, not the file mode. |
 | PID namespace | Runtime and proxy are in different PID namespaces and the same network namespace. The agent sees 5 PIDs (its own). |
 | AppArmor | containerd's default profile is applied with no field set: `/proc/<pid>/attr/current` of every container reads `cri-containerd.apparmor.d (enforce)`. A test pod with `appArmorProfile: {type: RuntimeDefault}` reads the same; one with `Unconfined` reads `unconfined`. The manifest does not set the field, because a node without AppArmor refuses it; the validator refuses `Unconfined`. |
-| Black-box pod checks | Agent: proxy gate answers `403 surrogate_missing`; egress listener `405`; other loopback ports refused (curl exit 7); direct `https://1.1.1.1` refused (exit 7); DNS "no servers could be reached". Log scan of all seven containers for the credential, caller key and seed: 0 hits. |
+| Black-box pod checks | Agent: proxy gate answers `403 surrogate_missing`; egress listener `405`; other loopback ports refused (curl exit 7); direct `https://<ip>` refused (exit 7); DNS "no servers could be reached". Log scan of all seven containers for the credential, caller key and seed: 0 hits. |
 | Expiry store | Owned 1001:1001 mode 0600 (`runAsGroup: 1001` added to `expiry-store-bootstrap`). Same sha256 before pod delete, after delete and after recreate. The recreated pod reached 6/6 and got `hello` 201. |
 | Grace period | `terminationGracePeriodSeconds: 10`. Pod delete to gone: 10.8 s. The binaries run as PID 1 with no SIGTERM handler, so deletion waits for the whole grace period; the default is 30 s. |
 
@@ -34,10 +34,10 @@ Snapshot before and after: namespaces, `ctr -n k8s.io images` listing, host `ipt
 
 ```
 namespaces                 : default kube-node-lease kube-public kube-system openab  (same)
-ctr images md5 / count     : 1b52afe0a10081120714dbf0a88a6778 / 44, before and after
-host iptables OUTPUT md5   : 6aa9113fa8015deb4c7a93b5c2f03524 before and after
-PV listing md5             : 0f73001170936388d9f59096cba1bbea before and after
-home listing md5           : 5c05b4b1648ffcef6269785cda708d68 before and after
+ctr images md5 / count     : <md5> / 44, before and after
+host iptables OUTPUT md5   : <md5> before and after
+PV listing md5             : <md5> before and after
+home listing md5           : <md5> before and after
 tailscale                  : state never touched; header identical
 build directory, scripts   : removed from the node's temp directory
 crictl containers (all)    : 13 before, 14 after: one exited local-path `helper-pod` in kube-system (the claim cleanup), garbage-collected by the kubelet

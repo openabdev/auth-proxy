@@ -21,7 +21,7 @@ All times are from the node clock. "Request" is `GET /ap/<caller key>/kiro-krs/`
 
 | Step | Action | Result |
 |---|---|---|
-| A. Baseline | Pod up, rules in place | 6/6 containers Ready. Request: `403 surrogate_missing` (policy pipeline answers). `auth-proxy --check-ready` exit 0, kubelet `proxy.ready=true`. As UID 1000: `curl https://1.1.1.1` fails (`http=000`), `nslookup` "no servers could be reached". `ap-netprobe --once`: loopback Refused, egress Refused, dns Refused. |
+| A. Baseline | Pod up, rules in place | 6/6 containers Ready. Request: `403 surrogate_missing` (policy pipeline answers). `auth-proxy --check-ready` exit 0, kubelet `proxy.ready=true`. As UID 1000: `curl https://<ip>` fails (`http=000`), `nslookup` "no servers could be reached". `ap-netprobe --once`: loopback Refused, egress Refused, dns Refused. |
 | Startup | Proxy log from a fresh pod | `unverified: starting`, `unverified: rules:missing`, then `ready: ok` about 1 s later, when the first status files appeared. |
 | B. Remove all rules (`iptables -F OUTPUT; ip6tables -F OUTPUT`) | | Proxy audit line `{"event":"netfilter","reason":"rules:rules_changed","state":"failed"}` 4.6 s after the removal (that is where the removal fell in the 30 s cycle; the worst case is one interval plus the 1 s poll). Request: `503`, `x-ap-decision: unavailable`, `connection: close`, body `{"ap_decision":"unavailable","code":"netfilter_unverified"}`. `--check-ready` exit 1. Kubelet showed `proxy.ready=false` 10.1 s after the removal (pod 5/6, `Ready=False`; the exec probe runs every 5 s). With the rules gone the agent boundary really was open: `nslookup example.com` resolved. `ap-netprobe --once`: loopback Open, dns Open, `reason=loopback_open`. |
 | C. Restore the snapshot | | Request back to `403 surrogate_missing` 24.1 s after the restore (one `netcheck` interval). Kubelet `proxy.ready=true` after 27.8 s. Agent direct egress refused again. |
@@ -38,10 +38,10 @@ Snapshot before and after (`namespaces`, pods, `ctr -n k8s.io images`, listening
 
 ```
 namespaces                : default kube-node-lease kube-public kube-system openab  (same)
-ctr images md5            : 1b52afe0a10081120714dbf0a88a6778 before and after
+ctr images md5            : <md5> before and after
 crictl containers         : 13 before, 13 after
-host iptables OUTPUT md5  : 6aa9113fa8015deb4c7a93b5c2f03524 before and after
-home listing md5          : c8591181ed00cdf6d6a3f34edcf6897e before and after (cargo dir untouched)
+host iptables OUTPUT md5  : <md5> before and after
+home listing md5          : <md5> before and after (cargo dir untouched)
 iptables rules naming the test: 0; matching processes: 0; PVs: 1 before (not ours), 1 after
 tailscale                 : state never touched; header identical
 ```

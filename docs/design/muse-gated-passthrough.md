@@ -1,7 +1,7 @@
 # Muse gated passthrough: a hold-the-connection approval gate
 
 Status: stage 1 is implemented and measured. Stage 2 (held-connection approval) is implemented on
-main (merged) and tested in CI against a mock upstream; the through-the-front measurements (hold window,
+main (merged), in pilot use, and tested in CI against a mock upstream; the through-the-front measurements (hold window,
 disconnect signal) are still open. Asynchronous polling is also implemented on main, see
 [muse-async-poll.md](muse-async-poll.md). Scope: a minimal proof
 of concept (PoC) for one consumer, Muse calling the Discord HTTP API through auth-proxy in standalone
@@ -578,7 +578,7 @@ and `view_base_url`. `buttons = false` restores option C (3.6.1) with no code ch
 1. **Bearer view link inside the tailnet.** The link carries a per-hold token. Anyone on the tailnet
    who has the link can read that one request while the hold lives. The same link also sits in
    Telegram's stored copy of the message, so the link is a bearer secret held by Telegram. The hold is
-   at most `hold_secs` (90 s in the stage 2 policy), and the token dies with the hold. The page shows the
+   at most `hold_secs` (set by the deployment policy; the code default is 120 s, range 5..=600), and the token dies with the hold. The page shows the
    redacted request, never a credential value. This risk is part of the approved design (council option 1,
    2026-11-21); the owner confirms it when the PR is reviewed.
 2. **Telegram account is the only authentication, with no second factor.** Whoever controls the owner's
@@ -833,7 +833,7 @@ name: a hold admitted with the token records that mode at admission and is refus
 1. **ACL to the Muse node.** Only the Muse tag reaches the public port (4.2 item 1). Nothing else reaches the
    gate on that port.
 2. **Phone approval on every write.** Every B request is a `hold` in the same hold table, with the same
-   notification, the same `hold_secs` window (90 s for this pilot), the same audit records and the same
+   notification, the same `hold_secs` window (set by the deployment policy; the code default is 120 s, range 5..=600), the same audit records and the same
    fail-closed rules as the keyed write route in 3.4 to 3.9. The approval plane is unchanged (3.6).
 3. **Single caller, one route.** One token identity in the whole policy, bound to one route. Config load
    refuses a second `[[token_identity]]` whatever its route, so this limit is enforced by code.
@@ -1191,8 +1191,7 @@ helper, not the new connector, until the first measurement round says otherwise.
 - Redirects are not followed. `Host` includes a non-default port.
 - The agent can still reach Discord directly.
 
-Consequences. (a) The 30 s JSON timeout is a hard constraint on the stage 2 hold window: `hold_secs` must stay
-below it unless Muse raises it for this connector, so the 120 s default is not usable as things stand. (b) The
+Consequences. (a) A 30 s JSON timeout limited the blocking hold window (measured on the Muse side during stage 1; superseded by the asynchronous route, docs/design/muse-async-poll.md). (b) The
 gate constrains the agent only if the new connector is the agent's only route to Discord. While the agent can
 call Discord directly, the gate is advisory (section 4.3).
 

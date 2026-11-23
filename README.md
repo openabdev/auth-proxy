@@ -103,7 +103,7 @@ control to credential control, in two sub-shapes.
 
 Neither sub-shape is built. What runs in standalone mode is the Muse gated passthrough below: the
 caller's own `Authorization` passes through and the gate only decides. Stage 1, stage 2 (`hold`) and
-asynchronous polling are implemented on main as a pilot for one consumer and one upstream; that pilot is not
+asynchronous polling are implemented on main and in pilot use for one consumer and one upstream; that pilot is not
 a general standalone product, and Phase 1 is unchanged.
 
 ## Muse gated passthrough (stage 1, pilot)

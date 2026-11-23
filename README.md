@@ -101,9 +101,9 @@ control to credential control, in two sub-shapes.
   architecture that #5 does not contain and no design review has covered yet. It is
   not settled and is not part of Phase 1.
 
-Neither sub-shape is built. What runs in this deployment is the Muse gated passthrough below: the
-caller's own `Authorization` passes through and the gate only decides. Stage 1, stage 2 (`hold`) and
-asynchronous polling are implemented on main and in pilot use for one consumer and one upstream; that pilot is not
+Neither sub-shape is built. What runs in this deployment is the Muse passthrough below: the
+caller's own `Authorization` passes through. Stage 1 (passthrough with allow and deny rules only) is the
+base; stage 2 (gated passthrough: `hold` and human approval on Telegram) and its asynchronous polling option are implemented on main and in pilot use for one consumer and one upstream; that pilot is not
 a general single-host product, and Phase 1 is unchanged.
 
 **Names.** "Gated passthrough" (also "the approval gate for passthrough routes") is the feature: a route runs

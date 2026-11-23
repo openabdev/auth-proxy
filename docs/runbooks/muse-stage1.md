@@ -1,4 +1,4 @@
-# Muse gated passthrough, stage 1 runbook
+# Muse passthrough, stage 1 runbook
 
 Design: `docs/design/muse-gated-passthrough.md` (sections 3, 6, 7). Stage 1 is measurement plus
 allow/deny passthrough for one consumer (Muse) and one upstream (Discord), on a single instance. No

@@ -1,6 +1,6 @@
 # Muse stage 1: measurement results
 
-Records the stage 1 measurements of the Muse gated passthrough (design: `docs/design/muse-gated-passthrough.md`).
+Records the stage 1 measurements of the Muse passthrough (design: `docs/design/muse-gated-passthrough.md`).
 Redacted: no hostnames, addresses, logins, URLs or keys.
 Companion file for the front and framing checks: `docs/evidence/muse-stage1-front-measurements.md`.
 

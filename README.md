@@ -1,6 +1,6 @@
 # auth-proxy
 
-![auth-proxy architecture: the agent holds only a surrogate; auth-proxy swaps in the real credential; ap-egress handles allowlisted CONNECT egress; the agent registers surrogates through the runtime, which registers them with the proxy over the session plane; per-UID netfilter rules and a self-check confine the agent. Standalone passthrough mode is described in a note in the image.](docs/images/architecture.svg)
+![auth-proxy architecture: the agent holds only a surrogate; auth-proxy swaps in the real credential; ap-egress handles allowlisted CONNECT egress; the agent registers surrogates through the runtime, which registers them with the proxy over the session plane; per-UID netfilter rules and a self-check confine the agent. Passthrough mode is described in a note in the image.](docs/images/architecture.svg)
 
 ## How it works
 
@@ -49,7 +49,7 @@ flowchart LR
 auth-proxy runs in two deployment models. The gate's mechanisms — caller check,
 canonicalization, per-identity policy, credential swap, and audit — work the same in
 both. The sidecar `require_approval` mechanism ([#5](https://github.com/openabdev/auth-proxy/issues/5)) is still
-planned and not implemented; standalone mode already has a `hold` verdict (see the Muse sections below). What changes is the trust
+planned and not implemented; single-host deployment already has a `hold` verdict (gated passthrough) (see the Muse sections below). What changes is the trust
 scaffolding around the gate: who vouches for the caller, where the proxy sits, and
 where the real credential lives.
 
@@ -65,9 +65,9 @@ flowchart LR
 
     UP1 ~~~ TP
 
-    subgraph STAND["Standalone service mode — third-party callers (Muse pilot implemented)"]
+    subgraph STAND["Single-host service deployment — third-party callers (Muse gated passthrough pilot implemented)"]
         TP["Third-party caller<br/>Muse / Grok · pre-provisioned caller key"]
-        GATE["auth-proxy<br/>standalone service<br/>on a user-controlled host"]
+        GATE["auth-proxy<br/>single-host service<br/>on a user-controlled host"]
         UP2["Upstream APIs<br/>Discord is the first consumer"]
         TP -->|"no registrar — caller key<br/>provisioned out of band"| GATE
         GATE -->|"platform vault path (proposed, not built): approval proof only<br/>the platform's egress would swap the credential"| UP2
@@ -85,9 +85,9 @@ reaches the proxy over loopback only, the proxy is in the data path, and upstrea
 credentials live in the proxy's own store. See
 [Kubernetes deployment (Option A)](#kubernetes-deployment-option-a) below.
 
-**Standalone service mode** serves callers on platforms we do not operate — Muse,
+**Single-host service deployment** serves callers on platforms we do not operate — Muse,
 Grok, or another external agent platform. There is no runtime and no registrar, so
-caller keys are provisioned out of band, and the proxy runs as a standalone,
+caller keys are provisioned out of band, and the proxy runs as a
 reachable service on a host the user controls. Enforcement shifts from network
 control to credential control, in two sub-shapes.
 
@@ -101,12 +101,19 @@ control to credential control, in two sub-shapes.
   architecture that #5 does not contain and no design review has covered yet. It is
   not settled and is not part of Phase 1.
 
-Neither sub-shape is built. What runs in standalone mode is the Muse gated passthrough below: the
-caller's own `Authorization` passes through and the gate only decides. Stage 1, stage 2 (`hold`) and
-asynchronous polling are implemented on main and in pilot use for one consumer and one upstream; that pilot is not
-a general standalone product, and Phase 1 is unchanged.
+Neither sub-shape is built. What runs in this deployment is the Muse passthrough below: the
+caller's own `Authorization` passes through. Stage 1 (passthrough with allow and deny rules only) is the
+base; stage 2 (gated passthrough: `hold` and human approval on Telegram) and its asynchronous polling option are implemented on main and in pilot use for one consumer and one upstream; that pilot is not
+a general single-host product, and Phase 1 is unchanged.
 
-## Muse gated passthrough (stage 1, pilot)
+**Names.** "Gated passthrough" (also "the approval gate for passthrough routes") is the feature: a route runs
+in passthrough mode (the caller's own credential is forwarded; the proxy neither stores nor swaps credentials)
+and write requests are held until a human approves them on Telegram. "Stage 1" is passthrough with allow and
+deny rules only; "stage 2" is gated passthrough (hold and human approval). The stage words are
+development-phase labels only. Asynchronous polling is an option of gated passthrough (per-route
+`hold_mode = "async"`), not a separate product.
+
+## Muse passthrough with allow and deny rules (stage 1, pilot)
 
 A second mode for one consumer (Muse) and one upstream (Discord): the caller's own `Authorization`
 passes through unchanged and the gate only decides allow or deny. The caller key travels in a header,

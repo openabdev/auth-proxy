@@ -1,11 +1,18 @@
-# Muse gated passthrough: a hold-the-connection approval gate
+# Muse gated passthrough: the approval gate for passthrough routes
+
+**Names.** "Gated passthrough" is the official name of this feature: a route runs in passthrough mode (the
+caller's own credential is forwarded; the proxy neither stores nor swaps credentials) and write requests are
+held until a human approves them on Telegram. In short prose it may be called the "approval gate for passthrough
+routes". "Stage 1" is passthrough with allow and deny rules only; "stage 2" is gated passthrough (hold and human
+approval). The stage words are development-phase labels. The asynchronous polling route is an option of gated
+passthrough (per-route `hold_mode = "async"`), not a separate product.
 
 Status: stage 1 is implemented and measured. Stage 2 (held-connection approval) is implemented on
 main (merged), in pilot use, and tested in CI against a mock upstream; the through-the-front hold window was measured in stage 1
 (a 300 s probe completed end to end, see docs/evidence/muse-stage1.md), and the disconnect signal is still open. The asynchronous route needs no long client connection. Asynchronous polling is also implemented on main, see
 [muse-async-poll.md](muse-async-poll.md). Scope: a minimal proof
-of concept (PoC) for one consumer, Muse calling the Discord HTTP API through auth-proxy in standalone
-service mode. See "Stage 2 implementation notes" at the end of section 7 for where the code differs from
+of concept (PoC) for one consumer, Muse calling the Discord HTTP API through auth-proxy in a single-host
+deployment. See "Stage 2 implementation notes" at the end of section 7 for where the code differs from
 this text.
 
 This document supersedes, for this PoC only, two earlier sketches: the "platform vault path" in the

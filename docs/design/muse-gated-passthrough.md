@@ -1,8 +1,9 @@
 # Muse gated passthrough: a hold-the-connection approval gate
 
 Status: stage 1 is implemented and measured. Stage 2 (held-connection approval) is implemented on
-branch `feat/muse-stage2` and tested in CI against a mock upstream; it is not deployed, and the
-through-the-front measurements (hold window, disconnect signal) are still open. Scope: a minimal proof
+main (merged), in pilot use, and tested in CI against a mock upstream; the through-the-front hold window was measured in stage 1
+(a 300 s probe completed end to end, see docs/evidence/muse-stage1.md), and the disconnect signal is still open. The asynchronous route needs no long client connection. Asynchronous polling is also implemented on main, see
+[muse-async-poll.md](muse-async-poll.md). Scope: a minimal proof
 of concept (PoC) for one consumer, Muse calling the Discord HTTP API through auth-proxy in standalone
 service mode. See "Stage 2 implementation notes" at the end of section 7 for where the code differs from
 this text.
@@ -43,7 +44,8 @@ Stated by the owner and treated as fixed [A owner]:
    (section 3.5). Discord's own responses, including any `x-ap-*` headers they carry, pass through
    unchanged.
 6. The connection is the state. There is no durable approved state, no polling endpoint and no one-time
-   proof. A crash after approval and before forwarding loses the held connection, nothing executes, and
+   proof. (For a route with `hold_mode = "async"` this is replaced: the POST returns 202 and the caller
+   polls, see [muse-async-poll.md](muse-async-poll.md). Nothing is durable there either.) A crash after approval and before forwarding loses the held connection, nothing executes, and
    Muse's retry starts a new approval round.
 
 ## 2. Overview
@@ -451,7 +453,9 @@ owner's phone through a second `tailscale serve` mapping on its own port, never 
 port; the ACL shape is in section 4.2 [A]. A local CLI over a Unix socket remains a fallback. The HTTP
 API is client-agnostic (`GET /pending`, `GET /pending/<id>`, `POST /pending/<id>/approve|deny`), in line
 with the #6 decision that app shells are thin clients over the same endpoints [I issue #6 comment 1].
-WebAuthn approval over the digest is a later replacement for the credential step [I issue #6 comment 1].
+WebAuthn approval over the digest is a later replacement for the credential step [I issue #6 comment 1]. WebAuthn is a design only (`docs/design/webauthn-approval.md`), not implemented.
+
+Current state: with `[notify] buttons = true` the owner decides in Telegram with Approve and Deny buttons, and the message carries a no-login one-time view link (PR #41). The Basic-auth page and CSRF code remain and are used when `buttons = false`; they are not the primary path.
 
 Page controls:
 
@@ -460,10 +464,10 @@ Page controls:
 - `approve` and `deny` are form `POST`s. A browser sends Basic credentials automatically, so each page
   carries a per-page CSRF token (random, bound to the entry id, single use) that the POST must echo.
 - Every approval response, including errors, carries `Content-Security-Policy: default-src 'none';
-  frame-ancestors 'none'; form-action 'self'`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+  style-src 'sha256-<hash of the one inline stylesheet>'; frame-ancestors 'none'; form-action 'self'`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
   `Cache-Control: no-store`, `Pragma: no-cache` and `X-Content-Type-Options: nosniff`. `default-src` does
   not cover `frame-ancestors`, so it is named, which stops a page framing the approve button over the
-  owner's cached Basic credentials. The page has no script and no inline style, and renders the body and
+  owner's cached Basic credentials. The page has no script and no `style` attributes; its one inline `<style>` block is allowed by that hash. It renders the body and
   every value with HTML escaping.
 - The page never renders or logs an `Authorization` value from a held request (the entry keeps it for
   forwarding but the view model omits it). It shows that the header is present.
@@ -549,7 +553,7 @@ and `view_base_url`. `buttons = false` restores option C (3.6.1) with no code ch
   compared in constant time. It is valid only while the entry is `Pending`. Approve, deny, expiry, drop,
   abandon and supersede each end it at once. An unknown or ended token gets the same generic 404 bytes
   as an unknown path. The page is read-only and shows the redacted request that the approval page shows
-  (method, route, redacted path, body preview, header names, with credential values hidden). It has the
+  (method, route, redacted path, header names, with credential values hidden). It shows the decoded message content and a banner naming any other top-level fields, names only (PR #43); the raw body is in a closed Details block. It has the
   six hardened headers, sets no cookie, has no form and no CSRF token, and never logs or audits the
   token. The route exists only when buttons are on.
 - **Supersede in buttons mode.** A supersede sends one new notification for the newest entry. The
@@ -574,7 +578,7 @@ and `view_base_url`. `buttons = false` restores option C (3.6.1) with no code ch
 1. **Bearer view link inside the tailnet.** The link carries a per-hold token. Anyone on the tailnet
    who has the link can read that one request while the hold lives. The same link also sits in
    Telegram's stored copy of the message, so the link is a bearer secret held by Telegram. The hold is
-   at most `hold_secs` (90 s in the stage 2 policy), and the token dies with the hold. The page shows the
+   at most `hold_secs` (set by the deployment policy; the code default is 120 s, range 5..=600), and the token dies with the hold. The page shows the
    redacted request, never a credential value. This risk is part of the approved design (council option 1,
    2026-11-21); the owner confirms it when the PR is reviewed.
 2. **Telegram account is the only authentication, with no second factor.** Whoever controls the owner's
@@ -829,8 +833,10 @@ name: a hold admitted with the token records that mode at admission and is refus
 1. **ACL to the Muse node.** Only the Muse tag reaches the public port (4.2 item 1). Nothing else reaches the
    gate on that port.
 2. **Phone approval on every write.** Every B request is a `hold` in the same hold table, with the same
-   notification, the same `hold_secs` window (90 s for this pilot), the same audit records and the same
-   fail-closed rules as the keyed write route in 3.4 to 3.9. The approval plane is unchanged (3.6).
+   notification, the same hold window (`hold_secs` on a blocking route; `async_hold_secs` on an async route, default 120 s, range 5..=600), the same audit records and the same
+   fail-closed rules as the keyed write route in 3.4 to 3.9, except that an async route has no
+   fingerprint dedupe or supersede and does not cancel when the caller disconnects (see
+   docs/design/muse-async-poll.md, Departures). The approval plane is unchanged (3.6).
 3. **Single caller, one route.** One token identity in the whole policy, bound to one route. Config load
    refuses a second `[[token_identity]]` whatever its route, so this limit is enforced by code.
 4. **Expiry.** The token stops working at the pilot end date, as above.
@@ -889,10 +895,10 @@ those exists because the caller does not wait. Here the caller waits, so the rea
 | Audit transitions `held/approved/denied/expired/executed` | **Keep**, rename `executed` to `forward_started` and `completed` | Same purpose; the record precedes the action |
 | Expiry as a recorded terminal refusal, not a state | **Keep** | Matches the connection model directly |
 | Single execution | **Keep** as at-most-once per connection (section 5.1) | In-memory state machine, no store |
-| WebAuthn approval | **Defer** | Part of the end state in #6. The PoC uses Basic auth plus a per-page CSRF token |
+| WebAuthn approval | **Defer** (not implemented) | Part of the end state in #6. The PoC uses Basic auth plus a per-page CSRF token |
 | Durable pending store surviving restart | **Drop** | The connection is the state. A restart loses it and that is the specified behaviour |
 | "Consume approval and mark executed in one durable write" (restart-safe exactly once) | **Drop** | Nothing to recover. After a restart there is no approved id to re-execute |
-| Request id and polling endpoint, callback | **Drop** | The response is the connection's own response. The request id remains, as an audit and approval-page key only |
+| Request id and polling endpoint, callback | **Drop** (blocking routes) | The response is the connection's own response. An async route has a poll endpoint, see `muse-async-poll.md`. The request id remains, as an audit and approval-page key only |
 | Result slot recorded against the id | **Drop** | Discord's response goes straight back on the connection |
 | One-time approval proof (platform vault path) | **Drop** | Muse needs no proof; owner decision |
 | Credential store and swap in the proxy | **Drop for this mode** | The credential arrives with the request |
@@ -1037,7 +1043,7 @@ Acceptance:
     stage 2 does not start until they are answered. Results: `docs/evidence/muse-stage1.md`.
 
     Stage 2 prerequisites from those results:
-    - The connector's helper timeout for gated routes must exceed the hold window (the default 30 s is not enough).
+    - The connector's helper timeout for gated routes must exceed the hold window (the default 30 s is not enough). This applies to blocking routes only; an async route returns 202 at once (`muse-async-poll.md`).
     - The connector for the gate host must be the agent's only route to Discord; remove the old connector or
       unregister its credential before the gate is relied on.
 
@@ -1187,8 +1193,7 @@ helper, not the new connector, until the first measurement round says otherwise.
 - Redirects are not followed. `Host` includes a non-default port.
 - The agent can still reach Discord directly.
 
-Consequences. (a) The 30 s JSON timeout is a hard constraint on the stage 2 hold window: `hold_secs` must stay
-below it unless Muse raises it for this connector, so the 120 s default is not usable as things stand. (b) The
+Consequences. (a) A 30 s JSON timeout limited the blocking hold window (measured on the Muse side during stage 1; superseded by the asynchronous route, docs/design/muse-async-poll.md). (b) The
 gate constrains the agent only if the new connector is the agent's only route to Discord. While the agent can
 call Discord directly, the gate is advisory (section 4.3).
 
@@ -1201,7 +1206,7 @@ Open questions 1 to 4 are stage 1 blockers.
    300 s through the TLS front (no cut up to 300 s); helper side [M-reported], the Muse helper received
    each completed response end to end with its timeout raised above the hold, and the default 30 s helper
    timeout gave up on a 30 s hold. Hard condition: the default 30 s helper timeout is not enough, so the
-   helper timeout for gated routes must exceed `hold_secs`. Still unmeasured: any ceiling above 300 s, and
+   helper timeout for gated routes must exceed `hold_secs` (blocking routes only; it does not apply to an async route). Still unmeasured: any ceiling above 300 s, and
    the platform-internal swap logs. The 120 s default for `hold_secs` is within the observed range, only
    with the raised helper timeout. See `docs/evidence/muse-stage1.md`.
 2. **Caller-key header name.** Answered [M-reported]: the current helper cannot add a custom request header,
@@ -1220,7 +1225,7 @@ Open questions 1 to 4 are stage 1 blockers.
 6. **Retry behaviour.** (Answered [M-reported] for the 423, 410 and 503 probes and a real 423 `no_grant` write: no retry; see `docs/evidence/muse-stage1.md`.) After an `expired` or `denied`, does Muse's agent retry automatically? If so each
    retry is another phone prompt; dedupe, the per-identity cap and the default 60 s cooldown bound this.
 7. **Approver channel.** Answered in the review comments: Basic auth plus a per-page CSRF token for the PoC,
-   WebAuthn later, and the approval API stays client-agnostic (a requirement). The notifier is Telegram only
+   WebAuthn later (design only, not implemented), and the approval API stays client-agnostic (a requirement). The notifier is Telegram only
    (section 3.6.1, owner decision 2026-11-21).
 8. **One caller key per what?** One identity per Muse user, per connector, or per Discord channel set?
    This sets how revocation and the audit identity read.

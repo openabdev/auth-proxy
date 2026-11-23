@@ -1,6 +1,6 @@
 # WebAuthn approval bound to the held request
 
-Status: design note, no code. Revision 3 answers the review verdicts at 96c10923 (section 16) and the re-review at 62e4364 (section 17). Draft for the standing design review; not final. Issue:
+Status: design only, not implemented (no WebAuthn code on main). The stage 2 notifier is Telegram (PR #40), not ntfy, so the ntfy passages below are superseded; the current approval flow is in `docs/design/muse-gated-passthrough.md` section 3.6. Revision 3 answers the review verdicts at 96c10923 (section 16) and the re-review at 62e4364 (section 17). Draft for the standing design review; not final. Issue:
 [#37](https://github.com/openabdev/auth-proxy/issues/37). Based on `origin/main` at `3878421`.
 Builds on `docs/design/muse-gated-passthrough.md` (sections 3.4 to 3.9, 5.2, open question 7) and on the
 stage 2 implementation in draft PR [#29](https://github.com/openabdev/auth-proxy/pull/29), which is **in

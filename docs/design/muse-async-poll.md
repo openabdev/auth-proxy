@@ -1,8 +1,9 @@
 # Muse async poll for held writes
-Draft. Terms follow `muse-gated-passthrough.md` 3.4 and 4.5.
+Status: implemented on main (#45); operator steps are in `docs/runbooks/muse-stage2.md`. Terms follow `muse-gated-passthrough.md` 3.4 and 4.5.
 ## Scope
-Only the Muse route `POST /channels/*/messages` (held), per route. Config key `muse.hold_mode =
-blocking|async` (default `blocking`); `async_hold_secs` applies only in `async`. Else unchanged.
+Only the Muse route `POST /channels/*/messages` (held), per route. Config keys on the `[[route]]` table: `hold_mode = "blocking"|"async"` (default `blocking`) and
+`async_hold_secs` (5..=600, default 120, used only in `async`). Async needs a passthrough route with a hold
+grant; otherwise the policy is refused at load. Else unchanged.
 ## POST
 1. Write the `held` audit record first. On failure refuse 503 `audit_unavailable`, before any entry
    exists and before any notification.
@@ -25,7 +26,7 @@ anything else is 400, without revealing whether the token exists. Response is `p
 | `denied`, `expired`, `dropped`, `send_failed` | 200 | `status`, `request_id` |
 | `send_unknown` | 200 | `status`, `request_id`, `error_class` (`reset`, `timeout`, `write_failed`) |
 
-`body` is at most 64 KiB, `truncated=true` if cut. The token is read-only and never approves, denies
+`body` is a string (the Discord response as lossy UTF-8 text, which the caller parses itself), at most 64 KiB, `truncated=true` if cut. The token is read-only and never approves, denies
 or changes state. A final status stays readable for a fixed 60 s window starting at the final
 transition (for `approved_and_sent`, when the Discord response is fully read or cut at 64 KiB).
 After that, and for any unknown token, the response is a uniform 404. No retained-entry cap.
@@ -54,7 +55,7 @@ current shape and never carry a token, `Authorization`, hash or body. Unapproved
 ## Departures
 Connection-as-state is replaced for this route. No cancel on Muse disconnect. Discord response
 headers are not returned verbatim. `X-AP-Decision` is not returned after admission. Fingerprint dedupe and supersede do not apply.
-Owner confirmation of these four departures is needed before implementation.
+These departures are as implemented.
 ## Tests
 Poll after each final status; uniform 404 after the window and for unknown tokens; `send_unknown`
 path; restart loses pending entries; audit shape with no token in audit.

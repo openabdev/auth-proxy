@@ -206,7 +206,16 @@ struct EmbedText {
     fields: Vec<(String, String)>,
     /// Fields past [`MAX_FIELDS`], which are not shown.
     omitted_fields: usize,
+    /// Keys of the embed other than title, description and fields: names only, cut to
+    /// [`MAX_UNSHOWN_NAMES`] names of [`MAX_UNSHOWN_NAME`] characters.
+    unshown: Vec<String>,
+    /// Keys past [`MAX_UNSHOWN_NAMES`].
+    unshown_more: usize,
 }
+
+/// Most key names, and characters per name, listed in the "not shown here" note of an embed.
+const MAX_UNSHOWN_NAMES: usize = 8;
+const MAX_UNSHOWN_NAME: usize = 32;
 
 /// Cut `s` to [`MAX_TEXT`] characters; the second value says whether it was cut.
 fn clip(s: &str) -> (String, bool) {
@@ -243,7 +252,22 @@ fn parse_body(body: &str) -> Option<Parsed> {
                 description: clip_str(e.get("description"), &mut truncated),
                 fields: Vec::new(),
                 omitted_fields: 0,
+                unshown: Vec::new(),
+                unshown_more: 0,
             };
+            let keys = e
+                .keys()
+                .filter(|k| !matches!(k.as_str(), "title" | "description" | "fields"));
+            for k in keys {
+                if t.unshown.len() < MAX_UNSHOWN_NAMES {
+                    t.unshown.push(match k.char_indices().nth(MAX_UNSHOWN_NAME) {
+                        Some((i, _)) => format!("{}{CUT}", &k[..i]),
+                        None => k.clone(),
+                    });
+                } else {
+                    t.unshown_more += 1;
+                }
+            }
             if let Some(Value::Array(fl)) = e.get("fields") {
                 t.omitted_fields = fl.len().saturating_sub(MAX_FIELDS);
                 truncated |= t.omitted_fields > 0;
@@ -395,6 +419,15 @@ fn embed_html(n: usize, e: &EmbedText) -> String {
                 "fields"
             }
         ));
+    }
+    if !e.unshown.is_empty() {
+        let names: Vec<String> = e.unshown.iter().map(|k| escape(k)).collect();
+        let more = if e.unshown_more > 0 {
+            format!(", +{} more", e.unshown_more)
+        } else {
+            String::new()
+        };
+        t.push_str(&format!("not shown here: {}{more}\n", names.join(", ")));
     }
     format!(
         "<p class=\"label\">Embed {n}</p>\n<pre class=\"body embed\">{}</pre>\n",
@@ -1138,6 +1171,53 @@ mod tests {
         }
         // The image URLs are not rendered outside the raw body in Details.
         assert!(html[payload_end..].matches("img.example.test").count() >= 2);
+    }
+
+    #[test]
+    fn embed_keys_that_are_not_rendered_are_named_without_their_values() {
+        let body = r#"{"embeds":[{"title":"T","author":{"name":"AUTHVAL"},"footer":{"text":"FOOTVAL"},"image":{"url":"https://img.example.test/i.png"},"thumbnail":{"url":"https://img.example.test/t.png"},"url":"https://example.test/u"},{"title":"Plain","description":"d","fields":[{"name":"a","value":"b"}]}]}"#;
+        let html = entry(&at(CH, body), Some("t"), &Labels::new());
+        let shown = &html[..html.find("<details>").unwrap()];
+        assert!(
+            shown.contains("not shown here: author, footer, image, thumbnail, url"),
+            "{shown}"
+        );
+        assert_eq!(shown.matches("not shown here").count(), 1, "{shown}");
+        for banned in ["AUTHVAL", "FOOTVAL", "example.test", "<img", "<a ", "src="] {
+            assert!(!shown.contains(banned), "{banned}\n{shown}");
+        }
+        // Raw JSON in Details stays complete.
+        assert!(html[html.find("<details>").unwrap()..].contains("AUTHVAL"));
+        // An embed with only unrendered keys is still shown, with the note.
+        let html = entry(&at(CH, r#"{"embeds":[{"image":{"url":"x"}}]}"#), None, &Labels::new());
+        assert!(html.contains("Embed 1") && html.contains("not shown here: image"), "{html}");
+    }
+
+    #[test]
+    fn the_unshown_keys_note_is_bounded_and_escaped() {
+        let keys: Vec<String> = (0..MAX_UNSHOWN_NAMES + 3)
+            .map(|i| format!(r#""k{i:02}":1"#))
+            .collect();
+        let body = format!(r#"{{"embeds":[{{"title":"T",{}}}]}}"#, keys.join(","));
+        let html = entry(&at(CH, &body), None, &Labels::new());
+        assert!(html.contains("not shown here: k00, k01"), "{html}");
+        assert!(html.contains("k07, +3 more"), "{html}");
+        assert!(!html.contains("k08, ") && !html.contains("k10, "), "{html}");
+        let long = "z".repeat(MAX_UNSHOWN_NAME + 10);
+        let body = format!(r#"{{"embeds":[{{"title":"T","{long}":1,"<b>x</b>":1}}]}}"#);
+        let html = entry(&at(CH, &body), None, &Labels::new());
+        let shown = &html[..html.find("<details>").unwrap()];
+        assert!(shown.contains("&lt;b&gt;x&lt;/b&gt;"), "{shown}");
+        assert!(!shown.contains("<b>x</b>"), "{shown}");
+        assert!(shown.contains(&format!("{}{CUT}", "z".repeat(MAX_UNSHOWN_NAME))), "{shown}");
+        assert!(!shown.contains(&long), "{shown}");
+    }
+
+    #[test]
+    fn an_embed_with_only_title_description_and_fields_has_no_unshown_note() {
+        let body = r#"{"embeds":[{"title":"T","description":"d","fields":[{"name":"a","value":"b"}]}]}"#;
+        let html = entry(&at(CH, body), Some("t"), &Labels::new());
+        assert!(!html.contains("not shown here"), "{html}");
     }
 
     #[test]

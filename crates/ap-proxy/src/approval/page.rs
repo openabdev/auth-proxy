@@ -27,6 +27,9 @@ pub type Labels = BTreeMap<String, String>;
 const MAX_EMBEDS: usize = 10;
 const MAX_FIELDS: usize = 25;
 const MAX_TEXT: usize = 4000;
+/// Most top-level field names listed in the extra-fields banner, and characters shown per name.
+const MAX_EXTRA_NAMES: usize = 16;
+const MAX_NAME: usize = 64;
 const CUT: &str = "… [truncated]";
 
 /// The stylesheet inlined in every page. The Content-Security-Policy allows this block by hash.
@@ -190,6 +193,8 @@ fn header(v: &View) -> String {
 struct Parsed {
     content: Option<String>,
     embeds: Vec<EmbedText>,
+    /// Embeds past [`MAX_EMBEDS`], which are not shown.
+    omitted_embeds: usize,
     /// Some text, embed or field was cut for display.
     truncated: bool,
 }
@@ -199,6 +204,8 @@ struct EmbedText {
     title: Option<String>,
     description: Option<String>,
     fields: Vec<(String, String)>,
+    /// Fields past [`MAX_FIELDS`], which are not shown.
+    omitted_fields: usize,
 }
 
 /// Cut `s` to [`MAX_TEXT`] characters; the second value says whether it was cut.
@@ -225,17 +232,21 @@ fn parse_body(body: &str) -> Option<Parsed> {
     let mut truncated = false;
     let content = clip_str(fields.get("content"), &mut truncated);
     let mut embeds = Vec::new();
+    let mut omitted_embeds = 0;
     if let Some(Value::Array(list)) = fields.get("embeds") {
-        truncated |= list.len() > MAX_EMBEDS;
+        omitted_embeds = list.len().saturating_sub(MAX_EMBEDS);
+        truncated |= omitted_embeds > 0;
         for e in list.iter().take(MAX_EMBEDS) {
             let Value::Object(e) = e else { continue };
             let mut t = EmbedText {
                 title: clip_str(e.get("title"), &mut truncated),
                 description: clip_str(e.get("description"), &mut truncated),
                 fields: Vec::new(),
+                omitted_fields: 0,
             };
             if let Some(Value::Array(fl)) = e.get("fields") {
-                truncated |= fl.len() > MAX_FIELDS;
+                t.omitted_fields = fl.len().saturating_sub(MAX_FIELDS);
+                truncated |= t.omitted_fields > 0;
                 for f in fl.iter().take(MAX_FIELDS) {
                     let name = clip_str(f.get("name"), &mut truncated);
                     let value = clip_str(f.get("value"), &mut truncated);
@@ -256,6 +267,7 @@ fn parse_body(body: &str) -> Option<Parsed> {
     Some(Parsed {
         content,
         embeds,
+        omitted_embeds,
         truncated,
     })
 }
@@ -373,40 +385,62 @@ fn embed_html(n: usize, e: &EmbedText) -> String {
     for (name, value) in &e.fields {
         t.push_str(&format!("Field {}: {}\n", escape(name), escape(value)));
     }
+    if e.omitted_fields > 0 {
+        t.push_str(&format!(
+            "[{} more {} omitted]\n",
+            e.omitted_fields,
+            if e.omitted_fields == 1 {
+                "field"
+            } else {
+                "fields"
+            }
+        ));
+    }
     format!(
         "<p class=\"label\">Embed {n}</p>\n<pre class=\"body embed\">{}</pre>\n",
         t.trim_end()
     )
 }
 
-/// The top-level fields of a JSON object body other than `content`, as names only. serde_json
-/// without `preserve_order` keeps object keys sorted, so these are sorted, not in body order.
-/// Empty for anything that is not a JSON object.
-fn extra_field_names(body: &str) -> Vec<String> {
-    match serde_json::from_str::<Value>(body) {
-        Ok(Value::Object(fields)) => fields
-            .keys()
-            .filter(|k| k.as_str() != "content")
-            .cloned()
-            .collect(),
-        _ => Vec::new(),
+/// The top-level fields of a JSON object body other than `content`: how many there are, and the
+/// first [`MAX_EXTRA_NAMES`] names, each cut to [`MAX_NAME`] characters. serde_json without
+/// `preserve_order` keeps object keys sorted, so these are sorted, not in body order. Zero names
+/// for anything that is not a JSON object.
+fn extra_field_names(body: &str) -> (usize, Vec<String>) {
+    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(body) else {
+        return (0, Vec::new());
+    };
+    let mut total = 0;
+    let mut shown = Vec::new();
+    for k in fields.keys().filter(|k| k.as_str() != "content") {
+        total += 1;
+        if shown.len() < MAX_EXTRA_NAMES {
+            shown.push(match k.char_indices().nth(MAX_NAME) {
+                Some((i, _)) => format!("{}{CUT}", &k[..i]),
+                None => k.clone(),
+            });
+        }
     }
+    (total, shown)
 }
 
-/// The visible line that names fields sent besides `content`. Empty when there are none.
+/// The visible line that names fields sent besides `content`. Empty when there are none. The
+/// line is bounded: names past the cap are counted, not listed.
 fn extra_fields_line(body: &str) -> String {
-    let names = extra_field_names(body);
-    if names.is_empty() {
+    let (total, names) = extra_field_names(body);
+    if total == 0 {
         return String::new();
     }
     let escaped: Vec<String> = names.iter().map(|n| escape(n)).collect();
-    let (count, noun) = if names.len() == 1 {
-        (1, "field")
+    let noun = if total == 1 { "field" } else { "fields" };
+    let rest = total - names.len();
+    let more = if rest > 0 {
+        format!(", … and {rest} more not listed")
     } else {
-        (names.len(), "fields")
+        String::new()
     };
     format!(
-        "<p class=\"banner extra-fields\">+ {count} more {noun} will be sent: {} (see Details)</p>\n",
+        "<p class=\"banner extra-fields\">+ {total} more {noun} will be sent: {}{more} (see Details)</p>\n",
         escaped.join(", ")
     )
 }
@@ -453,6 +487,13 @@ fn payload(c: &ViewContent, labels: &Labels) -> String {
             }
             for (i, e) in p.embeds.iter().enumerate() {
                 b.push_str(&embed_html(i + 1, e));
+            }
+            if p.omitted_embeds > 0 {
+                b.push_str(&format!(
+                    "<p class=\"banner omitted\"><strong>{} more {} omitted.</strong> See the raw body in Details.</p>\n",
+                    p.omitted_embeds,
+                    if p.omitted_embeds == 1 { "embed" } else { "embeds" }
+                ));
             }
         }
         None => b.push_str(&format!(
@@ -925,6 +966,62 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("<b>x</b>"), "{html}");
+    }
+
+    #[test]
+    fn the_extra_fields_banner_is_bounded_and_marks_what_it_cuts() {
+        let long = format!("a{}", "y".repeat(5000));
+        let keys: Vec<String> = (0..300).map(|i| format!(r#""k{i:03}":1"#)).collect();
+        let body = format!(r#"{{"content":"hi","{long}":1,{}}}"#, keys.join(","));
+        let html = entry(&with_body(&body), Some("t"), &Labels::new());
+        let start = html
+            .find("<p class=\"banner extra-fields\">")
+            .expect("indicator");
+        let end = start + html[start..].find("</p>").unwrap();
+        let line = &html[start..end];
+        assert!(line.len() < 1500, "banner is {} bytes", line.len());
+        assert!(line.contains("+ 301 more fields will be sent: "), "{line}");
+        assert!(
+            line.contains(&format!("a{}{CUT}", "y".repeat(MAX_NAME - 1))),
+            "{line}"
+        );
+        assert!(!line.contains(&"y".repeat(MAX_NAME + 1)), "{line}");
+        assert!(line.contains("k014") && !line.contains("k015"), "{line}");
+        assert!(
+            line.contains(", … and 285 more not listed (see Details)"),
+            "{line}"
+        );
+        // The raw body in Details is complete.
+        assert!(html.contains(&escape(&long)));
+        assert!(html.contains("k299"));
+    }
+
+    #[test]
+    fn cut_embeds_and_embed_fields_are_marked_as_omitted() {
+        let embeds: Vec<String> = (0..MAX_EMBEDS + 3)
+            .map(|i| format!(r#"{{"title":"e{i}"}}"#))
+            .collect();
+        let body = format!(r#"{{"embeds":[{}]}}"#, embeds.join(","));
+        let html = entry(&at(CH, &body), Some("t"), &Labels::new());
+        assert!(
+            html.contains("<strong>3 more embeds omitted.</strong>"),
+            "{html}"
+        );
+        assert!(!html.contains(&format!("Embed {}", MAX_EMBEDS + 1)));
+        let fields: Vec<String> = (0..MAX_FIELDS + 2)
+            .map(|i| format!(r#"{{"name":"n{i}","value":"v"}}"#))
+            .collect();
+        let body = format!(r#"{{"embeds":[{{"fields":[{}]}}]}}"#, fields.join(","));
+        let html = entry(&at(CH, &body), None, &Labels::new());
+        assert!(html.contains("[2 more fields omitted]"), "{html}");
+        assert!(!html.contains(&format!("Field n{MAX_FIELDS}: v")));
+        // Nothing is cut, so no marker.
+        let html = entry(
+            &at(CH, r#"{"embeds":[{"fields":[{"name":"a","value":"b"}]}]}"#),
+            None,
+            &Labels::new(),
+        );
+        assert!(!html.contains("omitted"), "{html}");
     }
 
     fn labels() -> Labels {

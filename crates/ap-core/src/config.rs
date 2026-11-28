@@ -689,14 +689,9 @@ fn validate_passthrough(p: &Passthrough) -> Result<(), ConfigError> {
                 "passthrough.channel_labels ids must be 1..=20 digits",
             ));
         }
-        if label.is_empty()
-            || label.chars().count() > 64
-            || label
-                .chars()
-                .any(|c| c.is_control() || matches!(c, '<' | '>' | '&'))
-        {
+        if label.is_empty() || label.chars().count() > 64 || !label.chars().all(label_char_ok) {
             return Err(invalid(format!(
-                "passthrough.channel_labels label for {id} must be 1..=64 printable characters without <, > or &"
+                "passthrough.channel_labels label for {id} must be 1..=64 letters, digits, spaces or - _ . , : # + / ( ) @"
             )));
         }
     }
@@ -709,6 +704,17 @@ fn validate_passthrough(p: &Passthrough) -> Result<(), ConfigError> {
         ));
     }
     Ok(())
+}
+
+/// A character a channel label may carry: a letter or digit, an ASCII space, or one of
+/// `- _ . , : # + / ( ) @`. Everything else is refused, which covers every control and format
+/// character (bidi controls, zero-width characters, U+2028, U+2029), quotes and `< > &`.
+fn label_char_ok(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(
+            c,
+            ' ' | '-' | '_' | '.' | ',' | ':' | '#' | '+' | '/' | '(' | ')' | '@'
+        )
 }
 
 fn validate_approval(a: &Approval, proxy: SocketAddr) -> Result<(), ConfigError> {
@@ -2234,6 +2240,11 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
             "channel_labels = { \"1\" = \"<b>x</b>\" }",
             "channel_labels = { \"1\" = \"a&b\" }",
             "channel_labels = { \"1\" = \"a\\nb\" }",
+            "channel_labels = { \"1\" = \"a\\\"b\" }",
+            "channel_labels = { \"1\" = \"a'b\" }",
+            "channel_labels = { \"1\" = \"a\\u2028b\" }",
+            "channel_labels = { \"1\" = \"a\\u2029b\" }",
+            "channel_labels = { \"1\" = \"a\\u00A0b\" }",
         ] {
             expect_invalid(&with(bad), "channel_labels");
         }
@@ -2247,6 +2258,40 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
             &with(&format!("channel_labels = {{ {} }}", many.join(", "))),
             "too many",
         );
+    }
+
+    #[test]
+    fn channel_labels_refuse_bidi_and_zero_width_characters_and_keep_normal_text() {
+        let with = |label: &str| {
+            pt_base().replace(
+                "public_authority = \"gate.example.test\"",
+                &format!(
+                    "public_authority = \"gate.example.test\"\nchannel_labels = {{ \"1\" = \"{label}\" }}"
+                ),
+            )
+        };
+        for bad in [
+            "ops\\u202E",
+            "\\u202Aops",
+            "ops\\u202D",
+            "o\\u2066ps\\u2069",
+            "o\\u200Bps",
+            "o\\u200Cps",
+            "o\\u200Dps",
+            "o\\u200Eps",
+            "o\\u200Fps",
+            "o\\u2060ps",
+            "\\uFEFFops",
+        ] {
+            expect_invalid(&with(bad), "channel_labels");
+        }
+        for good in [
+            "ops alerts",
+            "caf\\u00E9 \\u65E5\\u672C #1 (a+b)/c_d-e.f,g:h@i",
+        ] {
+            let c = load(&with(good)).unwrap_or_else(|e| panic!("{good}: {e}"));
+            assert!(!c.passthrough.unwrap().channel_labels["1"].is_empty());
+        }
     }
 
     #[test]

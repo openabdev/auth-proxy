@@ -5,7 +5,7 @@
 
 use crate::config::{Config, Decision, Grant, Route};
 use crate::error::Code;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// What a matching grant does with a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +82,8 @@ pub(crate) fn patterns_overlap(a: &str, b: &str) -> bool {
 pub struct Snapshot {
     routes: HashMap<String, Route>,
     grants: HashMap<String, Vec<Grant>>,
+    /// Display-only channel labels. They take no part in routing, grants or approval.
+    channel_labels: BTreeMap<String, String>,
 }
 
 impl Snapshot {
@@ -99,7 +101,21 @@ impl Snapshot {
                 .or_default()
                 .push(g.clone());
         }
-        Snapshot { routes, grants }
+        let channel_labels = cfg
+            .passthrough
+            .as_ref()
+            .map(|p| p.channel_labels.clone())
+            .unwrap_or_default();
+        Snapshot {
+            routes,
+            grants,
+            channel_labels,
+        }
+    }
+
+    /// The channel labels of the policy in force, for display only.
+    pub fn channel_labels(&self) -> &BTreeMap<String, String> {
+        &self.channel_labels
     }
 
     /// The route with this name, if the snapshot has one.

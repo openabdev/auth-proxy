@@ -223,7 +223,6 @@ path_patterns = ["/hold/*", "/webhooks/*/*"]
             delay,
             app.policy_source(),
             view_links,
-            std::collections::BTreeMap::new(),
         );
         let l = crate::listener::bind_loopback("127.0.0.1:0".parse().unwrap())
             .await
@@ -1323,6 +1322,68 @@ async fn view_token_serves_the_redacted_page_while_live_and_404_after_each_end()
     for t in ended {
         assert!(!audit.contains(&t), "view token written to audit");
     }
+}
+
+/// The policy text of an `Env`, with a hold grant for `/hold/channels/*` and, when given, one
+/// channel label for id 4242 under `[passthrough]`.
+fn policy_with_label(base: &str, label: Option<&str>) -> String {
+    let labels = label.map_or(String::new(), |l| {
+        format!("channel_labels = {{ \"4242\" = \"{l}\" }}\n")
+    });
+    let mut t = base.replace(
+        "cooldown_secs = 0\n",
+        &format!("cooldown_secs = 0\n{labels}"),
+    );
+    t.push_str("\n[[grant]]\nidentity = \"muse-pilot\"\nroute = \"discord\"\nmethods = [\"POST\"]\ndecision = \"hold\"\npath_patterns = [\"/hold/channels/*\"]\n");
+    t
+}
+
+/// The one-time view page and the login page of one pending hold.
+async fn pages(env: &Env, id: &str, token: &str) -> (Resp, Resp) {
+    let view = send(env.addr, &request("GET", &format!("/view/{token}"), "", "")).await;
+    let page = env.get(&format!("/pending/{id}"), "").await;
+    (view, page)
+}
+
+#[tokio::test]
+async fn a_label_only_reload_changes_the_label_on_the_pending_holds_pages() {
+    let env = Env::with_views("tg-label-reload").await;
+    let policy = env._s.path().join("policy.toml");
+    let base = std::fs::read_to_string(&policy).unwrap();
+    std::fs::write(&policy, policy_with_label(&base, Some("alpha-one"))).unwrap();
+    let (h, id) = env
+        .hold("/discord/hold/channels/4242", br#"{"content":"hi"}"#)
+        .await;
+    let token = view_token_of(&env, &id);
+    let (v, p) = pages(&env, &id, &token).await;
+    for body in [&v.body, &p.body] {
+        assert!(body.contains("alpha-one (id 4242)"), "{body}");
+    }
+
+    // A label-only change: same grants, same routes. The hold survives the reload tick.
+    std::fs::write(&policy, policy_with_label(&base, Some("beta-two"))).unwrap();
+    env.app.reload_tick();
+    assert_eq!(env.app.hold.state(&id), Some(State::Pending));
+    let (v, p) = pages(&env, &id, &token).await;
+    for body in [&v.body, &p.body] {
+        assert!(body.contains("beta-two (id 4242)"), "{body}");
+        assert!(!body.contains("alpha-one"), "{body}");
+    }
+
+    // Removing the label shows the id alone.
+    std::fs::write(&policy, policy_with_label(&base, None)).unwrap();
+    env.app.reload_tick();
+    assert_eq!(env.app.hold.state(&id), Some(State::Pending));
+    let (v, p) = pages(&env, &id, &token).await;
+    for body in [&v.body, &p.body] {
+        assert!(
+            body.contains("<p class=\"path channel\">id 4242</p>"),
+            "{body}"
+        );
+        assert!(!body.contains("beta-two"), "{body}");
+    }
+    env.app.hold.drop_all();
+    let _ = h.await;
 }
 
 #[tokio::test]

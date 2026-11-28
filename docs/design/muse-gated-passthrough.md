@@ -532,8 +532,10 @@ login. Approve and deny happen in Telegram. Config: `[notify] buttons = true`, w
 and `view_base_url`. `buttons = false` restores option C (3.6.1) with no code change.
 
 - **The message.** Text: the fixed sentence, `Request: <id>`, the link `{view_base_url}/view/<token>`,
-  and one row of two buttons, `Deny` on the left and `Approve` on the right. Nothing else leaves p1: no body, header, route
-  path, Discord token, digest or fingerprint. The view token is in the link, and it is the one value
+  and one row of two buttons, `Deny` on the left and `Approve` on the right (owner decision,
+  2026-11-28: Approve on the right is easier to reach with the right thumb on a phone; the approval
+  page is unchanged: Approve first, stacked on narrow screens). Nothing else leaves p1: no body,
+  header, route path, Discord token, digest or fingerprint. The view token is in the link, and it is the one value
   in the message that reads a request (accepted risk 1).
 - **Callback data.** `a` or `d`, then the 32-hex request id, then a 24-hex nonce: 57 bytes, under
   Telegram's 64-byte cap. The nonce is 96 random bits, drawn when the hold is admitted and stored with

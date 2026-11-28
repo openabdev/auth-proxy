@@ -213,6 +213,8 @@ Client rules:
 - A deny or an expiry starts the per-identity cooldown (default 60 s, `[passthrough] cooldown_secs`), so a quick new POST can get 503 `cooldown`.
 - Never log the poll token.
 
+Optional channel labels: `[passthrough] channel_labels = { "<channel id>" = "ops-alerts" }` (digits-only ids, at most 64 entries, labels 1..=64 letters, digits, spaces or `- _ . , : # + / ( ) @`). The view page then shows `ops-alerts (id <id>)` for the channel in the request path, or the id alone without a label. A label is display only and never affects routing, grants or approval.
+
 ## 8. Not claimed
 
 - Protection from the Muse platform or anything that holds the real token.

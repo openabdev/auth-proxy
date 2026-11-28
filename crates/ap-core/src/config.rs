@@ -6,7 +6,7 @@
 use crate::canon::canonical_host;
 use crate::headers::{AUTH_HEADERS, HOP_HEADERS};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 
@@ -138,6 +138,11 @@ pub struct Passthrough {
     /// Seconds an identity is refused after a human deny, 0..=3600 (0 disables).
     #[serde(default = "default_cooldown_secs")]
     pub cooldown_secs: u64,
+    /// Optional display labels for channel ids, shown next to the id on the approval view page.
+    /// At most 64 entries; each id is 1..=20 digits and each label 1..=64 printable characters
+    /// without `<`, `>` or `&`. Display only: never read by routing, grants or approval.
+    #[serde(default)]
+    pub channel_labels: BTreeMap<String, String>,
 }
 
 /// How a held request is answered to its caller.
@@ -675,6 +680,21 @@ fn validate_passthrough(p: &Passthrough) -> Result<(), ConfigError> {
             )));
         }
     }
+    if p.channel_labels.len() > 64 {
+        return Err(invalid("passthrough.channel_labels has too many entries"));
+    }
+    for (id, label) in &p.channel_labels {
+        if !(1..=20).contains(&id.len()) || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid(
+                "passthrough.channel_labels ids must be 1..=20 digits",
+            ));
+        }
+        if label.is_empty() || label.chars().count() > 64 || !label.chars().all(label_char_ok) {
+            return Err(invalid(format!(
+                "passthrough.channel_labels label for {id} must be 1..=64 letters, digits, spaces or - _ . , : # + / ( ) @"
+            )));
+        }
+    }
     if !(1..=1024).contains(&p.max_held_total) {
         return Err(invalid("passthrough.max_held_total must be in 1..=1024"));
     }
@@ -684,6 +704,17 @@ fn validate_passthrough(p: &Passthrough) -> Result<(), ConfigError> {
         ));
     }
     Ok(())
+}
+
+/// A character a channel label may carry: a letter or digit, an ASCII space, or one of
+/// `- _ . , : # + / ( ) @`. Everything else is refused, which covers every control and format
+/// character (bidi controls, zero-width characters, U+2028, U+2029), quotes and `< > &`.
+fn label_char_ok(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(
+            c,
+            ' ' | '-' | '_' | '.' | ',' | ':' | '#' | '+' | '/' | '(' | ')' | '@'
+        )
 }
 
 fn validate_approval(a: &Approval, proxy: SocketAddr) -> Result<(), ConfigError> {
@@ -2183,6 +2214,84 @@ paths = ["/api/v10/channels/", "/api/v10/users/@me"]
             "",
         );
         expect_invalid(&text, "paths must not be empty");
+    }
+
+    #[test]
+    fn channel_labels_load_and_are_validated() {
+        let with = |extra: &str| {
+            pt_base().replace(
+                "public_authority = \"gate.example.test\"",
+                &format!("public_authority = \"gate.example.test\"\n{extra}"),
+            )
+        };
+        assert!(load(&pt_base())
+            .unwrap()
+            .passthrough
+            .unwrap()
+            .channel_labels
+            .is_empty());
+        let ok = load(&with("channel_labels = { \"123\" = \"ops-alerts\" }")).unwrap();
+        assert_eq!(ok.passthrough.unwrap().channel_labels["123"], "ops-alerts");
+        for bad in [
+            "channel_labels = { \"12a\" = \"x\" }",
+            "channel_labels = { \"\" = \"x\" }",
+            "channel_labels = { \"123456789012345678901\" = \"x\" }",
+            "channel_labels = { \"1\" = \"\" }",
+            "channel_labels = { \"1\" = \"<b>x</b>\" }",
+            "channel_labels = { \"1\" = \"a&b\" }",
+            "channel_labels = { \"1\" = \"a\\nb\" }",
+            "channel_labels = { \"1\" = \"a\\\"b\" }",
+            "channel_labels = { \"1\" = \"a'b\" }",
+            "channel_labels = { \"1\" = \"a\\u2028b\" }",
+            "channel_labels = { \"1\" = \"a\\u2029b\" }",
+            "channel_labels = { \"1\" = \"a\\u00A0b\" }",
+        ] {
+            expect_invalid(&with(bad), "channel_labels");
+        }
+        let long = "x".repeat(65);
+        expect_invalid(
+            &with(&format!("channel_labels = {{ \"1\" = \"{long}\" }}")),
+            "channel_labels",
+        );
+        let many: Vec<String> = (1..=65).map(|i| format!("\"{i}\" = \"l\"")).collect();
+        expect_invalid(
+            &with(&format!("channel_labels = {{ {} }}", many.join(", "))),
+            "too many",
+        );
+    }
+
+    #[test]
+    fn channel_labels_refuse_bidi_and_zero_width_characters_and_keep_normal_text() {
+        let with = |label: &str| {
+            pt_base().replace(
+                "public_authority = \"gate.example.test\"",
+                &format!(
+                    "public_authority = \"gate.example.test\"\nchannel_labels = {{ \"1\" = \"{label}\" }}"
+                ),
+            )
+        };
+        for bad in [
+            "ops\\u202E",
+            "\\u202Aops",
+            "ops\\u202D",
+            "o\\u2066ps\\u2069",
+            "o\\u200Bps",
+            "o\\u200Cps",
+            "o\\u200Dps",
+            "o\\u200Eps",
+            "o\\u200Fps",
+            "o\\u2060ps",
+            "\\uFEFFops",
+        ] {
+            expect_invalid(&with(bad), "channel_labels");
+        }
+        for good in [
+            "ops alerts",
+            "caf\\u00E9 \\u65E5\\u672C #1 (a+b)/c_d-e.f,g:h@i",
+        ] {
+            let c = load(&with(good)).unwrap_or_else(|e| panic!("{good}: {e}"));
+            assert!(!c.passthrough.unwrap().channel_labels["1"].is_empty());
+        }
     }
 
     #[test]

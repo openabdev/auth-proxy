@@ -91,6 +91,14 @@ impl ApprovalApp {
         })
     }
 
+    /// The channel labels of the policy in force now, read at each page render so a reload
+    /// shows at once. No valid policy means no labels (the id alone is shown).
+    fn labels(&self) -> page::Labels {
+        (self.policy)()
+            .map(|s| s.channel_labels().clone())
+            .unwrap_or_default()
+    }
+
     fn new_token(&self, id: &str) -> String {
         let table = &self.table;
         self.csrf.issue(id, table.limits().hold, |e| {
@@ -270,14 +278,17 @@ fn show(app: &ApprovalApp, id: &str, json_wanted: bool) -> Response<Body> {
     if json_wanted {
         json_response(StatusCode::OK, &page::entry_json(&view, token.as_deref()))
     } else {
-        html_response(StatusCode::OK, page::entry(&view, token.as_deref()))
+        html_response(
+            StatusCode::OK,
+            page::entry(&view, token.as_deref(), &app.labels()),
+        )
     }
 }
 
 /// The read-only page for a `Pending` hold, or the generic 404.
 fn view_by_token(app: &ApprovalApp, token: &str) -> Response<Body> {
     match app.table.view_by_token(token) {
-        Some(view) => html_response(StatusCode::OK, page::view_only(&view)),
+        Some(view) => html_response(StatusCode::OK, page::view_only(&view, &app.labels())),
         None => result(StatusCode::NOT_FOUND, false, "not_found", None),
     }
 }

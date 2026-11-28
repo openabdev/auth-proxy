@@ -424,6 +424,7 @@ a passthrough-only config has no per-UID rules"
                     &cfg,
                     app.policy_source(),
                     buttons_on,
+                    pt.channel_labels.clone(),
                 );
                 listener::approval::serve_approval(l, state, Default::default()).await;
             }

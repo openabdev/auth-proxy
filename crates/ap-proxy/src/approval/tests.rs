@@ -223,6 +223,7 @@ path_patterns = ["/hold/*", "/webhooks/*/*"]
             delay,
             app.policy_source(),
             view_links,
+            std::collections::BTreeMap::new(),
         );
         let l = crate::listener::bind_loopback("127.0.0.1:0".parse().unwrap())
             .await

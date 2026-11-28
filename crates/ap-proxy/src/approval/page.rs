@@ -10,6 +10,7 @@
 //! block (method, route, redacted path and the message content), the approve and deny buttons on
 //! the decision page, and a closed `<details>` with the secondary facts.
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use base64::engine::general_purpose::STANDARD;
@@ -18,6 +19,15 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::hold::{State, View, ViewContent};
+
+/// Display-only channel labels, keyed by channel id.
+pub type Labels = BTreeMap<String, String>;
+
+/// Most embeds, fields per embed and characters per text shown; the rest is cut and marked.
+const MAX_EMBEDS: usize = 10;
+const MAX_FIELDS: usize = 25;
+const MAX_TEXT: usize = 4000;
+const CUT: &str = "… [truncated]";
 
 /// The stylesheet inlined in every page. The Content-Security-Policy allows this block by hash.
 const STYLE: &str = r#"
@@ -175,17 +185,198 @@ fn header(v: &View) -> String {
     h
 }
 
-/// The text of the `content` field when the body is a JSON object whose `content` is a string.
-/// The JSON string is decoded, so escapes such as `\uff5c` become the characters they stand for.
-/// `None` for anything else, including malformed JSON; this never panics.
-fn message_content(body: &str) -> Option<String> {
-    match serde_json::from_str::<Value>(body).ok()? {
-        Value::Object(mut fields) => match fields.remove("content")? {
-            Value::String(text) => Some(text),
-            _ => None,
-        },
-        _ => None,
+/// The readable parts of a JSON object body: the `content` string and the text of each embed.
+#[derive(Debug, PartialEq, Eq)]
+struct Parsed {
+    content: Option<String>,
+    embeds: Vec<EmbedText>,
+    /// Some text, embed or field was cut for display.
+    truncated: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Default)]
+struct EmbedText {
+    title: Option<String>,
+    description: Option<String>,
+    fields: Vec<(String, String)>,
+}
+
+/// Cut `s` to [`MAX_TEXT`] characters; the second value says whether it was cut.
+fn clip(s: &str) -> (String, bool) {
+    match s.char_indices().nth(MAX_TEXT) {
+        Some((i, _)) => (format!("{}{CUT}", &s[..i]), true),
+        None => (s.to_string(), false),
     }
+}
+
+fn clip_str(v: Option<&Value>, cut: &mut bool) -> Option<String> {
+    let (t, c) = clip(v?.as_str()?);
+    *cut |= c;
+    Some(t)
+}
+
+/// Parse the held body text. `None` when it is not a JSON object with a string `content` or at
+/// least one embed with text; this never panics and never fails, so the caller falls back to the
+/// raw text. Values of other types are skipped.
+fn parse_body(body: &str) -> Option<Parsed> {
+    let Value::Object(fields) = serde_json::from_str::<Value>(body).ok()? else {
+        return None;
+    };
+    let mut truncated = false;
+    let content = clip_str(fields.get("content"), &mut truncated);
+    let mut embeds = Vec::new();
+    if let Some(Value::Array(list)) = fields.get("embeds") {
+        truncated |= list.len() > MAX_EMBEDS;
+        for e in list.iter().take(MAX_EMBEDS) {
+            let Value::Object(e) = e else { continue };
+            let mut t = EmbedText {
+                title: clip_str(e.get("title"), &mut truncated),
+                description: clip_str(e.get("description"), &mut truncated),
+                fields: Vec::new(),
+            };
+            if let Some(Value::Array(fl)) = e.get("fields") {
+                truncated |= fl.len() > MAX_FIELDS;
+                for f in fl.iter().take(MAX_FIELDS) {
+                    let name = clip_str(f.get("name"), &mut truncated);
+                    let value = clip_str(f.get("value"), &mut truncated);
+                    if name.is_some() || value.is_some() {
+                        t.fields
+                            .push((name.unwrap_or_default(), value.unwrap_or_default()));
+                    }
+                }
+            }
+            if t != EmbedText::default() {
+                embeds.push(t);
+            }
+        }
+    }
+    if content.is_none() && embeds.is_empty() {
+        return None;
+    }
+    Some(Parsed {
+        content,
+        embeds,
+        truncated,
+    })
+}
+
+/// A mention found in message content.
+#[derive(Debug, PartialEq, Eq)]
+enum Mention<'a> {
+    User(&'a str),
+    Role(&'a str),
+    Channel(&'a str),
+    Everyone,
+    Here,
+}
+
+/// The mention at the start of `s`, with its byte length. Ids are 1..=20 ASCII digits.
+fn mention_at(s: &str) -> Option<(Mention<'_>, usize)> {
+    if s.starts_with("@everyone") {
+        return Some((Mention::Everyone, 9));
+    }
+    if s.starts_with("@here") {
+        return Some((Mention::Here, 5));
+    }
+    let rest = s.strip_prefix("<")?;
+    let prefix = if rest.starts_with("@&") {
+        "@&"
+    } else if rest.starts_with("@!") {
+        "@!"
+    } else if rest.starts_with('@') {
+        "@"
+    } else if rest.starts_with('#') {
+        "#"
+    } else {
+        return None;
+    };
+    let after = &rest[prefix.len()..];
+    let n = after.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=20).contains(&n) || after.as_bytes().get(n) != Some(&b'>') {
+        return None;
+    }
+    let id = &after[..n];
+    let m = match prefix {
+        "@&" => Mention::Role(id),
+        "#" => Mention::Channel(id),
+        _ => Mention::User(id),
+    };
+    Some((m, 1 + prefix.len() + n + 1))
+}
+
+/// Message content as HTML: escaped text, with each mention replaced in place by a marked token.
+/// No lookup of any kind: a token names the kind and the raw id (and a configured channel label).
+fn content_html(text: &str, labels: &Labels) -> String {
+    let mut out = String::new();
+    let mut plain = 0;
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        let found = if rest.starts_with(['<', '@']) {
+            mention_at(rest)
+        } else {
+            None
+        };
+        match found {
+            Some((m, len)) => {
+                out.push_str(&escape(&text[plain..i]));
+                out.push_str(&mention_html(&m, labels));
+                i += len;
+                plain = i;
+            }
+            None => i += rest.chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    out.push_str(&escape(&text[plain..]));
+    out
+}
+
+fn mention_html(m: &Mention<'_>, labels: &Labels) -> String {
+    match m {
+        Mention::User(id) => format!("<mark>[user mention · id {}]</mark>", escape(id)),
+        Mention::Role(id) => format!("<mark>[role mention · id {}]</mark>", escape(id)),
+        Mention::Channel(id) => match labels.get(*id) {
+            Some(l) => format!(
+                "<mark>[channel mention · id {} · {}]</mark>",
+                escape(id),
+                escape(l)
+            ),
+            None => format!("<mark>[channel mention · id {}]</mark>", escape(id)),
+        },
+        Mention::Everyone => {
+            "<mark><strong>⚠ WARNING: @everyone mention, notifies many people</strong></mark>"
+                .into()
+        }
+        Mention::Here => {
+            "<mark><strong>⚠ WARNING: @here mention, notifies many people</strong></mark>".into()
+        }
+    }
+}
+
+/// The channel id in a request path of the form `.../channels/<digits>/...`.
+fn channel_id(path: &str) -> Option<&str> {
+    let mut segs = path.split('/');
+    segs.find(|s| *s == "channels")?;
+    let id = segs.next()?;
+    ((1..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
+}
+
+/// One embed as a plain-text block. URLs and every other value stay inert text.
+fn embed_html(n: usize, e: &EmbedText) -> String {
+    let mut t = String::new();
+    if let Some(x) = &e.title {
+        t.push_str(&format!("Title: {}\n", escape(x)));
+    }
+    if let Some(x) = &e.description {
+        t.push_str(&format!("Description: {}\n", escape(x)));
+    }
+    for (name, value) in &e.fields {
+        t.push_str(&format!("Field {}: {}\n", escape(name), escape(value)));
+    }
+    format!(
+        "<p class=\"label\">Embed {n}</p>\n<pre class=\"body embed\">{}</pre>\n",
+        t.trim_end()
+    )
 }
 
 /// The top-level fields of a JSON object body other than `content`, as names only. serde_json
@@ -223,7 +414,9 @@ fn extra_fields_line(body: &str) -> String {
 /// The payload block: what will be sent, in large type. The message content is shown decoded when
 /// the body has one; otherwise the body is shown as it was received. Fields other than `content`
 /// are named in a line above the content, so they are visible without opening Details.
-fn payload(c: &ViewContent) -> String {
+// WYSIWYS: everything shown here is derived only from `c.body_text`, the held bytes that are
+// forwarded unchanged after approval, and from the request path; labels are display-only.
+fn payload(c: &ViewContent, labels: &Labels) -> String {
     let mut b = String::from("<section class=\"payload\" aria-label=\"Payload to send\">\n");
     b.push_str("<p class=\"label\">This request will be sent</p>\n");
     b.push_str(&format!(
@@ -232,13 +425,41 @@ fn payload(c: &ViewContent) -> String {
         escape(&c.route)
     ));
     b.push_str(&format!("<p class=\"path\">{}</p>\n", escape(&c.path)));
+    if let Some(id) = channel_id(&c.path) {
+        let shown = match labels.get(id) {
+            Some(l) => format!("{} (id {})", escape(l), escape(id)),
+            None => format!("id {}", escape(id)),
+        };
+        b.push_str(&format!(
+            "<p class=\"label\">Channel</p>\n<p class=\"path channel\">{shown}</p>\n"
+        ));
+    }
     b.push_str("<p class=\"label\">Message content</p>\n");
     if c.body_lossy {
         b.push_str("<p class=\"banner\"><strong>The body is not valid UTF-8.</strong> Invalid bytes are shown as U+FFFD; Discord receives the original bytes.</p>\n");
     }
     b.push_str(&extra_fields_line(&c.body_text));
-    let shown = message_content(&c.body_text).unwrap_or_else(|| c.body_text.clone());
-    b.push_str(&format!("<pre class=\"body\">{}</pre>\n", escape(&shown)));
+    match parse_body(&c.body_text) {
+        Some(p) => {
+            if p.truncated {
+                b.push_str("<p class=\"banner\"><strong>Truncated.</strong> Some text is cut for display; the raw body in Details is complete.</p>\n");
+            }
+            match &p.content {
+                Some(t) => b.push_str(&format!(
+                    "<pre class=\"body\">{}</pre>\n",
+                    content_html(t, labels)
+                )),
+                None => b.push_str("<p class=\"note\">(no text content)</p>\n"),
+            }
+            for (i, e) in p.embeds.iter().enumerate() {
+                b.push_str(&embed_html(i + 1, e));
+            }
+        }
+        None => b.push_str(&format!(
+            "<pre class=\"body\">{}</pre>\n",
+            escape(&c.body_text)
+        )),
+    }
     b.push_str("</section>\n");
     b
 }
@@ -300,7 +521,7 @@ fn details(v: &View, c: &ViewContent) -> String {
         t.push_str(&row(&h.name, &value));
     }
     t.push_str("</table>\n");
-    if message_content(&c.body_text).is_some() {
+    if parse_body(&c.body_text).is_some() {
         t.push_str("<h2>Raw body</h2>\n");
         t.push_str(&format!(
             "<pre class=\"body\">{}</pre>\n",
@@ -313,7 +534,7 @@ fn details(v: &View, c: &ViewContent) -> String {
 
 /// The page for one entry. `csrf` is the token for the approve and deny forms; without it the
 /// buttons are disabled.
-pub fn entry(v: &View, csrf: Option<&str>) -> String {
+pub fn entry(v: &View, csrf: Option<&str>, labels: &Labels) -> String {
     let mut b = header(v);
     match v.state {
         State::Superseded => {
@@ -333,7 +554,7 @@ pub fn entry(v: &View, csrf: Option<&str>) -> String {
         )),
     }
     if let Some(c) = &v.content {
-        b.push_str(&payload(c));
+        b.push_str(&payload(c, labels));
     }
     b.push_str(&actions(&v.id, csrf));
     if let Some(c) = &v.content {
@@ -345,11 +566,11 @@ pub fn entry(v: &View, csrf: Option<&str>) -> String {
 
 /// The read-only page for a `Pending` hold, reached by its one-time view link. It has no form,
 /// no buttons and no token: the owner decides in Telegram.
-pub fn view_only(v: &View) -> String {
+pub fn view_only(v: &View, labels: &Labels) -> String {
     let mut b = header(v);
     b.push_str("<p class=\"note\">Read only. Decide in Telegram.</p>\n");
     if let Some(c) = &v.content {
-        b.push_str(&payload(c));
+        b.push_str(&payload(c, labels));
         b.push_str(&details(v, c));
     }
     shell(&format!("Request {}", v.id), &b)
@@ -457,7 +678,11 @@ mod tests {
 
     #[test]
     fn script_body_and_header_values_are_escaped() {
-        let html = entry(&pending("<script>alert(1)</script>"), Some("tok"));
+        let html = entry(
+            &pending("<script>alert(1)</script>"),
+            Some("tok"),
+            &Labels::new(),
+        );
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(!html.contains("<b>v</b>") && html.contains("&lt;b&gt;v&lt;/b&gt;"));
@@ -477,7 +702,7 @@ mod tests {
         c.query = Some("a=<x>&b=\"y\"".into());
         c.content_type = Some("<ct>".into());
         c.upstream = "https://<up>:443".into();
-        let html = entry(&v, None);
+        let html = entry(&v, None, &Labels::new());
         for raw in ["<i>", "<r>", "<q>", "<x>", "<ct>", "<up>", "\"y\""] {
             assert!(!html.contains(raw), "{raw} reached the page");
         }
@@ -486,7 +711,7 @@ mod tests {
 
     #[test]
     fn the_details_section_is_present_and_closed_by_default() {
-        let html = entry(&pending("{}"), Some("t"));
+        let html = entry(&pending("{}"), Some("t"), &Labels::new());
         assert_eq!(html.matches("<details").count(), 1);
         assert!(html.contains("<details>\n<summary>Details</summary>"));
         assert!(!html.contains("<details open"), "details must start closed");
@@ -503,7 +728,7 @@ mod tests {
 
     #[test]
     fn the_payload_block_comes_first_with_the_buttons_and_before_details() {
-        let html = entry(&pending("hello"), Some("t"));
+        let html = entry(&pending("hello"), Some("t"), &Labels::new());
         let payload = html.find("<section class=\"payload\"").unwrap();
         let actions = html.find("<div class=\"actions\">").unwrap();
         let details = html.find("<details>").unwrap();
@@ -515,7 +740,7 @@ mod tests {
 
     #[test]
     fn the_view_page_has_the_payload_and_no_form_or_button() {
-        let html = view_only(&pending("hello"));
+        let html = view_only(&pending("hello"), &Labels::new());
         assert!(html.contains("<section class=\"payload\""));
         assert!(html.contains("Read only. Decide in Telegram."));
         assert!(!html.contains("<form") && !html.contains("<button") && !html.contains("csrf"));
@@ -524,7 +749,10 @@ mod tests {
 
     #[test]
     fn no_external_resource_or_script_is_loaded() {
-        for html in [entry(&pending("{}"), Some("t")), view_only(&pending("{}"))] {
+        for html in [
+            entry(&pending("{}"), Some("t"), &Labels::new()),
+            view_only(&pending("{}"), &Labels::new()),
+        ] {
             for banned in [
                 "<script",
                 "<link",
@@ -554,7 +782,7 @@ mod tests {
     #[test]
     fn the_page_and_the_json_name_the_upstream_the_request_goes_to() {
         let v = pending("{}");
-        let html = entry(&v, None);
+        let html = entry(&v, None, &Labels::new());
         assert!(html.contains("Sent to") && html.contains("https://discord.example.test:443"));
         let j = entry_json(&v, None);
         assert_eq!(j["upstream"], "https://discord.example.test:443");
@@ -569,7 +797,7 @@ mod tests {
             superseded_by: Some("b".repeat(32)),
             content: None,
         };
-        let html = entry(&v, None);
+        let html = entry(&v, None, &Labels::new());
         assert!(html.contains("Superseded."));
         assert!(html.contains(&format!("href=\"/pending/{}\"", "b".repeat(32))));
         assert!(html.contains("disabled") && !html.contains("<form method"));
@@ -579,8 +807,8 @@ mod tests {
     fn invalid_utf8_gets_a_banner() {
         let mut v = pending("x");
         v.content.as_mut().unwrap().body_lossy = true;
-        assert!(entry(&v, Some("t")).contains("not valid UTF-8"));
-        assert!(!entry(&pending("x"), Some("t")).contains("not valid UTF-8"));
+        assert!(entry(&v, Some("t"), &Labels::new()).contains("not valid UTF-8"));
+        assert!(!entry(&pending("x"), Some("t"), &Labels::new()).contains("not valid UTF-8"));
     }
 
     #[test]
@@ -606,6 +834,7 @@ mod tests {
         let html = entry(
             &with_body(r#"{"content":"Stage 2 gate test \uff5c \u5c0f"}"#),
             Some("t"),
+            &Labels::new(),
         );
         let block = html.find("<pre class=\"body\">").unwrap();
         let shown = "<pre class=\"body\">Stage 2 gate test \u{ff5c} \u{5c0f}</pre>";
@@ -617,7 +846,7 @@ mod tests {
     #[test]
     fn malformed_json_falls_back_to_the_raw_text() {
         for body in [r#"{"content":"x""#, "not json", "\"plain\"", "[1,2]", "{}"] {
-            let html = entry(&with_body(body), Some("t"));
+            let html = entry(&with_body(body), Some("t"), &Labels::new());
             let escaped = escape(body);
             assert!(
                 html.contains(&format!("<pre class=\"body\">{escaped}</pre>")),
@@ -630,19 +859,19 @@ mod tests {
     #[test]
     fn a_non_string_content_field_falls_back_to_the_raw_text() {
         let body = r#"{"content":5}"#;
-        let html = entry(&with_body(body), Some("t"));
+        let html = entry(&with_body(body), Some("t"), &Labels::new());
         assert!(html.contains(&format!("<pre class=\"body\">{}</pre>", escape(body))));
     }
 
     #[test]
     fn the_raw_json_appears_only_inside_details() {
         let body = r#"{"content":"Stage 2 gate test \uff5c \u5c0f"}"#;
-        let html = entry(&with_body(body), Some("t"));
+        let html = entry(&with_body(body), Some("t"), &Labels::new());
         let details = html.find("<details>").unwrap();
         assert_eq!(html.matches(&escape(body)).count(), 1, "{html}");
         assert!(html.find(&escape(body)).unwrap() > details);
         assert!(!html.contains("<details open"));
-        let view = view_only(&with_body(body));
+        let view = view_only(&with_body(body), &Labels::new());
         assert_eq!(view.matches(&escape(body)).count(), 1);
         assert!(view.find(&escape(body)).unwrap() > view.find("<details>").unwrap());
     }
@@ -650,7 +879,7 @@ mod tests {
     #[test]
     fn escaping_applies_to_the_decoded_content() {
         let body = r#"{"content":"<script>alert(1)<\/script> \u003cb\u003e"}"#;
-        let html = entry(&with_body(body), Some("t"));
+        let html = entry(&with_body(body), Some("t"), &Labels::new());
         assert!(!html.contains("<script>alert(1)"), "{html}");
         assert!(!html.contains("<b>"), "{html}");
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt; &lt;b&gt;"));
@@ -658,15 +887,17 @@ mod tests {
 
     #[test]
     fn a_content_only_body_shows_no_extra_fields_line() {
-        let html = entry(&with_body(r#"{"content":"hi"}"#), Some("t"));
+        let html = entry(&with_body(r#"{"content":"hi"}"#), Some("t"), &Labels::new());
         assert!(!html.contains("extra-fields"), "{html}");
-        assert!(!view_only(&with_body(r#"{"content":"hi"}"#)).contains("extra-fields"));
+        assert!(
+            !view_only(&with_body(r#"{"content":"hi"}"#), &Labels::new()).contains("extra-fields")
+        );
     }
 
     #[test]
     fn a_field_besides_content_is_named_above_details_and_its_value_is_not() {
         let body = r#"{"content":"hi","username":"SYNTH-VALUE-7"}"#;
-        let html = entry(&with_body(body), Some("t"));
+        let html = entry(&with_body(body), Some("t"), &Labels::new());
         let line_start = html
             .find("<p class=\"banner extra-fields\">")
             .expect("indicator");
@@ -679,14 +910,14 @@ mod tests {
         assert!(!line.contains("SYNTH-VALUE-7"), "{line}");
         assert!(line_end < html.find("<details>").unwrap());
         assert!(line_start < html.find("<pre class=\"body\">").unwrap());
-        let view = view_only(&with_body(body));
+        let view = view_only(&with_body(body), &Labels::new());
         assert!(view.contains("+ 1 more field will be sent: username"));
     }
 
     #[test]
     fn the_extra_field_name_is_escaped() {
         let body = r#"{"content":"hi","<b>x</b>":1,"embeds":[]}"#;
-        let html = entry(&with_body(body), Some("t"));
+        let html = entry(&with_body(body), Some("t"), &Labels::new());
         assert!(
             html.contains(
                 "+ 2 more fields will be sent: &lt;b&gt;x&lt;/b&gt;, embeds (see Details)"
@@ -694,5 +925,219 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("<b>x</b>"), "{html}");
+    }
+
+    fn labels() -> Labels {
+        Labels::from([("4242".to_string(), "ops-alerts".to_string())])
+    }
+
+    fn at(path: &str, body: &str) -> View {
+        let mut v = with_body(body);
+        v.content.as_mut().unwrap().path = path.into();
+        v
+    }
+
+    const CH: &str = "/api/v10/channels/4242/messages";
+
+    #[test]
+    fn the_channel_label_is_shown_next_to_the_id_and_no_label_shows_the_id_only() {
+        let v = at(CH, r#"{"content":"hi"}"#);
+        let html = entry(&v, Some("t"), &labels());
+        assert!(
+            html.contains("<p class=\"path channel\">ops-alerts (id 4242)</p>"),
+            "{html}"
+        );
+        assert!(view_only(&v, &labels()).contains("ops-alerts (id 4242)"));
+        let html = entry(&v, Some("t"), &Labels::new());
+        assert!(
+            html.contains("<p class=\"path channel\">id 4242</p>"),
+            "{html}"
+        );
+        assert!(!html.contains("ops-alerts"));
+        let other = at("/api/v10/channels/777/messages", "{}");
+        assert!(entry(&other, None, &labels()).contains("<p class=\"path channel\">id 777</p>"));
+        assert!(!entry(&pending("{}"), None, &labels()).contains("path channel"));
+    }
+
+    #[test]
+    fn labels_are_escaped() {
+        let l = Labels::from([("4242".to_string(), "\"><i>x".to_string())]);
+        let html = entry(&at(CH, "{}"), None, &l);
+        assert!(!html.contains("<i>x"), "{html}");
+        assert!(html.contains("&quot;&gt;&lt;i&gt;x (id 4242)"));
+    }
+
+    #[test]
+    fn each_mention_kind_is_marked_in_place_with_its_raw_id() {
+        let body =
+            r#"{"content":"a <@111> b <@!222> c <@&333> d <#4242> e <#999> f @everyone g @here"}"#;
+        let html = entry(&at(CH, body), None, &labels());
+        for want in [
+            "a <mark>[user mention · id 111]</mark> b ",
+            "<mark>[user mention · id 222]</mark> c ",
+            "<mark>[role mention · id 333]</mark> d ",
+            "<mark>[channel mention · id 4242 · ops-alerts]</mark> e ",
+            "<mark>[channel mention · id 999]</mark> f ",
+            "<mark><strong>⚠ WARNING: @everyone mention, notifies many people</strong></mark> g ",
+            "<mark><strong>⚠ WARNING: @here mention, notifies many people</strong></mark>",
+        ] {
+            assert!(html.contains(want), "{want}\n{html}");
+        }
+        assert!(
+            !html[..html.find("<details>").unwrap()].contains("&lt;@"),
+            "mention left as raw text"
+        );
+    }
+
+    #[test]
+    fn malformed_mentions_stay_plain_escaped_text() {
+        let body = r#"{"content":"<@abc> <@> <@123 <#> <@&> x@here"}"#;
+        let html = entry(&at(CH, body), None, &Labels::new());
+        assert!(
+            html.contains("&lt;@abc&gt; &lt;@&gt; &lt;@123 &lt;#&gt; &lt;@&amp;&gt; x"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn markup_in_content_and_embed_text_is_escaped() {
+        let body = r#"{"content":"<img src=x onerror=1> & <b>","embeds":[{"title":"<script>t</script>","description":"<a href=\"http://x.example.test\">d</a>","fields":[{"name":"<n>","value":"<v>"}]}]}"#;
+        let html = entry(&at(CH, body), Some("t"), &Labels::new());
+        for raw in [
+            "<img",
+            "<script>t",
+            "<a href=\"http://x",
+            "<n>",
+            "<v>",
+            "<b>",
+        ] {
+            assert!(!html.contains(raw), "{raw}\n{html}");
+        }
+        assert!(html.contains("Title: &lt;script&gt;t&lt;/script&gt;"));
+        assert!(html.contains("Field &lt;n&gt;: &lt;v&gt;"));
+    }
+
+    #[test]
+    fn embeds_are_plain_text_with_inert_urls_and_no_external_reference() {
+        let body = r#"{"embeds":[{"title":"T1","description":"see https://example.test/a?x=1","url":"https://example.test/u","image":{"url":"https://img.example.test/i.png"},"thumbnail":{"url":"https://img.example.test/t.png"},"fields":[{"name":"N","value":"V https://example.test/f"}]},{"title":"T2"}]}"#;
+        let html = entry(&at(CH, body), Some("t"), &Labels::new());
+        assert!(html.contains("Title: T1\nDescription: see https://example.test/a?x=1\nField N: V https://example.test/f"), "{html}");
+        assert!(html.contains("Embed 2") && html.contains("Title: T2"));
+        assert!(
+            html.contains("(no text content)"),
+            "embed-only body has no content text"
+        );
+        let payload_end = html.find("<details>").unwrap();
+        let shown = &html[..payload_end];
+        for banned in [
+            "<img",
+            "<a href=\"http",
+            "src=",
+            "<link",
+            "url(",
+            "img.example.test",
+        ] {
+            assert!(!shown.contains(banned), "{banned}\n{shown}");
+        }
+        // The image URLs are not rendered outside the raw body in Details.
+        assert!(html[payload_end..].matches("img.example.test").count() >= 2);
+    }
+
+    #[test]
+    fn long_text_and_many_embeds_are_cut_with_a_marker() {
+        let long = "x".repeat(MAX_TEXT + 10);
+        let embeds: Vec<String> = (0..MAX_EMBEDS + 3)
+            .map(|i| format!(r#"{{"title":"e{i}"}}"#))
+            .collect();
+        let body = format!(r#"{{"content":"{long}","embeds":[{}]}}"#, embeds.join(","));
+        let html = entry(&at(CH, &body), Some("t"), &Labels::new());
+        assert!(html.contains(&format!("{}{CUT}", "x".repeat(MAX_TEXT))));
+        assert!(html.contains("<strong>Truncated.</strong>"));
+        assert!(html.contains(&format!("Embed {MAX_EMBEDS}")));
+        assert!(!html.contains(&format!("Embed {}", MAX_EMBEDS + 1)));
+        // The raw body in Details is complete.
+        assert!(html.contains(&escape(&body)));
+        let fields: Vec<String> = (0..MAX_FIELDS + 2)
+            .map(|i| format!(r#"{{"name":"n{i}","value":"v"}}"#))
+            .collect();
+        let body = format!(r#"{{"embeds":[{{"fields":[{}]}}]}}"#, fields.join(","));
+        let html = entry(&at(CH, &body), None, &Labels::new());
+        assert!(html.contains(&format!("Field n{}: v", MAX_FIELDS - 1)));
+        assert!(!html.contains(&format!("Field n{}: v", MAX_FIELDS)));
+        assert!(html.contains("<strong>Truncated.</strong>"));
+    }
+
+    #[test]
+    fn odd_shapes_fall_back_without_error() {
+        for body in [
+            r#"{"content":"x","embeds":"nope"}"#,
+            r#"{"content":"x","embeds":[1,null,{"title":5,"fields":[{"name":1}]}]}"#,
+            r#"{"embeds":[{"fields":7}]}"#,
+            &format!("{}1{}", "[".repeat(5000), "]".repeat(5000)),
+        ] {
+            let html = entry(&at(CH, body), Some("t"), &Labels::new());
+            assert!(html.contains("<pre class=\"body\">"), "{body}");
+        }
+        let html = entry(
+            &at(CH, r#"{"embeds":[{"fields":7}]}"#),
+            None,
+            &Labels::new(),
+        );
+        assert!(html.contains(&format!(
+            "<pre class=\"body\">{}</pre>",
+            escape(r#"{"embeds":[{"fields":7}]}"#)
+        )));
+    }
+
+    #[test]
+    fn no_token_hash_or_caller_key_is_on_the_page() {
+        let v = at(CH, r#"{"content":"hi"}"#);
+        let html = entry(&v, None, &labels());
+        assert!(!html.contains("Bot ") && !html.contains("Bearer"));
+        // The only hash-like value is the body digest in Details; no credential value is shown.
+        assert!(html.contains("present (value not shown)"));
+        assert!(!html.contains("x-ap-caller-key"));
+    }
+
+    #[test]
+    fn what_is_shown_is_what_is_parsed_from_the_held_bytes() {
+        // Forwarding of these same bytes unchanged is covered by the hold_tests forwarding test
+        // that asserts the upstream received body == the sent body.
+        let held = r#"{"content":"hello <@111> and @everyone <#4242>","embeds":[{"title":"Tt","description":"Dd","fields":[{"name":"Nn","value":"Vv"}]}]}"#;
+        let v = at(CH, held);
+        let c = v.content.as_ref().unwrap();
+        assert_eq!(c.body_text.as_bytes(), held.as_bytes());
+        let html = entry(&v, None, &labels());
+        let j: Value = serde_json::from_slice(held.as_bytes()).unwrap();
+        let content = j["content"].as_str().unwrap();
+        let e = &j["embeds"][0];
+        let parsed = parse_body(&c.body_text).unwrap();
+        assert_eq!(parsed.content.as_deref(), Some(content));
+        assert_eq!(parsed.embeds[0].title.as_deref(), e["title"].as_str());
+        assert_eq!(
+            parsed.embeds[0].description.as_deref(),
+            e["description"].as_str()
+        );
+        assert_eq!(
+            parsed.embeds[0].fields,
+            [(
+                e["fields"][0]["name"].as_str().unwrap().to_string(),
+                e["fields"][0]["value"].as_str().unwrap().to_string()
+            )]
+        );
+        assert_eq!(
+            content_html(content, &labels()),
+            content_html(parsed.content.as_deref().unwrap(), &labels())
+        );
+        for want in [
+            "hello <mark>[user mention · id 111]</mark> and ",
+            "@everyone mention",
+            "[channel mention · id 4242 · ops-alerts]",
+            "Title: Tt\nDescription: Dd\nField Nn: Vv",
+            "ops-alerts (id 4242)",
+        ] {
+            assert!(html.contains(want), "{want}\n{html}");
+        }
+        assert_eq!(channel_id(&c.path), Some("4242"));
     }
 }

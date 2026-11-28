@@ -17,6 +17,7 @@ pub mod csrf;
 pub mod page;
 pub mod telegram;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +47,8 @@ pub struct ApprovalApp {
     fail_delay: Duration,
     /// Serve `GET /view/<token>` without Basic auth. Set only when the Telegram buttons are on.
     view_links: bool,
+    /// Display-only labels for channel ids, from `[passthrough].channel_labels`.
+    channel_labels: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for ApprovalApp {
@@ -59,7 +62,7 @@ pub type PolicySource = Arc<dyn Fn() -> Option<Arc<ap_core::policy::Snapshot>> +
 
 impl ApprovalApp {
     pub fn new(table: Arc<Table>, cfg: &Approval, policy: PolicySource) -> Arc<ApprovalApp> {
-        Self::build(table, cfg, FAIL_DELAY, policy, false)
+        Self::build(table, cfg, FAIL_DELAY, policy, false, BTreeMap::new())
     }
 
     /// Like [`ApprovalApp::new`], and with `view_links` also serves the no-login one-time view
@@ -69,8 +72,9 @@ impl ApprovalApp {
         cfg: &Approval,
         policy: PolicySource,
         view_links: bool,
+        channel_labels: BTreeMap<String, String>,
     ) -> Arc<ApprovalApp> {
-        Self::build(table, cfg, FAIL_DELAY, policy, view_links)
+        Self::build(table, cfg, FAIL_DELAY, policy, view_links, channel_labels)
     }
 
     fn build(
@@ -79,6 +83,7 @@ impl ApprovalApp {
         fail_delay: Duration,
         policy: PolicySource,
         view_links: bool,
+        channel_labels: BTreeMap<String, String>,
     ) -> Arc<ApprovalApp> {
         Arc::new(ApprovalApp {
             table,
@@ -88,6 +93,7 @@ impl ApprovalApp {
             realm: cfg.realm.clone(),
             fail_delay,
             view_links,
+            channel_labels,
         })
     }
 
@@ -270,14 +276,17 @@ fn show(app: &ApprovalApp, id: &str, json_wanted: bool) -> Response<Body> {
     if json_wanted {
         json_response(StatusCode::OK, &page::entry_json(&view, token.as_deref()))
     } else {
-        html_response(StatusCode::OK, page::entry(&view, token.as_deref()))
+        html_response(
+            StatusCode::OK,
+            page::entry(&view, token.as_deref(), &app.channel_labels),
+        )
     }
 }
 
 /// The read-only page for a `Pending` hold, or the generic 404.
 fn view_by_token(app: &ApprovalApp, token: &str) -> Response<Body> {
     match app.table.view_by_token(token) {
-        Some(view) => html_response(StatusCode::OK, page::view_only(&view)),
+        Some(view) => html_response(StatusCode::OK, page::view_only(&view, &app.channel_labels)),
         None => result(StatusCode::NOT_FOUND, false, "not_found", None),
     }
 }

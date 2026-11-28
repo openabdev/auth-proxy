@@ -260,10 +260,11 @@ fn parse_body(body: &str) -> Option<Parsed> {
                 .filter(|k| !matches!(k.as_str(), "title" | "description" | "fields"));
             for k in keys {
                 if t.unshown.len() < MAX_UNSHOWN_NAMES {
-                    t.unshown.push(match k.char_indices().nth(MAX_UNSHOWN_NAME) {
-                        Some((i, _)) => format!("{}{CUT}", &k[..i]),
-                        None => k.clone(),
-                    });
+                    t.unshown
+                        .push(match k.char_indices().nth(MAX_UNSHOWN_NAME) {
+                            Some((i, _)) => format!("{}{CUT}", &k[..i]),
+                            None => k.clone(),
+                        });
                 } else {
                     t.unshown_more += 1;
                 }
@@ -1189,8 +1190,15 @@ mod tests {
         // Raw JSON in Details stays complete.
         assert!(html[html.find("<details>").unwrap()..].contains("AUTHVAL"));
         // An embed with only unrendered keys is still shown, with the note.
-        let html = entry(&at(CH, r#"{"embeds":[{"image":{"url":"x"}}]}"#), None, &Labels::new());
-        assert!(html.contains("Embed 1") && html.contains("not shown here: image"), "{html}");
+        let html = entry(
+            &at(CH, r#"{"embeds":[{"image":{"url":"x"}}]}"#),
+            None,
+            &Labels::new(),
+        );
+        assert!(
+            html.contains("Embed 1") && html.contains("not shown here: image"),
+            "{html}"
+        );
     }
 
     #[test]
@@ -1209,13 +1217,17 @@ mod tests {
         let shown = &html[..html.find("<details>").unwrap()];
         assert!(shown.contains("&lt;b&gt;x&lt;/b&gt;"), "{shown}");
         assert!(!shown.contains("<b>x</b>"), "{shown}");
-        assert!(shown.contains(&format!("{}{CUT}", "z".repeat(MAX_UNSHOWN_NAME))), "{shown}");
+        assert!(
+            shown.contains(&format!("{}{CUT}", "z".repeat(MAX_UNSHOWN_NAME))),
+            "{shown}"
+        );
         assert!(!shown.contains(&long), "{shown}");
     }
 
     #[test]
     fn an_embed_with_only_title_description_and_fields_has_no_unshown_note() {
-        let body = r#"{"embeds":[{"title":"T","description":"d","fields":[{"name":"a","value":"b"}]}]}"#;
+        let body =
+            r#"{"embeds":[{"title":"T","description":"d","fields":[{"name":"a","value":"b"}]}]}"#;
         let html = entry(&at(CH, body), Some("t"), &Labels::new());
         assert!(!html.contains("not shown here"), "{html}");
     }

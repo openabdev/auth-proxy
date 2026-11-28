@@ -226,8 +226,8 @@ impl Notifier for TelegramNotifier {
         if let Some(b) = buttons {
             body["reply_markup"] = serde_json::json!({
                 "inline_keyboard": [[
-                    { "text": "Approve", "callback_data": b.approve },
                     { "text": "Deny", "callback_data": b.deny },
+                    { "text": "Approve", "callback_data": b.approve },
                 ]],
             });
         }

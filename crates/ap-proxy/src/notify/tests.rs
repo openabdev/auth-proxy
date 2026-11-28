@@ -164,10 +164,10 @@ async fn buttons_message_has_only_fixed_text_id_link_and_buttons() {
         format!("{TEXT}\nRequest: {HOLD_ID}\n{VIEW_URL}")
     );
     let row = &json["reply_markup"]["inline_keyboard"][0];
-    assert_eq!(row[0]["text"], "Approve");
-    assert_eq!(row[1]["text"], "Deny");
-    assert_eq!(row[0]["callback_data"], buttons.approve);
-    assert_eq!(row[1]["callback_data"], buttons.deny);
+    assert_eq!(row[0]["text"], "Deny");
+    assert_eq!(row[1]["text"], "Approve");
+    assert_eq!(row[0]["callback_data"], buttons.deny);
+    assert_eq!(row[1]["callback_data"], buttons.approve);
     assert_eq!(buttons.approve.len(), poll::CALLBACK_DATA_LEN);
     assert_eq!(buttons.deny.len(), poll::CALLBACK_DATA_LEN);
     let text = json["text"].as_str().unwrap();
